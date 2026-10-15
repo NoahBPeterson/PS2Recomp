@@ -748,6 +748,7 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
         SetTargetFPS(60);
+        SetExitKey(KEY_NULL); // raylib quits on Esc by default; games use Esc-mapped input, so only the window close quits
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
