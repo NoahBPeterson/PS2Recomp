@@ -211,10 +211,11 @@ namespace ps2recomp
                 "{{ float f = ctx->f[{}]; uint32_t bits; std::memcpy(&bits, &f, sizeof(bits)); {}; }}",
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
+        // LQC2/SQC2 also ignore the low four address bits, like LQ/SQ.
         case OPCODE_LDC2:
-            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
+            return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {}) & ~0xFu", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
-            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
+            return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {}) & ~0xFu", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";
         case OPCODE_DADDI:
             return fmt::format(
                 "{{ int64_t src = (int64_t)GPR_S64(ctx, {}); "

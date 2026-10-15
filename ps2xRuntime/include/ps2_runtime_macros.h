@@ -1002,21 +1002,21 @@ static inline void ps2_vu0_set_mac(R5900Context *ctx, __m128 result, uint32_t de
 }
 #define PS2_VU0_SET_MAC(ctx_ptr, result, dest) ps2_vu0_set_mac((ctx_ptr), (result), (dest))
 
-// Additional VU0 operations
+// Additional VU0 operations. The Q unit (DIV/SQRT/RSQRT) reads exponent-255 operands as ordinary
+// numbers like the EE FPU does (ps2_f*), but a zero (or denormal) divisor gives +-0x7F7FFFFF here,
+// as before, rather than the FPU's +-0x7FFFFFFF.
 static inline float Ps2VuDivQ(float fs, float ft)
 {
-    if (ft != 0.0f)
-    {
-        return fs / ft;
-    }
-    return (std::signbit(fs) != std::signbit(ft))
-               ? -std::numeric_limits<float>::max()
-               : std::numeric_limits<float>::max();
+    const uint32_t ufs = std::bit_cast<uint32_t>(fs);
+    const uint32_t uft = std::bit_cast<uint32_t>(ft);
+    if ((uft & PS2_FLOAT_EXP_MASK) == 0u)
+        return std::bit_cast<float>(((ufs ^ uft) & PS2_FLOAT_SIGN_MASK) | 0x7F7FFFFFu);
+    return ps2_fdiv(fs, ft);
 }
 
 static inline float Ps2VuSqrtQ(float ft)
 {
-    return std::sqrt(std::fabs(ft));
+    return ps2_fsqrt(ft);
 }
 
 static inline float Ps2VuRsqrtQ(float fs, float ft)

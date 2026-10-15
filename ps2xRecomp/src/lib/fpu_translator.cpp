@@ -94,10 +94,16 @@ namespace ps2recomp
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
             case COP1_S_MSUBA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
+            // MAX.S/MIN.S compare the raw words in sign-magnitude order, so +0 > -0 (std::max/min
+            // treat them as equal and keep the first operand) and exponent-255 words are numbers.
             case COP1_S_MAX:
-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_MIN:
-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format(
+                    "{{ uint32_t a, b; std::memcpy(&a, &ctx->f[{1}], 4); std::memcpy(&b, &ctx->f[{2}], 4); "
+                    "const int64_t ka = (a & 0x80000000u) ? -(int64_t)(a & 0x7FFFFFFFu) - 1 : (int64_t)a; "
+                    "const int64_t kb = (b & 0x80000000u) ? -(int64_t)(b & 0x7FFFFFFFu) - 1 : (int64_t)b; "
+                    "const uint32_t r = (ka {3} kb) ? a : b; std::memcpy(&ctx->f[{0}], &r, 4); }}",
+                    fd, fs, ft, function == COP1_S_MAX ? ">=" : "<=");
             case COP1_S_C_F:
                 return fmt::format("ctx->fcr31 &= ~0x800000;");
             case COP1_S_C_UN:

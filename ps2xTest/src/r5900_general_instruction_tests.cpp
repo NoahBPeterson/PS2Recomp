@@ -878,13 +878,21 @@ void register_r5900_general_instruction_tests()
 
             std::memcpy(rdram + kDataAddress + 16u, lanes, sizeof(lanes));
             setGpr(*ctx, 1, kDataAddress);
-            PS2X_EXEC_EMITTED(t, lqc2, ctx->vu0_vf[5] = _mm_castsi128_ps(READ128(ADD32(GPR_U32(ctx, 1), 16))););
+            PS2X_EXEC_EMITTED(t, lqc2, ctx->vu0_vf[5] = _mm_castsi128_ps(READ128(ADD32(GPR_U32(ctx, 1), 16) & ~0xFu)););
             uint32_t loaded[4];
             std::memcpy(loaded, &ctx->vu0_vf[5], sizeof(loaded));
             t.IsTrue(std::memcmp(loaded, lanes, sizeof(lanes)) == 0, "lqc2 loads x, y, z, w from consecutive words");
 
+            // Like LQ/SQ, the low four address bits are ignored (found by the EE oracle tier in TC2).
+            setGpr(*ctx, 1, kDataAddress + 4u);
+            ctx->vu0_vf[5] = _mm_setzero_ps();
+            PS2X_EXEC_EMITTED(t, lqc2, ctx->vu0_vf[5] = _mm_castsi128_ps(READ128(ADD32(GPR_U32(ctx, 1), 16) & ~0xFu)););
+            std::memcpy(loaded, &ctx->vu0_vf[5], sizeof(loaded));
+            t.IsTrue(std::memcmp(loaded, lanes, sizeof(lanes)) == 0, "lqc2 through an unaligned pointer loads the aligned quadword");
+            setGpr(*ctx, 1, kDataAddress);
+
             fillRam(rdram, kDataAddress + 32u, 32u);
-            PS2X_EXEC_EMITTED(t, sqc2, WRITE128(ADD32(GPR_U32(ctx, 1), 32), _mm_castps_si128(ctx->vu0_vf[5])););
+            PS2X_EXEC_EMITTED(t, sqc2, WRITE128(ADD32(GPR_U32(ctx, 1), 32) & ~0xFu, _mm_castps_si128(ctx->vu0_vf[5])););
             t.IsTrue(std::memcmp(rdram + kDataAddress + 32u, lanes, sizeof(lanes)) == 0, "sqc2 stores x, y, z, w to consecutive words");
             t.IsTrue(ramUntouched(rdram, kDataAddress + 48u, 16u), "sqc2 writes exactly one quadword");
         });
