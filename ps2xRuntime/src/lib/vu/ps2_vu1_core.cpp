@@ -14,6 +14,8 @@
 #include <limits>
 #include <ps2_log.h>
 
+void ps2xDumpRecentVif1Unpacks(); // ps2_vif1_interpreter.cpp
+
 namespace
 {
     constexpr uint8_t laneForComponent(uint32_t component)
@@ -851,6 +853,10 @@ void VU1Interpreter::progressXgkick()
         m_xgkick.cycleCredit -= 2u;
         if (m_xgkick.copiedBytes > XgkickPipeline::kBufferSize - 16u)
         {
+            static const bool dump = std::getenv("PS2X_VU_RESERVED_DUMP") != nullptr;
+            if (dump)
+                std::fprintf(stderr, "[xgkick-overflow] src=0x%x copied=0x%x (no EOP within buffer)\n",
+                             m_xgkick.sourceAddress, m_xgkick.copiedBytes);
             reportReservedInstruction(false, 0xFFFFFFFBu);
             m_xgkick.active = false;
             return;
@@ -884,6 +890,22 @@ void VU1Interpreter::progressXgkick()
 
             if (tagBytes > XgkickPipeline::kBufferSize - qwordOffset)
             {
+                static const bool dump = std::getenv("PS2X_VU_RESERVED_DUMP") != nullptr;
+                if (dump)
+                {
+                    uint64_t tagHi = 0;
+                    std::memcpy(&tagHi, m_xgkick.packet.data() + qwordOffset + 8u, sizeof(tagHi));
+                    std::fprintf(stderr,
+                                 "[xgkick-overflow] src=0x%x offset=0x%x tag=%016llx:%016llx nloop=%u flg=%u nreg=%u bytes=0x%llx\n",
+                                 m_xgkick.sourceAddress, qwordOffset, static_cast<unsigned long long>(tagHi),
+                                 static_cast<unsigned long long>(tagLo), nloop, format, nreg,
+                                 static_cast<unsigned long long>(tagBytes));
+                    std::fprintf(stderr, "  top=0x%x itop=0x%x vi:", m_state.top, m_state.itop);
+                    for (uint32_t r = 0; r < 16u; ++r)
+                        std::fprintf(stderr, " %u=0x%x", r, static_cast<uint16_t>(m_state.vi[r]));
+                    std::fprintf(stderr, "\n  recent VIF1 unpacks:\n");
+                    ps2xDumpRecentVif1Unpacks();
+                }
                 reportReservedInstruction(false, 0xFFFFFFFBu);
                 m_xgkick.active = false;
                 return;
@@ -1566,8 +1588,37 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::getDecodedInstructionPair
     return m_decodedCodeCache[pairIndex];
 }
 
+namespace
+{
+    // Context for reserved-instruction reports: the last MSCAL/MSCALF start PC and the
+    // code memory being run (per unit: 0 = VU0, 1 = VU1).
+    uint32_t s_lastStartPc[2] = {0u, 0u};
+    const uint8_t *s_lastCode[2] = {nullptr, nullptr};
+    uint32_t s_lastCodeSize[2] = {0u, 0u};
+}
+
 void VU1Interpreter::reportReservedInstruction(bool upper, uint32_t instruction)
 {
+    // PS2X_VU_RESERVED_DUMP=1 adds the program start PC and the code words around the fault.
+    static const bool dump = std::getenv("PS2X_VU_RESERVED_DUMP") != nullptr;
+    if (dump)
+    {
+        const int unit = m_unit == Unit::VU1 ? 1 : 0;
+        std::fprintf(stderr, "[VU%d reserved-ctx] start=0x%x pc=0x%x code:", unit, s_lastStartPc[unit], m_state.pc);
+        if (const uint8_t *code = s_lastCode[unit])
+        {
+            const uint32_t from = m_state.pc >= 0x20u ? m_state.pc - 0x20u : 0u;
+            for (uint32_t a = from; a < m_state.pc + 0x20u && a + 8u <= s_lastCodeSize[unit]; a += 8u)
+            {
+                uint32_t lo = 0u, up = 0u;
+                std::memcpy(&lo, code + a, 4);
+                std::memcpy(&up, code + a + 4, 4);
+                std::fprintf(stderr, " %s%x:%08x/%08x", a == m_state.pc ? "*" : "", a, up, lo);
+            }
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     RUNTIME_ERROR(
         "[VU" << (m_unit == Unit::VU1 ? "1" : "0")
               << " reserved " << (upper ? "upper" : "lower")
@@ -1586,6 +1637,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
 {
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
+    s_lastStartPc[m_unit == Unit::VU1 ? 1 : 0] = m_state.pc;
     m_state.ebit = false;
     m_state.haltAfterDelaySlot = false;
     m_state.stoppedByD = false;
@@ -1620,6 +1672,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 {
     m_activeVuData = vuData;
     m_activeVuDataSize = dataSize;
+    s_lastCode[m_unit == Unit::VU1 ? 1 : 0] = vuCode;
+    s_lastCodeSize[m_unit == Unit::VU1 ? 1 : 0] = codeSize;
     m_activeGs = &gs;
     m_activeMemory = memory;
 

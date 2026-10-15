@@ -1,6 +1,35 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+
+namespace
+{
+    // Recent VIF1 UNPACKs, printed by ps2xDumpRecentVif1Unpacks() when a VU1 XGKICK
+    // reads a bad GIF tag (PS2X_VU_RESERVED_DUMP).
+    struct RecentUnpack
+    {
+        uint32_t seq, opcode, imm, num, tops, destQw, writes, bytes, avail;
+        bool written;
+    };
+    RecentUnpack g_recentUnpacks[64]{};
+    uint32_t g_recentUnpackSeq = 0u;
+}
+
+void ps2xDumpRecentVif1Unpacks()
+{
+    const uint32_t count = std::min<uint32_t>(g_recentUnpackSeq, 64u);
+    for (uint32_t i = g_recentUnpackSeq - count; i != g_recentUnpackSeq; ++i)
+    {
+        const RecentUnpack &u = g_recentUnpacks[i % 64u];
+        std::fprintf(stderr,
+                     "  [unpack #%u] op=0x%02x imm=0x%04x flg=%u tops=0x%x dest=qw0x%x..0x%x (byte 0x%x) bytes=0x%x avail=0x%x %s\n",
+                     u.seq, u.opcode, u.imm, (u.imm >> 15) & 1u, u.tops, u.destQw, u.destQw + u.writes - 1u,
+                     u.destQw * 16u, u.bytes, u.avail, u.written ? "written" : "SKIPPED (payload past buffer end)");
+    }
+}
 
 enum VIFCmd : uint8_t
 {
@@ -516,6 +545,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = (uint32_t)imm * 8u;
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            bool copied = false;
             if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
             {
                 uint32_t copyBytes = mpgBytes;
@@ -525,7 +555,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
+                    copied = true;
                 }
+            }
+            // PS2X_VIF_MPG_LOG=1 traces VU1 microcode uploads (first 2000).
+            static const bool mpgLog = std::getenv("PS2X_VIF_MPG_LOG") != nullptr;
+            static uint32_t mpgLogged = 0u;
+            if (mpgLog && mpgLogged++ < 2000u)
+            {
+                std::fprintf(stderr, "[vif1-mpg] dest=0x%x bytes=0x%x avail=0x%x copied=%d\n", destAddr, mpgBytes,
+                             sizeBytes - pos, copied ? 1 : 0);
             }
             pos += mpgBytes;
             if (pos > sizeBytes)
@@ -618,6 +657,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            {
+                RecentUnpack &u = g_recentUnpacks[g_recentUnpackSeq % 64u];
+                u = {g_recentUnpackSeq, opcode, imm, num, vif1_regs.tops & 0x3FFu, vuAddr, writeVectorCount,
+                     totalBytes, sizeBytes - pos, m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes};
+                ++g_recentUnpackSeq;
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
