@@ -1610,7 +1610,7 @@ void register_ps2_recompiler_tests()
                 };
                 const std::string registration = read(outputPath / "register_functions.cpp");
                 std::map<uint32_t, std::string> bindings;
-                const std::regex assignment(R"(g_ps2RecompiledFunctionTable\[[0-9]+\] = ([a-zA-Z0-9_]+); // 0x([0-9a-f]+))");
+                const std::regex assignment(R"(\{[0-9]+u, ([a-zA-Z0-9_]+)\}, // 0x([0-9a-f]+))");
                 for (std::sregex_iterator i(registration.begin(), registration.end(), assignment), end; i != end; ++i)
                 {
                     const uint32_t address = static_cast<uint32_t>(std::stoul((*i)[2].str(), nullptr, 16));

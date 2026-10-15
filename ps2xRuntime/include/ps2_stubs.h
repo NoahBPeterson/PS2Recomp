@@ -5,7 +5,7 @@ class  PS2Runtime;
 
 #include <cstdint>
 #include "ps2_call_list.h"
-#include "runtime/ps2_memory.h"
+#include "ps2_recomp_abi.h"
 #include "Stubs/Unimplemented.h"
 
 namespace ps2_stubs

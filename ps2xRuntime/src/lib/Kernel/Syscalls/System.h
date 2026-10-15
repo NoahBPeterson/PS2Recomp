@@ -2,6 +2,8 @@
 
 #include "ps2_syscalls.h"
 
+struct GSRegisters;
+
 namespace ps2_syscalls
 {
     void configureGsCrt(GSRegisters &gs, uint32_t interlaced, uint32_t videoMode, uint32_t frameMode);

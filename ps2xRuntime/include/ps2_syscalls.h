@@ -1,7 +1,7 @@
 #ifndef PS2_SYSCALLS_H
 #define PS2_SYSCALLS_H
 
-#include "ps2_runtime.h"
+#include "ps2_recomp_abi.h"
 #include "ps2_call_list.h"
 #include <mutex>
 #include <atomic>

@@ -131,7 +131,7 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
     {
-        return fmt::format("{{ uint32_t addr = (((uint32_t)ctx->vi[{}] & 0xFF) << 4) + {}u; uint32_t v; std::memcpy(&v, runtime->memory().getVU0Data() + addr, 4); ctx->vi[{}] = static_cast<uint16_t>(v); }}",
+        return fmt::format("{{ uint32_t addr = (((uint32_t)ctx->vi[{}] & 0xFF) << 4) + {}u; uint32_t v; std::memcpy(&v, ps2x_abi::vu0Data(runtime) + addr, 4); ctx->vi[{}] = static_cast<uint16_t>(v); }}",
                            inst.rd, vuFieldOffset(inst.vectorInfo.vectorField), inst.rt); // VILWR.<f> vit, (vis)
     }
 
@@ -145,7 +145,7 @@ namespace ps2recomp
             if (dest & (0x8u >> i))
                 stores += fmt::format("std::memcpy(vu0d + addr + {}u, &v, 4); ", i * 4u);
         }
-        return fmt::format("{{ uint8_t *vu0d = runtime->memory().getVU0Data(); uint32_t addr = ((uint32_t)ctx->vi[{}] & 0xFF) << 4; uint32_t v = ctx->vi[{}]; {}}}",
+        return fmt::format("{{ uint8_t *vu0d = ps2x_abi::vu0Data(runtime); uint32_t addr = ((uint32_t)ctx->vi[{}] & 0xFF) << 4; uint32_t v = ctx->vi[{}]; {}}}",
                            inst.rd, inst.rt, stores); // VISWR.<f> vit, (vis)
     }
 
@@ -185,7 +185,7 @@ namespace ps2recomp
         return fmt::format(
             "{{ "
             "    ctx->vu0_tpc = 0x{:X}; " // Set target program counter
-            "    runtime->executeVU0Microprogram(rdram, ctx, 0x{:X}); "
+            "    ps2x_abi::executeVU0Microprogram(runtime, rdram, ctx, 0x{:X}); "
             "}}",
             target_byte_addr, target_byte_addr);
     }
@@ -200,7 +200,7 @@ namespace ps2recomp
                "    uint16_t instr_index = (uint16_t)(ctx->vu0_cmsar0 & 0x1FF); " // Get instruction index from CMSAR0, mask to 9 bits
                "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
                "    ctx->vu0_pc = target_byte_addr; "
-               "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+               "    ps2x_abi::vu0StartMicroProgram(runtime, rdram, ctx, target_byte_addr); "
                "}";
     }
 
@@ -798,7 +798,7 @@ namespace ps2recomp
     {
         uint8_t vis = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ const uint8_t *vu0d = runtime->memory().getVU0Data(); "
+        return fmt::format("{{ const uint8_t *vu0d = ps2x_abi::vu0Data(runtime); "
                            "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0xFF)) << 4; "
                            "__m128 res = _mm_loadu_ps(reinterpret_cast<const float *>(vu0d + addr)); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
@@ -815,7 +815,7 @@ namespace ps2recomp
     {
         uint8_t vit = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint8_t *vu0d = runtime->memory().getVU0Data(); "
+        return fmt::format("{{ uint8_t *vu0d = ps2x_abi::vu0Data(runtime); "
                            "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0xFF)) << 4; "
                            "__m128 old_val = _mm_loadu_ps(reinterpret_cast<const float *>(vu0d + addr)); "
                            "__m128 res = _mm_blendv_ps(old_val, ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
@@ -832,7 +832,7 @@ namespace ps2recomp
     {
         uint8_t vis = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ const uint8_t *vu0d = runtime->memory().getVU0Data(); "
+        return fmt::format("{{ const uint8_t *vu0d = ps2x_abi::vu0Data(runtime); "
                            "ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1); "
                            "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0xFF)) << 4; "
                            "__m128 res = _mm_loadu_ps(reinterpret_cast<const float *>(vu0d + addr)); "
@@ -849,7 +849,7 @@ namespace ps2recomp
     {
         uint8_t vit = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint8_t *vu0d = runtime->memory().getVU0Data(); "
+        return fmt::format("{{ uint8_t *vu0d = ps2x_abi::vu0Data(runtime); "
                            "ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1); "
                            "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0xFF)) << 4; "
                            "__m128 old_val = _mm_loadu_ps(reinterpret_cast<const float *>(vu0d + addr)); "

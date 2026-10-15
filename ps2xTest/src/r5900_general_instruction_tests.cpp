@@ -461,7 +461,7 @@ void register_r5900_general_instruction_tests()
             const Instruction addi = decode(encodeI(OPCODE_ADDI, 1, 2, 5));            // addi $2, $1, 5
             const Instruction addiNeg = decode(encodeI(OPCODE_ADDI, 1, 2, imm16(-16))); // addi $2, $1, -16
             auto runAddi = [&] {
-                PS2X_EXEC_EMITTED(t, addi, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)5, tmp, ov); if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
+                PS2X_EXEC_EMITTED(t, addi, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)5, tmp, ov); if (ov) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
             };
 
             armTrapCheck(*ctx);
@@ -472,7 +472,7 @@ void register_r5900_general_instruction_tests()
 
             armTrapCheck(*ctx);
             setGpr32(*ctx, 1, 5u);
-            PS2X_EXEC_EMITTED(t, addiNeg, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)4294967280, tmp, ov); if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
+            PS2X_EXEC_EMITTED(t, addiNeg, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)4294967280, tmp, ov); if (ov) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
             expectGpr(t, *ctx, 2, sext32(0xFFFFFFF5u), "addi 5 + (-16) sign-extends the 32-bit result");
 
             armTrapCheck(*ctx);
@@ -485,7 +485,7 @@ void register_r5900_general_instruction_tests()
 
             armTrapCheck(*ctx);
             setGpr32(*ctx, 1, 0x80000000u);
-            PS2X_EXEC_EMITTED(t, addiNeg, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)4294967280, tmp, ov); if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
+            PS2X_EXEC_EMITTED(t, addiNeg, { uint32_t tmp; bool ov; ADD32_OV(GPR_U32(ctx, 1), (int32_t)4294967280, tmp, ov); if (ov) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_INTEGER_OVERFLOW), "addi INT32_MIN + (-16) must raise an overflow exception");
 
             expectTranslation(t, decode(encodeI(OPCODE_ADDI, 1, 0, 5)), "// NOP (addi to $zero)");
@@ -598,14 +598,14 @@ void register_r5900_general_instruction_tests()
 
             armTrapCheck(*ctx);
             setGpr(*ctx, 1, 0x0000000100000000ull);
-            PS2X_EXEC_EMITTED(t, daddi, { int64_t src = (int64_t)GPR_S64(ctx, 1); int64_t imm = (int64_t)(int32_t)4294967295; int64_t res = (int64_t)((uint64_t)src + (uint64_t)imm); if (((src ^ imm) >= 0) && ((src ^ res) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, res); });
+            PS2X_EXEC_EMITTED(t, daddi, { int64_t src = (int64_t)GPR_S64(ctx, 1); int64_t imm = (int64_t)(int32_t)4294967295; int64_t res = (int64_t)((uint64_t)src + (uint64_t)imm); if (((src ^ imm) >= 0) && ((src ^ res) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, res); });
             expectGpr(t, *ctx, 2, 0x00000000FFFFFFFFull, "daddi 0x100000000 + (-1) is a 64-bit add");
             t.IsTrue(noException(*ctx), "daddi without overflow must not raise an exception");
 
             armTrapCheck(*ctx);
             setGpr(*ctx, 1, 0x7FFFFFFFFFFFFFFFull);
             setGpr(*ctx, 2, 0x1234u);
-            PS2X_EXEC_EMITTED(t, daddiOne, { int64_t src = (int64_t)GPR_S64(ctx, 1); int64_t imm = (int64_t)(int32_t)1; int64_t res = (int64_t)((uint64_t)src + (uint64_t)imm); if (((src ^ imm) >= 0) && ((src ^ res) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, res); });
+            PS2X_EXEC_EMITTED(t, daddiOne, { int64_t src = (int64_t)GPR_S64(ctx, 1); int64_t imm = (int64_t)(int32_t)1; int64_t res = (int64_t)((uint64_t)src + (uint64_t)imm); if (((src ^ imm) >= 0) && ((src ^ res) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, res); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_INTEGER_OVERFLOW), "daddi INT64_MAX + 1 must raise an integer overflow exception");
             expectGpr(t, *ctx, 2, 0x1234u, "daddi overflow must leave rt unchanged");
 
@@ -949,7 +949,7 @@ void register_r5900_general_instruction_tests()
             const size_t jTarget = j.find("ctx->pc = 0x400000u;");
             t.IsTrue(jSlot != std::string::npos && jTarget != std::string::npos && jSlot < jTarget,
                      "j executes its delay slot before leaving for the target");
-            t.IsTrue(j.find("runtime->dispatchGuestBranch(rdram, ctx, 0x400000u, 0x1000u, 0x0u, PS2Runtime::GuestBranchKind::DirectJump, \"J\")") != std::string::npos,
+            t.IsTrue(j.find("ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, 0x400000u, 0x1000u, 0x0u, Ps2GuestBranchKind::DirectJump, \"J\")") != std::string::npos,
                      "j to an external target dispatches as a direct jump");
             t.IsTrue(j.find("SET_GPR_U32(ctx, 31") == std::string::npos, "j must not write $ra");
 
@@ -959,7 +959,7 @@ void register_r5900_general_instruction_tests()
             t.IsTrue(jalLink != std::string::npos, "jal writes the return address (pc + 8) to $ra");
             t.IsTrue(jalLink != std::string::npos && jalSlot != std::string::npos && jalLink < jalSlot,
                      "jal links before the delay slot so the slot can observe $ra");
-            t.IsTrue(jal.find("runtime->dispatchGuestBranch(rdram, ctx, 0x400000u, 0x1000u, 0x1008u, PS2Runtime::GuestBranchKind::DirectCall, \"JAL\")") != std::string::npos,
+            t.IsTrue(jal.find("ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, 0x400000u, 0x1000u, 0x1008u, Ps2GuestBranchKind::DirectCall, \"JAL\")") != std::string::npos,
                      "jal to an external target dispatches as a direct call with its return pc");
 
             // The upper four bits of the target come from the delay-slot pc.
@@ -1170,12 +1170,12 @@ void register_r5900_general_instruction_tests()
             t.IsTrue(retSlot != std::string::npos && retSet != std::string::npos,
                      "jr $ra runs the delay slot and publishes the target");
             t.IsTrue(retSlot < retSet, "jr $ra reads its target before the delay slot can modify it");
-            t.IsTrue(ret.find("PS2Runtime::GuestBranchKind::Return") != std::string::npos, "jr $ra is a return");
+            t.IsTrue(ret.find("Ps2GuestBranchKind::Return") != std::string::npos, "jr $ra is a return");
             t.IsTrue(ret.find("SET_GPR_U32(ctx, 31") == std::string::npos, "jr must not write $ra");
 
             const std::string jump = emitBranchFunction(jrT9);
             t.IsTrue(jump.find("const uint32_t jumpTarget = GPR_U32(ctx, 25);") != std::string::npos, "jr $t9 reads $t9");
-            t.IsTrue(jump.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x1000u, 0x0u, PS2Runtime::GuestBranchKind::IndirectJump, \"JR\")") != std::string::npos,
+            t.IsTrue(jump.find("ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, jumpTarget, 0x1000u, 0x0u, Ps2GuestBranchKind::IndirectJump, \"JR\")") != std::string::npos,
                      "jr through a non-return register dispatches as an indirect jump");
 
             const std::string call = emitBranchFunction(jalrT9);
@@ -1186,7 +1186,7 @@ void register_r5900_general_instruction_tests()
             t.IsTrue(callLink != std::string::npos && callSlot != std::string::npos,
                      "jalr links and runs the delay slot after reading its target");
             t.IsTrue(callLink < callSlot, "jalr links before the delay slot so the slot can observe $ra");
-            t.IsTrue(call.find("runtime->dispatchGuestBranch(rdram, ctx, jumpTarget, 0x1000u, 0x1008u, PS2Runtime::GuestBranchKind::IndirectCall, \"JALR\")") != std::string::npos,
+            t.IsTrue(call.find("ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, jumpTarget, 0x1000u, 0x1008u, Ps2GuestBranchKind::IndirectCall, \"JALR\")") != std::string::npos,
                      "jalr dispatches as an indirect call with its return pc");
 
             const std::string callT0 = emitBranchFunction(jalrT0);
@@ -1227,10 +1227,10 @@ void register_r5900_general_instruction_tests()
             const Instruction brk = decode((0x7u << 6) | SPECIAL_BREAK);          // break 7
             const Instruction sync = decode((0x10u << 6) | SPECIAL_SYNC);         // sync.p
 
-            expectTranslation(t, syscall, "ctx->pc = 0x1004u;\nruntime->handleSyscall(rdram, ctx, 0x1234u);");
+            expectTranslation(t, syscall, "ctx->pc = 0x1004u;\nps2x_abi::handleSyscall(runtime, rdram, ctx, 0x1234u);");
 
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, brk, runtime->handleBreak(rdram, ctx););
+            PS2X_EXEC_EMITTED(t, brk, ps2x_abi::handleBreak(runtime, rdram, ctx););
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_BREAKPOINT), "break raises a breakpoint exception at the faulting pc");
 
             expectTranslation(t, sync, "// SYNC instruction - memory barrier\n// In recompiled code, we don't need explicit memory barriers");
@@ -1383,10 +1383,10 @@ void register_r5900_general_instruction_tests()
             const Instruction sub = decode(encodeR(SPECIAL_SUB, 1, 3, 2));   // sub $2, $1, $3
             const Instruction subu = decode(encodeR(SPECIAL_SUBU, 1, 3, 2)); // subu $2, $1, $3
             auto runAdd = [&] {
-                PS2X_EXEC_EMITTED(t, add, { int32_t rs_val = GPR_S32(ctx, 1); int32_t rt_val = GPR_S32(ctx, 3); int64_t result = (int64_t)rs_val + (int64_t)rt_val; if (result > INT32_MAX || result < INT32_MIN) { runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); } else { SET_GPR_S32(ctx, 2, (int32_t)result); } });
+                PS2X_EXEC_EMITTED(t, add, { int32_t rs_val = GPR_S32(ctx, 1); int32_t rt_val = GPR_S32(ctx, 3); int64_t result = (int64_t)rs_val + (int64_t)rt_val; if (result > INT32_MAX || result < INT32_MIN) { ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); } else { SET_GPR_S32(ctx, 2, (int32_t)result); } });
             };
             auto runSub = [&] {
-                PS2X_EXEC_EMITTED(t, sub, { uint32_t tmp; bool ov; SUB32_OV(GPR_U32(ctx, 1), GPR_U32(ctx, 3), tmp, ov); if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
+                PS2X_EXEC_EMITTED(t, sub, { uint32_t tmp; bool ov; SUB32_OV(GPR_U32(ctx, 1), GPR_U32(ctx, 3), tmp, ov); if (ov) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S32(ctx, 2, (int32_t)tmp); });
             };
 
             armTrapCheck(*ctx);
@@ -1498,10 +1498,10 @@ void register_r5900_general_instruction_tests()
             const Instruction dsub = decode(encodeR(SPECIAL_DSUB, 1, 3, 2));   // dsub $2, $1, $3
             const Instruction dsubu = decode(encodeR(SPECIAL_DSUBU, 1, 3, 2)); // dsubu $2, $1, $3
             auto runDadd = [&] {
-                PS2X_EXEC_EMITTED(t, dadd, { int64_t a = (int64_t)GPR_S64(ctx, 1); int64_t b = (int64_t)GPR_S64(ctx, 3); int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); if (((a ^ b) >= 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, r); });
+                PS2X_EXEC_EMITTED(t, dadd, { int64_t a = (int64_t)GPR_S64(ctx, 1); int64_t b = (int64_t)GPR_S64(ctx, 3); int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); if (((a ^ b) >= 0) && ((a ^ r) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, r); });
             };
             auto runDsub = [&] {
-                PS2X_EXEC_EMITTED(t, dsub, { int64_t a = (int64_t)GPR_S64(ctx, 1); int64_t b = (int64_t)GPR_S64(ctx, 3); int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); if (((a ^ b) < 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, r); });
+                PS2X_EXEC_EMITTED(t, dsub, { int64_t a = (int64_t)GPR_S64(ctx, 1); int64_t b = (int64_t)GPR_S64(ctx, 3); int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); if (((a ^ b) < 0) && ((a ^ r) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); else SET_GPR_S64(ctx, 2, r); });
             };
 
             armTrapCheck(*ctx);
@@ -1558,35 +1558,35 @@ void register_r5900_general_instruction_tests()
             setGpr(*ctx, 3, 1u);
 
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tge, if (GPR_S64(ctx, 1) >= GPR_S64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tge, if (GPR_S64(ctx, 1) >= GPR_S64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tge: -1 >= 1 is false, no trap");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tgeu, if (GPR_U64(ctx, 1) >= GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tgeu, if (GPR_U64(ctx, 1) >= GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tgeu: 0xFFFFFFFFFFFFFFFF >= 1 traps");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tlt, if (GPR_S64(ctx, 1) < GPR_S64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tlt, if (GPR_S64(ctx, 1) < GPR_S64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tlt: -1 < 1 traps");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tltu, if (GPR_U64(ctx, 1) < GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tltu, if (GPR_U64(ctx, 1) < GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tltu: 0xFFFFFFFFFFFFFFFF < 1 is false, no trap");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, teq, if (GPR_U64(ctx, 1) == GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, teq, if (GPR_U64(ctx, 1) == GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "teq on different values does not trap");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tne, if (GPR_U64(ctx, 1) != GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tne, if (GPR_U64(ctx, 1) != GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tne on different values traps");
 
             // Equal low words, different high words: every compare must look at all 64 bits.
             setGpr(*ctx, 1, 0x0000000100000005ull);
             setGpr(*ctx, 3, 0x0000000000000005ull);
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, teq, if (GPR_U64(ctx, 1) == GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, teq, if (GPR_U64(ctx, 1) == GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "teq compares all 64 bits");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tge, if (GPR_S64(ctx, 1) >= GPR_S64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tge, if (GPR_S64(ctx, 1) >= GPR_S64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tge compares all 64 bits");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tltu, if (GPR_U64(ctx, 1) < GPR_U64(ctx, 3)) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tltu, if (GPR_U64(ctx, 1) < GPR_U64(ctx, 3)) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tltu compares all 64 bits");
         });
 
@@ -1702,32 +1702,32 @@ void register_r5900_general_instruction_tests()
 
             setGpr(*ctx, 1, 0xFFFFFFFFFFFFFFFEull); // -2 signed, just below max unsigned
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tgei, if (GPR_S64(ctx, 1) >= (int64_t)(int32_t)4294967295) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tgei, if (GPR_S64(ctx, 1) >= (int64_t)(int32_t)4294967295) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tgei: -2 >= -1 is false, no trap");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tlti, if (GPR_S64(ctx, 1) < (int64_t)(int32_t)4294967295) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tlti, if (GPR_S64(ctx, 1) < (int64_t)(int32_t)4294967295) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tlti: -2 < -1 traps");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tgeiu, if (GPR_U64(ctx, 1) >= (uint64_t)(int64_t)(int32_t)4294967295) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tgeiu, if (GPR_U64(ctx, 1) >= (uint64_t)(int64_t)(int32_t)4294967295) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tgeiu: the immediate -1 is 0xFFFFFFFFFFFFFFFF unsigned, so 0x...FFFE is below it");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tltiu, if (GPR_U64(ctx, 1) < (uint64_t)(int64_t)(int32_t)4294967295) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tltiu, if (GPR_U64(ctx, 1) < (uint64_t)(int64_t)(int32_t)4294967295) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tltiu: 0x...FFFE < 0xFFFFFFFFFFFFFFFF traps");
 
             setGpr(*ctx, 1, 5u);
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, teqi, if (GPR_S64(ctx, 1) == (int64_t)(int32_t)5) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, teqi, if (GPR_S64(ctx, 1) == (int64_t)(int32_t)5) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "teqi traps on an equal value");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tnei, if (GPR_S64(ctx, 1) != (int64_t)(int32_t)5) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tnei, if (GPR_S64(ctx, 1) != (int64_t)(int32_t)5) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "tnei does not trap on an equal value");
 
             setGpr(*ctx, 1, 0x0000000100000005ull); // same low word, so the compare must use all 64 bits
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, teqi, if (GPR_S64(ctx, 1) == (int64_t)(int32_t)5) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, teqi, if (GPR_S64(ctx, 1) == (int64_t)(int32_t)5) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(noException(*ctx), "teqi compares all 64 bits");
             armTrapCheck(*ctx);
-            PS2X_EXEC_EMITTED(t, tnei, if (GPR_S64(ctx, 1) != (int64_t)(int32_t)5) { runtime->handleTrap(rdram, ctx); });
+            PS2X_EXEC_EMITTED(t, tnei, if (GPR_S64(ctx, 1) != (int64_t)(int32_t)5) { ps2x_abi::handleTrap(runtime, rdram, ctx); });
             t.IsTrue(exceptionRaised(*ctx, EXCEPTION_TRAP), "tnei compares all 64 bits");
         });
 

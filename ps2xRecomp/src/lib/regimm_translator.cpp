@@ -38,17 +38,17 @@ namespace ps2recomp
         case REGIMM_MTSAH:
             return fmt::format("ctx->sa = ((GPR_U32(ctx, {}) ^ (uint32_t){}) & 0x7) << 4;", inst.rs, inst.simmediate);
         case REGIMM_TGEI:
-            return fmt::format("if (GPR_S64(ctx, {}) >= (int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_S64(ctx, {}) >= (int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TGEIU:
-            return fmt::format("if (GPR_U64(ctx, {}) >= (uint64_t)(int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_U64(ctx, {}) >= (uint64_t)(int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TLTI:
-            return fmt::format("if (GPR_S64(ctx, {}) < (int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_S64(ctx, {}) < (int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TLTIU:
-            return fmt::format("if (GPR_U64(ctx, {}) < (uint64_t)(int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_U64(ctx, {}) < (uint64_t)(int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TEQI:
-            return fmt::format("if (GPR_S64(ctx, {}) == (int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_S64(ctx, {}) == (int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         case REGIMM_TNEI:
-            return fmt::format("if (GPR_S64(ctx, {}) != (int64_t)(int32_t){}) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.simmediate);
+            return fmt::format("if (GPR_S64(ctx, {}) != (int64_t)(int32_t){}) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.simmediate);
         default:
             return m_codeGenerator.emitUnhandledInstruction(inst, fmt::format("Unhandled REGIMM instruction: 0x{:X}", inst.rt));
         }

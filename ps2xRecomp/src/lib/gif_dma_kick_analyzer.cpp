@@ -258,7 +258,7 @@ namespace ps2recomp
     std::string gifDmaKickCall(const GifDmaKickPlan &plan)
     {
         std::ostringstream ss;
-        ss << "runtime->kickGifDmaChainFromMMIO(rdram, ctx, "
+        ss << "ps2x_abi::kickGifDmaChainFromMMIO(runtime, rdram, ctx, "
            << plan.values[0] << ", "
            << plan.values[1] << ", "
            << plan.values[2] << ", "

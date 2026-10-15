@@ -182,12 +182,12 @@ namespace
         }
 
         requestSchedulerCheckpoint(runtime);
-        if (!runtime->dispatchGuestBranch(rdram,
+        if (!ps2x_abi::dispatchGuestBranch(runtime, rdram,
                                           ctx,
                                           0x3300u,
                                           0x3304u,
                                           0x3308u,
-                                          PS2Runtime::GuestBranchKind::DirectCall,
+                                          Ps2GuestBranchKind::DirectCall,
                                           "test-recursive-call"))
         {
             return;
@@ -206,7 +206,7 @@ namespace
 
         requestSchedulerCheckpoint(runtime);
         ctx->pc = 0x3400u;
-        if (runtime->eeCheckpointDue())
+        if (ps2x_abi::eeCheckpointDue(runtime))
         {
             return;
         }
@@ -442,7 +442,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3000u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::IndirectCall,
+                Ps2GuestBranchKind::IndirectCall,
                 "test-jalr");
 
             t.IsTrue(returnedToFallthrough,
@@ -468,7 +468,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3400u,
                 0x2000u,
                 0u,
-                PS2Runtime::GuestBranchKind::IndirectJump,
+                Ps2GuestBranchKind::IndirectJump,
                 "test-jr");
 
             t.IsFalse(continuedInCaller,
@@ -493,7 +493,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3100u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::IndirectCall,
+                Ps2GuestBranchKind::IndirectCall,
                 "test-jalr-transfer");
 
             t.IsFalse(returnedToFallthrough,
@@ -516,7 +516,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3300u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::DirectCall,
+                Ps2GuestBranchKind::DirectCall,
                 "test-yield-outer");
 
             t.IsFalse(returnedToFallthrough,
@@ -541,7 +541,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3400u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::DirectCall,
+                Ps2GuestBranchKind::DirectCall,
                 "test-entry-loop-yield");
 
             t.IsFalse(returnedToFallthrough,
@@ -567,7 +567,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3210u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::IndirectCall,
+                Ps2GuestBranchKind::IndirectCall,
                 "test-missing");
 
             t.IsFalse(returnedToFallthrough,
@@ -593,7 +593,7 @@ void register_ps2_runtime_expansion_tests()
                 0x3210u,
                 0x2000u,
                 0x2008u,
-                PS2Runtime::GuestBranchKind::IndirectCall,
+                Ps2GuestBranchKind::IndirectCall,
                 "test-missing-unwind");
 
             t.IsFalse(continuedInCaller,

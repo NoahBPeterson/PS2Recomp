@@ -131,7 +131,7 @@ namespace
 
     void overrideRecursiveFindAddressHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        runtime->handleSyscall(rdram, ctx, 0x83u);
+        ps2x_abi::handleSyscall(runtime, rdram, ctx, 0x83u);
         ctx->pc = ::getRegU32(ctx, 31);
     }
 
@@ -190,7 +190,7 @@ namespace
     void schedulerOverrideEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ctx->pc = K_OVERRIDE_RESUME;
-        runtime->handleSyscall(rdram, ctx, gOverrideSyscall);
+        ps2x_abi::handleSyscall(runtime, rdram, ctx, gOverrideSyscall);
     }
 
     void schedulerOverrideResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
@@ -211,7 +211,7 @@ namespace
         const int driverId = runtime->eeScheduler().createThread(driver);
         runtime->eeScheduler().startThread(driverId, 0u, *ctx, false);
         ctx->pc = K_OVERRIDE_BLOCK_BASE_RESUME;
-        runtime->handleSyscall(rdram, ctx, gOverrideSyscall);
+        ps2x_abi::handleSyscall(runtime, rdram, ctx, gOverrideSyscall);
     }
 
     void schedulerBlockingOverrideHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

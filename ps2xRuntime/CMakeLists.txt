@@ -390,6 +390,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_recomp_abi.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
@@ -475,12 +476,15 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
         UNITY_BUILD ON
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
     )
+    # The generated function table is one large file of its own; compile it on its own job so it
+    # runs alongside the other units instead of serializing the end of the build.
+    set_source_files_properties(src/runner/register_functions.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
 endif()
 
 if(PS2X_ENABLE_RUNNER_PCH)
     set(PS2X_RUNNER_PCH_HEADERS
+        # Not ps2_runtime.h: generated code sees the runtime only through ps2_recomp_abi.h (T-0001).
         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime.h"
     )
 
     foreach(PS2X_RUNNER_GENERATED_HEADER IN ITEMS

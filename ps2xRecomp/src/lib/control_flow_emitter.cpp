@@ -177,7 +177,7 @@ namespace ps2recomp
         m_ss << fmt::format("{}ctx->pc = 0x{:X}u;\n", indent, target);
         if (target <= sourcePc && !isCallLikeEdge())
         {
-            m_ss << fmt::format("{}if (runtime->eeCheckpointDue()) {{\n", indent);
+            m_ss << fmt::format("{}if (ps2x_abi::eeCheckpointDue(runtime)) {{\n", indent);
             m_ss << fmt::format("{}    return;\n", indent);
             m_ss << fmt::format("{}}}\n", indent);
         }
@@ -193,7 +193,7 @@ namespace ps2recomp
                                                        bool returnOnTransfer)
     {
         m_ss << fmt::format(
-            "{}if (!runtime->dispatchGuestBranch(rdram, ctx, {}, 0x{:X}u, 0x{:X}u, PS2Runtime::GuestBranchKind::{}, \"{}\")) {{\n",
+            "{}if (!ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, {}, 0x{:X}u, 0x{:X}u, Ps2GuestBranchKind::{}, \"{}\")) {{\n",
             indent,
             targetExpression,
             sourcePc,
@@ -257,9 +257,9 @@ namespace ps2recomp
         if (isReturn)
         {
             m_ss << indent << "#if defined(PS2X_STRICT_RETURN_DIAGNOSTICS) && PS2X_STRICT_RETURN_DIAGNOSTICS\n";
-            m_ss << indent << "(void)runtime->dispatchGuestBranch(rdram, ctx, " << jumpTargetExpression
+            m_ss << indent << "(void)ps2x_abi::dispatchGuestBranch(runtime, rdram, ctx, " << jumpTargetExpression
                  << ", 0x" << fmt::format("{:X}", branchPc())
-                 << "u, 0u, PS2Runtime::GuestBranchKind::Return, \"JR $ra\");\n";
+                 << "u, 0u, Ps2GuestBranchKind::Return, \"JR $ra\");\n";
             m_ss << indent << "return;\n";
             m_ss << indent << "#else\n";
             m_ss << indent << "ctx->pc = " << jumpTargetExpression << ";\n";

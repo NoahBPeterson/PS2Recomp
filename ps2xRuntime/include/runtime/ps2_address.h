@@ -3,7 +3,7 @@
 
 #include <cstdint>
 
-#include "runtime/ps2_memory.h"
+#include "runtime/ps2_memory_map.h"
 
 static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_BASE = 0x20000000u;
 static inline constexpr uint32_t PS2_EE_UNCACHED_RAM_MIRROR_SIZE = 0x20000000u;

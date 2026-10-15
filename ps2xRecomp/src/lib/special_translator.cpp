@@ -41,11 +41,11 @@ namespace ps2recomp
         case SPECIAL_JALR:
             return fmt::format("// JALR ${}, ${} - Handled by branch logic", inst.rd, inst.rs);
         case SPECIAL_SYSCALL:
-            return fmt::format("ctx->pc = 0x{:X}u;\nruntime->handleSyscall(rdram, ctx, 0x{:X}u);",
+            return fmt::format("ctx->pc = 0x{:X}u;\nps2x_abi::handleSyscall(runtime, rdram, ctx, 0x{:X}u);",
                                inst.address + 4u,
                                (inst.raw >> 6) & 0xFFFFFu);
         case SPECIAL_BREAK:
-            return fmt::format("runtime->handleBreak(rdram, ctx);");
+            return fmt::format("ps2x_abi::handleBreak(runtime, rdram, ctx);");
         case SPECIAL_SYNC:
             return "// SYNC instruction - memory barrier\n// In recompiled code, we don't need explicit memory barriers";
         case SPECIAL_MFHI:
@@ -91,7 +91,7 @@ namespace ps2recomp
                 "    int32_t rt_val = GPR_S32(ctx, {}); "
                 "    int64_t result = (int64_t)rs_val + (int64_t)rt_val; "
                 "    if (result > INT32_MAX || result < INT32_MIN) {{ "
-                "        runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "        ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "    }} else {{ "
                 "        SET_GPR_S32(ctx, {}, (int32_t)result); "
                 "    }} "
@@ -103,7 +103,7 @@ namespace ps2recomp
             return fmt::format(
                 "{{ uint32_t tmp; bool ov; "
                 "SUB32_OV(GPR_U32(ctx, {}), GPR_U32(ctx, {}), tmp, ov); "
-                "if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "if (ov) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "else SET_GPR_S32(ctx, {}, (int32_t)tmp); }}",
                 inst.rs, inst.rt, inst.rd);
         case SPECIAL_SUBU:
@@ -134,7 +134,7 @@ namespace ps2recomp
                 "{{ int64_t a = (int64_t)GPR_S64(ctx, {}); "
                 "int64_t b = (int64_t)GPR_S64(ctx, {}); "
                 "int64_t r = (int64_t)((uint64_t)a + (uint64_t)b); "
-                "if (((a ^ b) >= 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "if (((a ^ b) >= 0) && ((a ^ r) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "else SET_GPR_S64(ctx, {}, r); }}",
                 inst.rs, inst.rt, inst.rd);
         case SPECIAL_DADDU:
@@ -146,7 +146,7 @@ namespace ps2recomp
                 "{{ int64_t a = (int64_t)GPR_S64(ctx, {}); "
                 "int64_t b = (int64_t)GPR_S64(ctx, {}); "
                 "int64_t r = (int64_t)((uint64_t)a - (uint64_t)b); "
-                "if (((a ^ b) < 0) && ((a ^ r) < 0)) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "if (((a ^ b) < 0) && ((a ^ r) < 0)) ps2x_abi::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "else SET_GPR_S64(ctx, {}, r); }}",
                 inst.rs, inst.rt, inst.rd);
         case SPECIAL_DSUBU:
@@ -170,17 +170,17 @@ namespace ps2recomp
         case SPECIAL_DSRA32:
             return fmt::format("SET_GPR_S64(ctx, {}, GPR_S64(ctx, {}) >> (32 + {}));", inst.rd, inst.rt, inst.sa);
         case SPECIAL_TGE:
-            return fmt::format("if (GPR_S64(ctx, {}) >= GPR_S64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_S64(ctx, {}) >= GPR_S64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         case SPECIAL_TGEU:
-            return fmt::format("if (GPR_U64(ctx, {}) >= GPR_U64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_U64(ctx, {}) >= GPR_U64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         case SPECIAL_TLT:
-            return fmt::format("if (GPR_S64(ctx, {}) < GPR_S64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_S64(ctx, {}) < GPR_S64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         case SPECIAL_TLTU:
-            return fmt::format("if (GPR_U64(ctx, {}) < GPR_U64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_U64(ctx, {}) < GPR_U64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         case SPECIAL_TEQ:
-            return fmt::format("if (GPR_U64(ctx, {}) == GPR_U64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_U64(ctx, {}) == GPR_U64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         case SPECIAL_TNE:
-            return fmt::format("if (GPR_U64(ctx, {}) != GPR_U64(ctx, {})) {{ runtime->handleTrap(rdram, ctx); }}", inst.rs, inst.rt);
+            return fmt::format("if (GPR_U64(ctx, {}) != GPR_U64(ctx, {})) {{ ps2x_abi::handleTrap(runtime, rdram, ctx); }}", inst.rs, inst.rt);
         default:
             return m_codeGenerator.emitUnhandledInstruction(inst, fmt::format("Unhandled SPECIAL instruction: 0x{:X}", inst.function));
         }
