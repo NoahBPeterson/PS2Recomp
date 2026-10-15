@@ -583,6 +583,37 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // thbase alarms fire in interrupt context; the handler's return value is
+        // the next interval in IOP cycles (0 = one-shot).
+        void serviceDueAlarms()
+        {
+            if (servicingGuestCallbacks)
+                return;
+            std::vector<IopAlarm> due = kernel.takeDueAlarms(totalCycles);
+            if (due.empty())
+                return;
+
+            servicingGuestCallbacks = true;
+            try
+            {
+                for (IopAlarm &alarm : due)
+                {
+                    const uint32_t nextInterval = callFunction(alarm.handler, alarm.argument, 0u, 0u, 0u, alarm.gp, 100000u);
+                    if (nextInterval != 0u)
+                    {
+                        alarm.dueCycle = std::max(alarm.dueCycle + nextInterval, totalCycles + 1u);
+                        kernel.rearmAlarm(alarm);
+                    }
+                }
+            }
+            catch (...)
+            {
+                servicingGuestCallbacks = false;
+                throw;
+            }
+            servicingGuestCallbacks = false;
+        }
+
         void runCycles(uint64_t cycles) noexcept
         {
             try
@@ -597,6 +628,7 @@ namespace ps2x::iop::detail
                     }
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
+                    serviceDueAlarms();
                     timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
@@ -606,6 +638,7 @@ namespace ps2x::iop::detail
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
+                        nextWake = kernel.nextAlarmCycle(nextWake);
                         nextWake = timrman.nextEventCycle(nextWake);
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;

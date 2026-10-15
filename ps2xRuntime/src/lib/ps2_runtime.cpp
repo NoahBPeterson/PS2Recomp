@@ -2453,6 +2453,19 @@ void PS2Runtime::run()
         }
         EndDrawing();
 
+        // PS2X_SCREENSHOT_EVERY=N saves the presented frame every N host frames
+        // (ps2x_frame_<n>.png in the working directory).
+        static const uint32_t screenshotEvery = []
+        {
+            const char *value = std::getenv("PS2X_SCREENSHOT_EVERY");
+            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+        }();
+        static uint32_t presentedFrames = 0u;
+        if (screenshotEvery != 0u && (++presentedFrames % screenshotEvery) == 0u)
+        {
+            TakeScreenshot(TextFormat("ps2x_frame_%05u.png", presentedFrames));
+        }
+
         if (WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");

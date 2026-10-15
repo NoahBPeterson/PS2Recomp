@@ -30,6 +30,7 @@ namespace ps2x::iop::detail
         m_threads.clear();
         m_semaphores.clear();
         m_eventFlags.clear();
+        m_alarms.clear();
         m_nextThreadId = 1;
         m_nextSemaphoreId = 1;
         m_nextEventFlagId = 1;
@@ -269,12 +270,43 @@ namespace ps2x::iop::detail
             m_memory.write32(cpu.gpr[4] + 4u, static_cast<uint32_t>(currentCycle >> 32u));
             setV0(0);
             return true;
-        case 35:
-        case 36:
-        case 37:
-        case 38:
+        case 35: // SetAlarm
+        case 36: // iSetAlarm
+        {
+            constexpr int32_t kErrorFoundHandler = -104;
+            const uint32_t clockAddress = cpu.gpr[4];
+            const uint32_t handler = cpu.gpr[5];
+            const uint32_t argument = cpu.gpr[6];
+            const uint64_t clock = static_cast<uint64_t>(m_memory.read32(clockAddress)) |
+                                   (static_cast<uint64_t>(m_memory.read32(clockAddress + 4u)) << 32u);
+            const bool duplicate = std::any_of(m_alarms.begin(), m_alarms.end(), [&](const IopAlarm &alarm)
+                                               { return alarm.handler == handler && alarm.argument == argument; });
+            if (duplicate)
+            {
+                setV0(kErrorFoundHandler);
+                return true;
+            }
+            m_alarms.push_back({currentCycle + std::max<uint64_t>(clock, 1u), handler, argument, cpu.gpr[28]});
             setV0(0);
             return true;
+        }
+        case 37: // CancelAlarm
+        case 38: // iCancelAlarm
+        {
+            constexpr int32_t kErrorNotFoundHandler = -105;
+            const uint32_t handler = cpu.gpr[4];
+            const uint32_t argument = cpu.gpr[5];
+            const auto it = std::find_if(m_alarms.begin(), m_alarms.end(), [&](const IopAlarm &alarm)
+                                         { return alarm.handler == handler && alarm.argument == argument; });
+            if (it == m_alarms.end())
+            {
+                setV0(kErrorNotFoundHandler);
+                return true;
+            }
+            m_alarms.erase(it);
+            setV0(0);
+            return true;
+        }
         case 39: // USec2SysClock
         {
             const uint64_t cycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz) / 1'000'000ull;
@@ -707,6 +739,37 @@ namespace ps2x::iop::detail
                 nextWake = std::min(nextWake, thread.wakeCycle);
         }
         return nextWake;
+    }
+
+    std::vector<IopAlarm> IopKernel::takeDueAlarms(uint64_t currentCycle)
+    {
+        std::vector<IopAlarm> due;
+        for (auto it = m_alarms.begin(); it != m_alarms.end();)
+        {
+            if (it->dueCycle <= currentCycle)
+            {
+                due.push_back(*it);
+                it = m_alarms.erase(it);
+            }
+            else
+                ++it;
+        }
+        std::sort(due.begin(), due.end(), [](const IopAlarm &a, const IopAlarm &b)
+                  { return a.dueCycle < b.dueCycle; });
+        return due;
+    }
+
+    void IopKernel::rearmAlarm(const IopAlarm &alarm)
+    {
+        m_alarms.push_back(alarm);
+    }
+
+    uint64_t IopKernel::nextAlarmCycle(uint64_t fallback) const
+    {
+        uint64_t next = fallback;
+        for (const IopAlarm &alarm : m_alarms)
+            next = std::min(next, alarm.dueCycle);
+        return next;
     }
 
     void IopKernel::dumpThreads(uint64_t currentCycle) const

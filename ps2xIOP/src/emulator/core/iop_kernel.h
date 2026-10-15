@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <vector>
 
 namespace ps2x::iop::detail
 {
@@ -43,6 +44,16 @@ namespace ps2x::iop::detail
         int wakeupCount = 0;
     };
 
+    // thbase SetAlarm/iSetAlarm registration. The handler runs in interrupt
+    // context; a non-zero return value re-arms it that many cycles later.
+    struct IopAlarm
+    {
+        uint64_t dueCycle = 0;
+        uint32_t handler = 0;
+        uint32_t argument = 0;
+        uint32_t gp = 0;
+    };
+
     class IopKernel
     {
     public:
@@ -68,6 +79,10 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] size_t threadCount() const noexcept { return m_threads.size(); }
         void dumpThreads(uint64_t currentCycle) const;
+
+        [[nodiscard]] std::vector<IopAlarm> takeDueAlarms(uint64_t currentCycle);
+        void rearmAlarm(const IopAlarm &alarm);
+        [[nodiscard]] uint64_t nextAlarmCycle(uint64_t fallback) const;
 
     private:
         struct Semaphore
@@ -96,6 +111,7 @@ namespace ps2x::iop::detail
         std::map<int, IopThread> m_threads;
         std::map<int, Semaphore> m_semaphores;
         std::map<int, EventFlag> m_eventFlags;
+        std::vector<IopAlarm> m_alarms;
         uint32_t m_nextThreadId = 1;
         uint32_t m_nextSemaphoreId = 1;
         uint32_t m_nextEventFlagId = 1;
