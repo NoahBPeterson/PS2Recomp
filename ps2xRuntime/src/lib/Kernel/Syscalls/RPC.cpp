@@ -722,14 +722,10 @@ namespace ps2_syscalls
         uint32_t sid = getRegU32(ctx, 5);
         uint32_t func = getRegU32(ctx, 6);
         uint32_t buf = getRegU32(ctx, 7);
-        // stack args: cfunc, cbuf, qd...
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t cfunc = 0;
-        uint32_t cbuf = 0;
-        uint32_t qd = 0;
-        readStackU32(rdram, sp, 0x10, cfunc);
-        readStackU32(rdram, sp, 0x14, cbuf);
-        readStackU32(rdram, sp, 0x18, qd);
+        // EE EABI: args 5-7 (cfunc, cbuf, qd) arrive in $t0-$t2, not on the stack.
+        const uint32_t cfunc = getRegU32(ctx, 8);
+        const uint32_t cbuf = getRegU32(ctx, 9);
+        const uint32_t qd = getRegU32(ctx, 10);
 
         t_SifRpcServerData *sd = reinterpret_cast<t_SifRpcServerData *>(getMemPtr(rdram, sdPtr));
         if (!sd)
@@ -989,11 +985,8 @@ namespace ps2_syscalls
         uint32_t packetSize = getRegU32(ctx, 6);
         uint32_t srcExtra = getRegU32(ctx, 7);
 
-        uint32_t sp = getRegU32(ctx, 29);
-        uint32_t destExtra = 0;
-        uint32_t sizeExtra = 0;
-        readStackU32(rdram, sp, 0x10, destExtra);
-        readStackU32(rdram, sp, 0x14, sizeExtra);
+        const uint32_t destExtra = getRegU32(ctx, 8);
+        const uint32_t sizeExtra = getRegU32(ctx, 9);
 
         if (sizeExtra > 0 && srcExtra && destExtra)
         {
