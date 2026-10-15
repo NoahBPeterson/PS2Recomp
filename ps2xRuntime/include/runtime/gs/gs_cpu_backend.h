@@ -86,6 +86,9 @@ private:
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
     std::array<uint64_t, 512> m_pageWriteStamp{};
+    // Pages written since the last TEXFLUSH. Textures decoded meanwhile read the stale texture
+    // page buffer, so TEXFLUSH re-stamps these pages to force a re-decode.
+    std::array<bool, 512> m_pageWrittenSinceFlush{};
     uint64_t m_vramWriteStamp = 1;
     uint64_t m_clutVersion = 1;
     std::unordered_map<uint64_t, std::unique_ptr<DecodedTexture>> m_decodedTextures;

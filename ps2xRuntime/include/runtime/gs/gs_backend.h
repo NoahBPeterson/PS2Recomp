@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+struct GSDebugSnapshot;
+
 class GSRasterBackend
 {
 public:
@@ -12,6 +14,13 @@ public:
 
     virtual void Initialize(uint8_t *vram, uint32_t vramSize) = 0;
     virtual void Reset() = 0;
+
+    // Raw-command backends (paraLLEl-GS) consume GIF packets and register writes directly
+    // instead of the frontend's decoded primitives.
+    virtual bool UsesRawCommands() const { return false; }
+    virtual void ProcessGIF(uint32_t /*path*/, const uint8_t * /*data*/, uint32_t /*sizeBytes*/) {}
+    virtual void WriteRegisterRaw(uint8_t /*addr*/, uint64_t /*value*/) {}
+    virtual void ReadRegisterState(GSDebugSnapshot & /*snapshot*/) const {}
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;

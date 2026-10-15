@@ -277,6 +277,8 @@ struct GSTransferSnapshot
 struct GSPresentationRequest
 {
     uint64_t pmode = 0;
+    uint64_t smode1 = 0;
+    uint64_t syncv = 0;
     uint64_t smode2 = 0;
     uint64_t dispfb1 = 0;
     uint64_t display1 = 0;
@@ -284,6 +286,7 @@ struct GSPresentationRequest
     uint64_t display2 = 0;
     uint64_t bgcolor = 0;
     uint64_t vsyncTick = 0;
+    uint32_t field = 0; // CSR.FIELD, for interlaced scanout
     GSFrameReg contextFrames[2]{};
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;

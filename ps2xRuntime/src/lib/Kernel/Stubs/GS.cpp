@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/ee_scheduler.h"
+#include "../Syscalls/System.h"
 
 namespace ps2_stubs
 {
@@ -71,40 +72,19 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // The EE calling convention (EABI) passes the 5th-8th integer arguments in $t0-$t3, never
+        // on the stack. An earlier stack fallback for "both registers zero" turned legitimate
+        // zero arguments (e.g. sceGsSetDefDispEnv dx = dy = 0) into stack garbage.
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9};
-            }
-
-            return {stack0, stack1};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9)};
         }
 
         GsTrailingArgs3 decodeGsTrailingArgs3(uint8_t *rdram, R5900Context *ctx)
         {
-            const uint32_t reg8 = getRegU32(ctx, 8);
-            const uint32_t reg9 = getRegU32(ctx, 9);
-            const uint32_t reg10 = getRegU32(ctx, 10);
-            const uint32_t stack0 = readStackU32(rdram, ctx, 16);
-            const uint32_t stack1 = readStackU32(rdram, ctx, 20);
-            const uint32_t stack2 = readStackU32(rdram, ctx, 24);
-
-            const bool hasRegArgs = (reg8 != 0u || reg9 != 0u || reg10 != 0u);
-            const bool hasStackArgs = (stack0 != 0u || stack1 != 0u || stack2 != 0u);
-            if (hasRegArgs || !hasStackArgs)
-            {
-                return {reg8, reg9, reg10};
-            }
-
-            return {stack0, stack1, stack2};
+            (void)rdram;
+            return {getRegU32(ctx, 8), getRegU32(ctx, 9), getRegU32(ctx, 10)};
         }
 
         void applyGsClearPacket(PS2Runtime *runtime, const GsClearMem &clear)
@@ -814,7 +794,7 @@ namespace ps2_stubs
                 // their old A+D addresses 0x41/0x42 alias SCISSOR_2/ALPHA_1, so route them
                 // straight to privileged state (as applyGsDispEnv does) instead.
                 runtime->memory().gs().pmode = pmode;
-                runtime->memory().gs().smode2 = smode2;
+                ps2_syscalls::configureGsCrt(runtime->memory().gs(), interlace & 1u, omode & 0xFFu, ffmode & 1u);
 
                 uint32_t pktAddr = runtime->guestMalloc(96u, 16u);
                 if (pktAddr != 0u)
@@ -1016,9 +996,40 @@ namespace ps2_stubs
 
         uint32_t fbw = (w + 63) / 64;
         uint64_t dispfb = makeDispFb(0, fbw, psm, 0, 0);
-        uint64_t display = makeDisplay(dx, dy, 0, 0, w - 1, h - 1);
 
-        writeGsDispEnv(rdram, envAddr, display, dispfb);
+        // libgraph timing: DISPLAY is in video clocks (2560 per NTSC/PAL line), so the
+        // horizontal magnification is 2560/w - 1 and DW spans w * (MAGH + 1) clocks; DX/DY add
+        // the mode's visible-area origin to the caller's offset. The old stub wrote dx/dy/w/h
+        // raw with MAGH 0, which a scanout-accurate backend (paraLLEl-GS) shows as a sliver.
+        const bool pal = g_gparam.omode == 3u;
+        const bool interlaced = (g_gparam.interlace & 1u) != 0u;
+        const uint32_t magh = (w != 0u && w <= 2560u) ? (2560u / w) - 1u : 0u;
+        const int32_t sdx = static_cast<int16_t>(dx & 0xFFFFu);
+        const int32_t sdy = static_cast<int16_t>(dy & 0xFFFFu);
+        const int32_t baseX = pal ? 656 : 636;
+        const int32_t baseY = pal ? (interlaced ? 72 : 36) : (interlaced ? 50 : 25);
+        const uint32_t displayX = static_cast<uint32_t>(std::clamp(baseX + sdx * static_cast<int32_t>(magh + 1u), 0, 4095));
+        const uint32_t displayY = static_cast<uint32_t>(std::clamp(baseY + sdy, 0, 2047));
+        uint64_t display = makeDisplay(displayX, displayY, magh, 0, w * (magh + 1u) - 1u, h - 1);
+        static uint32_t logged = 0;
+        if (logged++ < 4)
+            std::printf("[gs-stub] sceGsSetDefDispEnv psm=%u w=%u h=%u dx=%d dy=%d omode=%u int=%u -> DX=%u DY=%u MAGH=%u\n",
+                        psm, w, h, sdx, sdy, g_gparam.omode, g_gparam.interlace, displayX, displayY, magh);
+
+        // libgraph also initialises PMODE and SMODE2, which sceGsPutDispEnv writes to the
+        // privileged registers: PMODE = SCE_GS_SET_PMODE(0, 1, 0, 1, 0, 0) (circuit 2, CRTMD,
+        // AMOD) and SMODE2 from the graphics mode. Games then patch fields on top (TC sets EN1
+        // and ALP); left at zero they scan out progressive single fields with MMOD = 0.
+        GsDispEnvMem env{};
+        if (readGsDispEnv(rdram, envAddr, env))
+        {
+            env.pmode = makePmode(0u, 1u, 0u, 1u, 0u, 0u);
+            env.smode2 = static_cast<uint64_t>(g_gparam.interlace & 1u) | (static_cast<uint64_t>(g_gparam.ffmode & 1u) << 1);
+            env.dispfb = dispfb;
+            env.display = display;
+            if (uint8_t *ptr = getMemPtr(rdram, envAddr))
+                std::memcpy(ptr, &env, sizeof(env));
+        }
         setReturnS32(ctx, 0);
     }
 

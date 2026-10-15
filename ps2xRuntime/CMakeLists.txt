@@ -383,6 +383,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_cpu_backend.cpp
+    src/lib/gs/gs_dump_writer.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
@@ -521,6 +522,17 @@ target_link_libraries(ps2EntryRunner
 
 # Instrument the hand-written runtime/IOP code only; the generated game code stays
 # uninstrumented so sanitizer builds remain tractable. Example: -DPS2X_SANITIZE=address,undefined
+option(PS2X_GS_PARALLEL "Use the paraLLEl-GS Vulkan compute backend (MoltenVK on macOS); PS2X_GS=cpu selects the CPU backend at runtime" OFF)
+if(PS2X_GS_PARALLEL)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ParallelGS.cmake")
+endif()
+
+# Headless PCSX2 GS dump replayer (tickets/notes/gs-dump-format.md).
+if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+    add_executable(ps2x_gs_replay tools/gs_replay/gs_replay.cpp)
+    target_link_libraries(ps2x_gs_replay PRIVATE ps2_runtime)
+endif()
+
 set(PS2X_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list for ps2_runtime/ps2_iop (e.g. address,undefined or thread)")
 if(PS2X_SANITIZE AND NOT MSVC)
     foreach(ps2x_sanitized_target ps2_runtime ps2_iop)

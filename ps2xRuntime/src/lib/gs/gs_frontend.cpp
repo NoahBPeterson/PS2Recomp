@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_dump_writer.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -260,6 +261,8 @@ GSDebugSnapshot GS::getDebugSnapshot() const
         snapshot.hasHostPresentationFrame = m_hasHostPresentationFrame;
     }
     snapshot.localToHostPendingBytes = transfer.localToHostPendingBytes;
+    if (m_backend && m_backend->UsesRawCommands())
+        m_backend->ReadRegisterState(snapshot);
     return snapshot;
 }
 
@@ -509,6 +512,9 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     if (!m_privRegs)
         return request;
     request.pmode = m_privRegs->pmode;
+    request.smode1 = m_privRegs->smode1;
+    request.syncv = m_privRegs->syncv;
+    request.field = static_cast<uint32_t>((m_privRegs->csr.load() >> 13u) & 1u);
     request.smode2 = m_privRegs->smode2;
     request.dispfb1 = m_privRegs->dispfb1;
     request.display1 = m_privRegs->display1;
@@ -538,6 +544,8 @@ void GS::latchHostPresentationFrame()
             return;
         }
         request = buildPresentationRequestUnlocked();
+        if (ps2x_gs_dump::active())
+            ps2x_gs_dump::vsync(m_privRegs, request, m_backend.get());
     }
 
     PresentationFrame frame{};
@@ -638,9 +646,17 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
-void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::transfer(path, data, sizeBytes);
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        if (data && sizeBytes && (sizeBytes & 15u) == 0u)
+            m_backend->ProcessGIF(path, data, sizeBytes);
+        return;
+    }
     if (!data || sizeBytes < 16 || !m_backend)
         return;
 
@@ -744,6 +760,15 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::transfer(3u, data, sizeBytes);
+
+    if (m_backend->UsesRawCommands())
+    {
+        m_backend->ProcessGIF(3u, data, sizeBytes);
+        ++m_nativePackedGIFPacketCount;
+        return true;
+    }
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -784,6 +809,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x_gs_dump::active() && m_backend)
+        ps2x_gs_dump::imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1062,11 +1089,18 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::registerWrite(regAddr, value);
     writeRegisterUnlocked(regAddr, value);
 }
 
 void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        m_backend->WriteRegisterRaw(regAddr, value);
+        return;
+    }
     const bool interestingReg =
         regAddr == GS_REG_PRIM ||
         regAddr == GS_REG_RGBAQ ||
@@ -1617,19 +1651,43 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::clearFramebuffer(contextIndex != 0u ? 1 : 0, rgba);
+    if (m_backend && m_backend->UsesRawCommands())
+        return m_backend->ClearFramebuffer(getDebugSnapshot().ctx[(contextIndex != 0u) ? 1 : 0], rgba);
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::clearFramebuffer(-1, rgba);
+    if (m_backend && m_backend->UsesRawCommands())
+    {
+        const GSDebugSnapshot state = getDebugSnapshot();
+        return m_backend->ClearFramebuffer(state.ctx[state.prim.ctxt ? 1 : 0], rgba);
+    }
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+}
+
+void GS::shutdownBackend()
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
+    std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+    m_hostPresentationFrame.clear();
+    m_hasHostPresentationFrame = false;
+    m_backend.reset();
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
-    return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+    const uint32_t consumed = m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+    if (ps2x_gs_dump::active())
+        ps2x_gs_dump::readFifo(consumed);
+    return consumed;
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)

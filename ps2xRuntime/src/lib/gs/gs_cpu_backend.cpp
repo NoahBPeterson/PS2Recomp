@@ -633,8 +633,12 @@ void GSCpuBackend::MarkVramWritten(uint32_t psm, uint32_t base, uint32_t bw, uin
     const uint32_t page = (base >> 5u) + (y / pageHeight) * gsPagesPerRow(static_cast<uint8_t>(psm), bw) + x / pageWidth;
     const uint64_t stamp = ++m_vramWriteStamp;
     m_pageWriteStamp[page % kGsPageCount] = stamp;
+    m_pageWrittenSinceFlush[page % kGsPageCount] = true;
     if (base & 31u) // block-offset base: the write can land in the following page
+    {
         m_pageWriteStamp[(page + 1u) % kGsPageCount] = stamp;
+        m_pageWrittenSinceFlush[(page + 1u) % kGsPageCount] = true;
+    }
 }
 
 GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareDecodedTexture(const GSDrawState &state)
@@ -897,6 +901,15 @@ void GSCpuBackend::TextureFlush()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_texturePageCache.Invalidate();
+    const uint64_t stamp = ++m_vramWriteStamp;
+    for (size_t page = 0; page < m_pageWrittenSinceFlush.size(); ++page)
+    {
+        if (m_pageWrittenSinceFlush[page])
+        {
+            m_pageWriteStamp[page] = stamp;
+            m_pageWrittenSinceFlush[page] = false;
+        }
+    }
 }
 
 void GSCpuBackend::Sync(GSSyncReason)

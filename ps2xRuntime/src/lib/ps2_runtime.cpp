@@ -5,6 +5,9 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#ifdef PS2X_GS_PARALLEL
+#include "runtime/gs/gs_parallel_backend.h"
+#endif
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -29,6 +32,10 @@
 
 // Presented host frames; read by debug switches (e.g. PS2X_PAD_SCRIPT in Pad.cpp).
 std::atomic<uint32_t> g_ps2xHostFrame{0u};
+namespace ps2_stubs
+{
+    void latchHostPadInput(PS2Runtime *runtime);
+}
 extern std::atomic<uint32_t> g_ps2xGsFlips[2];
 extern std::atomic<uint32_t> g_ps2xPadReadsPort0;
 static std::string g_ps2xWindowTitle;
@@ -561,6 +568,7 @@ PS2Runtime::~PS2Runtime()
             m_debugUiInitialized = false;
         }
 
+        m_gs.shutdownBackend(); // GPU backends release their device before the window goes away
         if (IsWindowReady())
         {
             CloseWindow();
@@ -679,8 +687,8 @@ bool PS2Runtime::syncCoreSubsystems()
     }
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
-    m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size); });
+    m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
+                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -745,11 +753,28 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+        // PS2X_HEADLESS=1 keeps the window hidden (automated test runs; screenshots still work).
+        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (std::getenv("PS2X_HEADLESS") ? FLAG_WINDOW_HIDDEN : 0u));
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         g_ps2xWindowTitle = title ? title : "";
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+#endif
+#ifdef PS2X_GS_PARALLEL
+        // PS2X_GS=parallel opts into paraLLEl-GS (Vulkan compute; MoltenVK on macOS). Opt-in until
+        // display alpha is sorted out: TC's in-game 3D currently scans out black with it.
+        if (const char *gsChoice = std::getenv("PS2X_GS"); gsChoice && std::string(gsChoice) == "parallel")
+        {
+            try
+            {
+                m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+                std::cout << "[gs] using paraLLEl-GS backend" << std::endl;
+            }
+            catch (const std::exception &error)
+            {
+                std::cerr << "[gs] paraLLEl-GS unavailable (" << error.what() << "); using the CPU backend" << std::endl;
+            }
+        }
 #endif
         SetTargetFPS(60);
         SetExitKey(KEY_NULL); // raylib quits on Esc by default; games use Esc-mapped input, so only the window close quits
@@ -2539,6 +2564,7 @@ void PS2Runtime::run()
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
         EndDrawing();
+        ps2_stubs::latchHostPadInput(this);
 
         // PS2X_SCREENSHOT_EVERY=N saves the presented frame every N host frames
         // (ps2x_frame_<n>.png in the working directory).
@@ -2646,6 +2672,7 @@ void PS2Runtime::run()
         m_debugUiInitialized = false;
     }
     UnloadTexture(frameTex);
+    m_gs.shutdownBackend();
     CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");

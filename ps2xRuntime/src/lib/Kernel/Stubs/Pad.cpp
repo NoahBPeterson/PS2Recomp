@@ -7,6 +7,11 @@
 
 extern std::atomic<uint32_t> g_ps2xHostFrame;
 
+// Port-0 buttons (active high) pressed on any host frame since the game last read the pad.
+// The game polls once per game frame, which at low frame rates is several host frames;
+// without this a tap that starts and ends between two polls is never seen.
+static std::atomic<uint16_t> g_padLatchedPressed{0u};
+
 // Successful port-0 scePadRead calls. Games poll the pad once per game-loop iteration,
 // so the host loop uses this as the game-FPS readout in the window title.
 std::atomic<uint32_t> g_ps2xPadReadsPort0{0u};
@@ -415,6 +420,11 @@ namespace ps2_stubs
                 }
             }
 
+            if (port == 0 && usedBackend)
+            {
+                state.buttons = static_cast<uint16_t>(state.buttons & ~g_padLatchedPressed.exchange(0u, std::memory_order_relaxed));
+            }
+
             if (port == 0)
             {
                 state.buttons = static_cast<uint16_t>(state.buttons & ~scriptedButtonsAt(g_ps2xHostFrame.load(std::memory_order_relaxed)));
@@ -438,6 +448,17 @@ namespace ps2_stubs
 
             return true;
         }
+    }
+
+    // Called by the host loop once per presented frame, after raylib polls input events.
+    void latchHostPadInput(PS2Runtime *runtime)
+    {
+        uint8_t data[32]{};
+        if (!runtime || !runtime->padBackend().readState(0, 0, data, sizeof(data)))
+            return;
+        const uint16_t pressed = static_cast<uint16_t>(~(data[2] | (data[3] << 8)));
+        if (pressed)
+            g_padLatchedPressed.fetch_or(pressed, std::memory_order_relaxed);
     }
 
     void PadSyncCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
