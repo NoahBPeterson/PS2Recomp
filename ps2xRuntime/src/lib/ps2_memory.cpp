@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+std::atomic<uint32_t> g_ps2xGsFlips[2]{}; // DISPFB1/DISPFB2 flip counts (see countGsDisplayFlip)
+
 namespace
 {
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
@@ -102,6 +104,16 @@ namespace
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
 
     // PS2X_GS_PRIV_LOG=1 traces writes to GS privileged registers (first 512).
+    // Counts guest display flips: a change of DISPFB1/DISPFB2's FBP field (bits 0..8).
+    // Read by the host loop for the game-FPS readout in the window title.
+    inline void countGsDisplayFlip(uint32_t address, uint64_t oldValue, uint64_t newValue)
+    {
+        const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if ((regOff != 0x0070u && regOff != 0x0090u) || ((oldValue ^ newValue) & 0x1FFu) == 0u)
+            return;
+        (regOff == 0x0070u ? g_ps2xGsFlips[0] : g_ps2xGsFlips[1]).fetch_add(1u, std::memory_order_relaxed);
+    }
+
     inline void traceGsPrivWrite(uint32_t address, uint64_t newValue, unsigned bits)
     {
         static const bool enabled = std::getenv("PS2X_GS_PRIV_LOG") != nullptr;
@@ -994,6 +1006,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
         {
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
+            countGsDisplayFlip(address, *reg, newVal);
             *reg = newVal;
             traceGsPrivWrite(address, newVal, 32u);
         }
@@ -1052,6 +1065,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         }
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
+            countGsDisplayFlip(address, *reg, value);
             *reg = value;
             traceGsPrivWrite(address, value, 64u);
         }
@@ -1213,7 +1227,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             const uint64_t mask = 0xFFFFFFFFull << (off * 8u);
-            *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            const uint64_t newVal = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
+            countGsDisplayFlip(address, *reg, newVal);
+            *reg = newVal;
         }
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;

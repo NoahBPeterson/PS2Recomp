@@ -29,6 +29,8 @@
 
 // Presented host frames; read by debug switches (e.g. PS2X_PAD_SCRIPT in Pad.cpp).
 std::atomic<uint32_t> g_ps2xHostFrame{0u};
+extern std::atomic<uint32_t> g_ps2xGsFlips[2];
+static std::string g_ps2xWindowTitle;
 
 namespace ps2_stubs
 {
@@ -744,6 +746,7 @@ bool PS2Runtime::initialize(const char *title)
 #else
         SetConfigFlags(FLAG_WINDOW_RESIZABLE);
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        g_ps2xWindowTitle = title ? title : "";
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -2591,6 +2594,25 @@ void PS2Runtime::run()
                     }
                     start = end + 1u;
                 }
+            }
+        }
+
+        // Window title readout, refreshed twice a second: game FPS counts guest display flips
+        // (DISPFB changes; the busier of the two read circuits), host FPS is the present loop.
+        {
+            static double lastTime = GetTime();
+            static uint32_t lastFlips[2] = {0u, 0u};
+            const double now = GetTime();
+            if (now - lastTime >= 0.5)
+            {
+                const uint32_t flips0 = g_ps2xGsFlips[0].load(std::memory_order_relaxed);
+                const uint32_t flips1 = g_ps2xGsFlips[1].load(std::memory_order_relaxed);
+                const uint32_t flips = std::max(flips0 - lastFlips[0], flips1 - lastFlips[1]);
+                SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(),
+                                          flips / (now - lastTime), GetFPS()));
+                lastFlips[0] = flips0;
+                lastFlips[1] = flips1;
+                lastTime = now;
             }
         }
 
