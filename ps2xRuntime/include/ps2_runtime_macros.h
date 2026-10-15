@@ -856,7 +856,18 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// CVT.W.S: truncate toward zero regardless of the rounding mode, saturating on
+// overflow. Like PCSX2, any operand whose exponent field is >= 158 (|a| >= 2^31,
+// including Inf/NaN) yields INT32_MIN when the sign bit is set, else INT32_MAX.
+static inline int32_t ps2_fpu_cvt_w_s(float a)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &a, sizeof(bits));
+    if (((bits >> 23) & 0xFFu) >= 158u)
+        return (bits & 0x80000000u) ? INT32_MIN : INT32_MAX;
+    return (int32_t)a;
+}
+#define FPU_CVT_W_S(a) (ps2_fpu_cvt_w_s((float)(a)))
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
