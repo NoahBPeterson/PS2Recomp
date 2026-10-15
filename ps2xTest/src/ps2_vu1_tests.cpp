@@ -809,9 +809,9 @@ void register_ps2_vu1_tests()
             };
             constexpr EfuCase cases[] = {
                 {0x70u, 11u}, {0x71u, 18u}, {0x72u, 18u}, {0x73u, 24u},
-                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x77u, 18u},
-                {0x78u, 12u}, {0x79u, 29u}, {0x7Au, 12u}, {0x7Cu, 54u},
-                {0x7Du, 44u}};
+                {0x74u, 54u}, {0x75u, 54u}, {0x76u, 12u}, {0x78u, 12u},
+                {0x79u, 18u}, {0x7Au, 12u}, {0x7Cu, 29u}, {0x7Du, 54u},
+                {0x7Eu, 44u}};
 
             for (const EfuCase &efu : cases)
             {
@@ -839,6 +839,8 @@ void register_ps2_vu1_tests()
                          "WAITP should count every EFU stall as an elapsed VU cycle");
                 t.IsTrue(std::isfinite(vu1.state().p),
                          "architected EFU opcode should commit a finite P result");
+                if (efu.opcode == 0x79u)
+                    t.Equals(vu1.state().p, 2.0f, "ERSQRT (0x79) of vf1x = 0.25 should give P = 2");
             }
         });
 
@@ -1088,6 +1090,31 @@ void register_ps2_vu1_tests()
                      "JR should skip the sequential instruction after its delay slot");
             t.Equals(vu1.state().vi[4], 4,
                      "JR immediately after a VI write should branch using the previous VI value");
+        });
+
+        tc.Run("a VI write in a taken branch's delay slot is visible to a branch at the target", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // Microcode dispatcher pattern: "jr vi1 ; iaddiu vi15, vi00, <return>" into a
+            // handler whose first instruction is "jr vi15".
+            writeVuInstructionPair(fx.code, 0u, makeVuJr(1u), kVuUpperNop);                 // -> handler at 32
+            writeVuInstructionPair(fx.code, 8u, makeVuIaddiu(15u, 0u, 2), kVuUpperNop);     // return address 16
+            writeVuInstructionPair(fx.code, 16u, makeVuIaddiu(5u, 0u, 5), kVuUpperNop | 0x40000000u);
+            writeVuInstructionPair(fx.code, 24u, 0x8000033Cu /* lower NOP */, kVuUpperNop);
+            writeVuInstructionPair(fx.code, 32u, makeVuJr(15u), kVuUpperNop);               // handler: return
+            writeVuInstructionPair(fx.code, 40u, makeVuIaddiu(6u, 6u, 1), kVuUpperNop);     // counts its runs
+
+            VU1Interpreter vu1;
+            vu1.state().vi[1] = 4;
+            vu1.state().vi[15] = 4; // stale value pointing back at the handler
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 1000u);
+
+            t.Equals(vu1.state().vi[6], 1, "the handler's delay slot should run once");
+            t.Equals(vu1.state().vi[5], 5, "the handler should return to the address set in the delay slot");
         });
 
         tc.Run("MPG upload invalidates cached VU1 decode before MSCAL", [](TestCase &t)
