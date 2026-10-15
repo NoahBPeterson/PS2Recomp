@@ -57,3 +57,26 @@ target_include_directories(ps2x_ee_oracle PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
 )
 target_link_libraries(ps2x_ee_oracle PRIVATE ps2_runtime)
+
+# ps2x_ee_oracle_wide: the same replay linked against every generated function (the ps2EntryRunner
+# objects, reused as built), dispatching through the runtime's function table. Any TC2 function whose
+# call graph stays in recompiled code can be checked; no per-function compile.
+if(TARGET ps2EntryRunner AND APPLE)
+    add_executable(ps2x_ee_oracle_wide
+        ee_oracle_main.cpp
+        $<TARGET_OBJECTS:ps2EntryRunner>
+    )
+    target_compile_definitions(ps2x_ee_oracle_wide PRIVATE EE_ORACLE_WIDE=1)
+    target_include_directories(ps2x_ee_oracle_wide PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    )
+    target_link_libraries(ps2x_ee_oracle_wide PRIVATE ps2_runtime)
+    foreach(_lib rlImGui imgui)
+        if(TARGET ${_lib})
+            target_link_libraries(ps2x_ee_oracle_wide PRIVATE ${_lib})
+        endif()
+    endforeach()
+    # the runner's objects bring the game's main(); enter through the replay instead
+    target_link_options(ps2x_ee_oracle_wide PRIVATE "-Wl,-e,_ee_oracle_entry")
+endif()

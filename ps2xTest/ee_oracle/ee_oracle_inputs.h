@@ -15,11 +15,12 @@ namespace ee_oracle
     constexpr uint32_t kRamSize = 32u << 20;
     constexpr uint32_t kBufBase = 0x01800000u;
     constexpr uint32_t kBufStride = 0x1000u;
-    constexpr uint32_t kBufCount = 4u;
+    constexpr uint32_t kBufCount = 8u; // one per argument register a0..a3, t0..t3
     constexpr uint32_t kBufWords = 256u;
     constexpr uint32_t kStackLo = 0x01ff0000u;
     constexpr uint32_t kStackTop = kRamSize - 0x4000u;
     constexpr uint64_t kDone = 0xfffffffffffffff0ull;
+    constexpr uint32_t kGp = 0x00505170u; // TC2.ELF's _gp (crt0 at 0x4b2468)
 
     struct Rng
     {
@@ -41,16 +42,18 @@ namespace ee_oracle
         return (h & 0x80000000u) | ((111u + ((h >> 23) & 31u)) << 23) | (h & 0x007fffffu);
     }
 
-    inline uint32_t genWord(Rng &rng)
+    // rich: spec ends in '+', pointer-rich buffers for code that walks pointer structures
+    inline uint32_t genWord(Rng &rng, bool rich)
     {
         const uint64_t r = rng.next();
         const uint32_t sel = (uint32_t)(r & 0xff);
         const uint32_t h = (uint32_t)(r >> 32);
-        if (sel < 180)
+        const uint32_t f = rich ? 77u : 180u, p = rich ? 230u : 215u, i = rich ? 248u : 245u;
+        if (sel < f)
             return genFloat(h);
-        if (sel < 215)
+        if (sel < p)
             return kBufBase + (h % kBufCount) * kBufStride + ((h >> 8) % 64u) * 16u;
-        if (sel < 245)
+        if (sel < i)
             return h % 64u;
         return 0u;
     }
@@ -85,15 +88,16 @@ namespace ee_oracle
         Input in;
         Rng rng{((uint64_t)addr << 32) | caseIdx};
         in.words.resize(kBufCount * kBufWords);
+        const bool rich = !spec.empty() && spec.back() == '+';
         for (auto &w : in.words)
-            w = genWord(rng);
+            w = genWord(rng, rich);
         State &s = in.st;
         for (int i = 1; i < 32; ++i)
         {
             s.gpr[i].lo = sx32((uint32_t)rng.next());
             s.gpr[i].hi = rng.next();
         }
-        for (int k = 0; k < 4; ++k)
+        for (int k = 0; k < 8; ++k) // a0..a3 = $4..$7, a4..a7 (t0..t3) = $8..$11
         {
             const uint64_t v = rng.next();
             const char c = k < (int)spec.size() ? spec[k] : '-';
@@ -111,6 +115,7 @@ namespace ee_oracle
                 s.gpr[4 + k].hi = (uint64_t)genFloat((uint32_t)(w >> 32)) << 32 | genFloat((uint32_t)w);
             }
         }
+        s.gpr[28].lo = sx32(kGp);
         s.gpr[29].lo = sx32(kStackTop);
         s.gpr[31].lo = kDone;
         for (auto &f : s.fpr)
