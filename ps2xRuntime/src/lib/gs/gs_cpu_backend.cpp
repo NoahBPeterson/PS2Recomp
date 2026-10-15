@@ -9,6 +9,7 @@
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -535,6 +536,226 @@ GSCpuBackend::GSCpuBackend()
     Reset();
 }
 
+namespace
+{
+    constexpr uint32_t kGsPageCount = 512u; // 4 MiB of VRAM in 8 KiB pages
+    constexpr uint32_t kDecodedTileShift = 4u; // 16x16 texel tiles
+    constexpr size_t kDecodedTextureBudgetBytes = 256u * 1024u * 1024u;
+
+    // Page dimensions in pixels for a storage format (GS page = 8 KiB).
+    void gsPageSize(uint8_t psm, uint32_t &width, uint32_t &height)
+    {
+        switch (psm)
+        {
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            width = 64u;
+            height = 64u;
+            return;
+        case GS_PSM_T8:
+            width = 128u;
+            height = 64u;
+            return;
+        case GS_PSM_T4:
+            width = 128u;
+            height = 128u;
+            return;
+        default: // 32-bit layouts, including T8H/T4HL/T4HH stored in CT32 words
+            width = 64u;
+            height = 32u;
+            return;
+        }
+    }
+
+    uint32_t gsPagesPerRow(uint8_t psm, uint32_t bw)
+    {
+        uint32_t pageWidth = 0u, pageHeight = 0u;
+        gsPageSize(psm, pageWidth, pageHeight);
+        return std::max<uint32_t>(1u, (bw * 64u) / pageWidth);
+    }
+
+    // Contiguous (wrapping) page range covering a width x height region at block base `bp`.
+    void gsRegionPages(uint8_t psm, uint32_t bp, uint32_t bw, uint32_t width, uint32_t height,
+                       uint32_t &firstPage, uint32_t &pageCount)
+    {
+        uint32_t pageWidth = 0u, pageHeight = 0u;
+        gsPageSize(psm, pageWidth, pageHeight);
+        const uint32_t rows = (std::max<uint32_t>(height, 1u) + pageHeight - 1u) / pageHeight;
+        const uint32_t cols = (std::max<uint32_t>(width, 1u) + pageWidth - 1u) / pageWidth;
+        const uint64_t span = static_cast<uint64_t>(rows - 1u) * gsPagesPerRow(psm, bw) + cols + ((bp & 31u) ? 1u : 0u);
+        firstPage = (bp >> 5u) % kGsPageCount;
+        pageCount = static_cast<uint32_t>(std::min<uint64_t>(span, kGsPageCount));
+    }
+
+    bool gsPageRangesOverlap(uint32_t firstA, uint32_t countA, uint32_t firstB, uint32_t countB)
+    {
+        if (countA >= kGsPageCount || countB >= kGsPageCount)
+            return true;
+        const uint32_t offset = (firstB + kGsPageCount - firstA) % kGsPageCount; // B's start relative to A
+        return offset < countA || (kGsPageCount - offset) < countB;
+    }
+}
+
+struct GSCpuBackend::DecodedTexture
+{
+    // Identity: everything DecodeTexel reads.
+    uint32_t tbp0 = 0;
+    uint8_t tbw = 0, psm = 0, tw = 0, th = 0;
+    uint32_t cbp = 0;
+    uint8_t cpsm = 0, csm = 0, csa = 0;
+    uint8_t ta0 = 0, ta1 = 0;
+    bool aem = false;
+    uint64_t clutVersion = 0; // 0 for direct-colour formats
+
+    uint32_t width = 0, height = 0, tilesX = 0;
+    uint32_t firstPage = 0, pageCount = 0;
+    uint64_t decodeStamp = 0;    // tiles reflect VRAM as of this write stamp
+    uint64_t validatedStamp = 0; // page stamps last checked at this write stamp
+    std::vector<uint32_t> texels;
+    std::vector<uint8_t> tileReady;
+
+    bool matches(const GSTex0Reg &tex, const GSTexaReg &texa, uint64_t clut) const
+    {
+        return tbp0 == tex.tbp0 && tbw == tex.tbw && psm == tex.psm && tw == tex.tw && th == tex.th &&
+               cbp == tex.cbp && cpsm == tex.cpsm && csm == tex.csm && csa == tex.csa &&
+               ta0 == texa.ta0 && ta1 == texa.ta1 && aem == texa.aem && clutVersion == clut;
+    }
+};
+
+GSCpuBackend::~GSCpuBackend() = default;
+
+void GSCpuBackend::MarkVramWritten(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
+{
+    uint32_t pageWidth = 0u, pageHeight = 0u;
+    gsPageSize(static_cast<uint8_t>(psm), pageWidth, pageHeight);
+    const uint32_t page = (base >> 5u) + (y / pageHeight) * gsPagesPerRow(static_cast<uint8_t>(psm), bw) + x / pageWidth;
+    const uint64_t stamp = ++m_vramWriteStamp;
+    m_pageWriteStamp[page % kGsPageCount] = stamp;
+    if (base & 31u) // block-offset base: the write can land in the following page
+        m_pageWriteStamp[(page + 1u) % kGsPageCount] = stamp;
+}
+
+GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareDecodedTexture(const GSDrawState &state)
+{
+    if (m_decodedTexturesDisabled || !state.prim.tme)
+        return nullptr;
+
+    const GSContext &ctx = state.context;
+    const GSTex0Reg &tex = ctx.tex0;
+    const bool indexed = isFourBitIndexedPsm(tex.psm) || isEightBitIndexedPsm(tex.psm);
+    const uint64_t clutVersion = indexed ? m_clutVersion : 0u;
+    const uint32_t width = state.textureWidth;
+    const uint32_t height = state.textureHeight;
+
+    uint32_t firstPage = 0u, pageCount = 0u;
+    gsRegionPages(tex.psm, tex.tbp0, tex.tbw, width, height, firstPage, pageCount);
+
+    // Sampling the surface being drawn (feedback) must see each new pixel: use the direct path.
+    uint32_t frameFirst = 0u, frameCount = 0u;
+    const uint32_t drawHeight = static_cast<uint32_t>(ctx.scissor.y1) + 1u;
+    gsRegionPages(ctx.frame.psm, framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, ctx.frame.fbw * 64u, drawHeight,
+                  frameFirst, frameCount);
+    if (gsPageRangesOverlap(firstPage, pageCount, frameFirst, frameCount))
+        return nullptr;
+    if (!ctx.zbuf.zmask)
+    {
+        uint32_t zFirst = 0u, zCount = 0u;
+        gsRegionPages(ctx.zbuf.psm, framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, ctx.frame.fbw * 64u, drawHeight,
+                      zFirst, zCount);
+        if (gsPageRangesOverlap(firstPage, pageCount, zFirst, zCount))
+            return nullptr;
+    }
+
+    uint64_t key = tex.tbp0;
+    key = key * 0x9E3779B97F4A7C15ull ^ (static_cast<uint64_t>(tex.tbw) | (static_cast<uint64_t>(tex.psm) << 8) |
+                                         (static_cast<uint64_t>(tex.tw) << 16) | (static_cast<uint64_t>(tex.th) << 24));
+    key = key * 0x9E3779B97F4A7C15ull ^ (static_cast<uint64_t>(tex.cbp) | (static_cast<uint64_t>(tex.cpsm) << 32) |
+                                         (static_cast<uint64_t>(tex.csm) << 40) | (static_cast<uint64_t>(tex.csa) << 48));
+    key = key * 0x9E3779B97F4A7C15ull ^ (static_cast<uint64_t>(state.texa.ta0) | (static_cast<uint64_t>(state.texa.ta1) << 8) |
+                                         (static_cast<uint64_t>(state.texa.aem) << 16));
+    key = key * 0x9E3779B97F4A7C15ull ^ clutVersion;
+
+    auto found = m_decodedTextures.find(key);
+    if (found == m_decodedTextures.end() || !found->second->matches(tex, state.texa, clutVersion))
+    {
+        if (found != m_decodedTextures.end())
+        {
+            m_decodedTextureBytes -= found->second->texels.size() * sizeof(uint32_t);
+            m_decodedTextures.erase(found);
+        }
+        const size_t bytes = static_cast<size_t>(width) * height * sizeof(uint32_t);
+        if (m_decodedTextureBytes + bytes > kDecodedTextureBudgetBytes)
+        {
+            m_decodedTextures.clear();
+            m_decodedTextureBytes = 0u;
+        }
+        auto texture = std::make_unique<DecodedTexture>();
+        texture->tbp0 = tex.tbp0;
+        texture->tbw = tex.tbw;
+        texture->psm = tex.psm;
+        texture->tw = tex.tw;
+        texture->th = tex.th;
+        texture->cbp = tex.cbp;
+        texture->cpsm = tex.cpsm;
+        texture->csm = tex.csm;
+        texture->csa = tex.csa;
+        texture->ta0 = state.texa.ta0;
+        texture->ta1 = state.texa.ta1;
+        texture->aem = state.texa.aem;
+        texture->clutVersion = clutVersion;
+        texture->width = width;
+        texture->height = height;
+        texture->tilesX = (width + (1u << kDecodedTileShift) - 1u) >> kDecodedTileShift;
+        const uint32_t tilesY = (height + (1u << kDecodedTileShift) - 1u) >> kDecodedTileShift;
+        texture->firstPage = firstPage;
+        texture->pageCount = pageCount;
+        texture->texels.resize(static_cast<size_t>(width) * height);
+        texture->tileReady.assign(static_cast<size_t>(texture->tilesX) * tilesY, 0u);
+        texture->decodeStamp = m_vramWriteStamp;
+        texture->validatedStamp = m_vramWriteStamp;
+        m_decodedTextureBytes += bytes;
+        DecodedTexture *raw = texture.get();
+        m_decodedTextures[key] = std::move(texture);
+        return raw;
+    }
+
+    DecodedTexture &texture = *found->second;
+    if (texture.validatedStamp != m_vramWriteStamp)
+    {
+        uint64_t newest = 0u;
+        for (uint32_t i = 0; i < texture.pageCount; ++i)
+            newest = std::max(newest, m_pageWriteStamp[(texture.firstPage + i) % kGsPageCount]);
+        if (newest > texture.decodeStamp)
+        {
+            std::fill(texture.tileReady.begin(), texture.tileReady.end(), uint8_t{0});
+            texture.decodeStamp = m_vramWriteStamp;
+        }
+        texture.validatedStamp = m_vramWriteStamp;
+    }
+    return &texture;
+}
+
+uint32_t GSCpuBackend::FetchDecodedTexel(DecodedTexture &texture, const GSDrawState &state, int u, int v)
+{
+    const uint32_t tile = (static_cast<uint32_t>(v) >> kDecodedTileShift) * texture.tilesX +
+                          (static_cast<uint32_t>(u) >> kDecodedTileShift);
+    if (!texture.tileReady[tile])
+    {
+        const uint32_t x0 = (static_cast<uint32_t>(u) >> kDecodedTileShift) << kDecodedTileShift;
+        const uint32_t y0 = (static_cast<uint32_t>(v) >> kDecodedTileShift) << kDecodedTileShift;
+        const uint32_t x1 = std::min(x0 + (1u << kDecodedTileShift), texture.width);
+        const uint32_t y1 = std::min(y0 + (1u << kDecodedTileShift), texture.height);
+        for (uint32_t y = y0; y < y1; ++y)
+            for (uint32_t x = x0; x < x1; ++x)
+                texture.texels[static_cast<size_t>(y) * texture.width + x] =
+                    DecodeTexel(state, static_cast<int>(x), static_cast<int>(y));
+        texture.tileReady[tile] = 1u;
+    }
+    return texture.texels[static_cast<size_t>(v) * texture.width + static_cast<uint32_t>(u)];
+}
+
 void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
 {
     if (vram && vramSize < GSMem::MEMORY_SIZE)
@@ -557,6 +778,12 @@ void GSCpuBackend::ResetUnlocked()
     m_clut.fill(0u);
     m_clutCbp.fill(0u);
     m_texturePageCache.Invalidate();
+    m_decodedTextures.clear();
+    m_decodedTextureBytes = 0u;
+    m_activeTexture = nullptr;
+    ++m_clutVersion;
+    // PS2X_GS_NO_TEXCACHE=1 disables the decoded-texture cache (A/B checks against the direct path).
+    m_decodedTexturesDisabled = std::getenv("PS2X_GS_NO_TEXCACHE") != nullptr;
     m_transfer = {};
     m_transfer.direction = 3u;
     m_transferState = {};
@@ -624,6 +851,7 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
     const bool loadCsm1Suffix = tex0.csm == 0u && thirtyTwoBit && !fourBit;
     const uint32_t firstEntry = loadCsm1Suffix ? destinationBase : 0u;
+    const std::array<uint16_t, 512> previousClut = m_clut;
 
     for (uint32_t entry = firstEntry; entry < entryCount; ++entry)
     {
@@ -656,6 +884,8 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
+    if (m_clut != previousClut)
+        ++m_clutVersion;
 }
 
 void GSCpuBackend::Flush()
@@ -706,6 +936,7 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
     if (!m_vram)
         return;
     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
+    MarkVramWritten(psm, base, bw, x, y);
 }
 
 void GSCpuBackend::SnapshotVram(std::vector<uint8_t> &out) const
@@ -734,6 +965,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
+    m_activeTexture = PrepareDecodedTexture(state);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -1080,6 +1312,34 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     return 0xFFFF00FFu;
 }
 
+uint32_t GSCpuBackend::DecodeTexel(const GSDrawState &state, int sampleU, int sampleV)
+{
+    const auto &tex = state.context.tex0;
+    u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
+
+    switch (tex.psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_Z32:
+    case GS_PSM_CT24:
+    case GS_PSM_Z24:
+        return applyTexa(state.texa, tex.psm, out);
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
+    case GS_PSM_T8:
+    case GS_PSM_T8H:
+    case GS_PSM_T4:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+    }
+
+    return 0xFFFF00FFu;
+}
+
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
 {
     const auto &ctx = state.context;
@@ -1112,30 +1372,10 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
-
-        u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, sampleU, sampleV);
-
-        switch (tex.psm)
-        {
-        case GS_PSM_CT32:
-        case GS_PSM_Z32:
-        case GS_PSM_CT24:
-        case GS_PSM_Z24:
-            return applyTexa(state.texa, tex.psm, out);
-        case GS_PSM_CT16:
-        case GS_PSM_CT16S:
-        case GS_PSM_Z16:
-        case GS_PSM_Z16S:
-            return applyTexa(state.texa, tex.psm, Rgba5551ToRgba8888(out));
-        case GS_PSM_T8:
-        case GS_PSM_T8H:
-        case GS_PSM_T4:
-        case GS_PSM_T4HL:
-        case GS_PSM_T4HH:
-            return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
-        }
-
-        return 0xFFFF00FFu;
+        if (m_activeTexture && static_cast<uint32_t>(sampleU) < m_activeTexture->width &&
+            static_cast<uint32_t>(sampleV) < m_activeTexture->height)
+            return FetchDecodedTexel(*m_activeTexture, state, sampleU, sampleV);
+        return DecodeTexel(state, sampleU, sampleV);
     };
 
     if (!state.linearFilter)

@@ -2613,8 +2613,12 @@ void PS2Runtime::run()
                 const uint32_t flips1 = g_ps2xGsFlips[1].load(std::memory_order_relaxed);
                 const uint32_t padReads = g_ps2xPadReadsPort0.load(std::memory_order_relaxed);
                 const uint32_t frames = std::max({flips0 - lastFlips[0], flips1 - lastFlips[1], padReads - lastPadReads});
-                SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(),
-                                          frames / (now - lastTime), GetFPS()));
+                const double gameFps = frames / (now - lastTime);
+                SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(), gameFps, GetFPS()));
+                // Same readout on stdout every 5 s, for unattended runs.
+                static int titleUpdates = 0;
+                if (++titleUpdates % 10 == 0)
+                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d\n", now, presentedFrames, gameFps, GetFPS());
                 lastFlips[0] = flips0;
                 lastFlips[1] = flips1;
                 lastPadReads = padReads;

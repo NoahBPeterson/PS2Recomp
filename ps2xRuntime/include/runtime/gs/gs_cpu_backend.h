@@ -4,13 +4,16 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override; // out of line: DecodedTexture is incomplete here
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -46,6 +49,15 @@ private:
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+    uint32_t DecodeTexel(const GSDrawState &state, int u, int v);
+
+    // Decoded-texture cache: each texture is unswizzled and CLUT-resolved to RGBA8888 once
+    // (lazily, per 16x16 tile) instead of on every sample. Entries are invalidated through
+    // per-page VRAM write stamps, so uploads and render-to-texture are picked up.
+    struct DecodedTexture;
+    DecodedTexture *PrepareDecodedTexture(const GSDrawState &state);
+    uint32_t FetchDecodedTexel(DecodedTexture &texture, const GSDrawState &state, int u, int v);
+    void MarkVramWritten(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
@@ -73,6 +85,13 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+    std::array<uint64_t, 512> m_pageWriteStamp{};
+    uint64_t m_vramWriteStamp = 1;
+    uint64_t m_clutVersion = 1;
+    std::unordered_map<uint64_t, std::unique_ptr<DecodedTexture>> m_decodedTextures;
+    size_t m_decodedTextureBytes = 0;
+    DecodedTexture *m_activeTexture = nullptr;
+    bool m_decodedTexturesDisabled = false;
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
