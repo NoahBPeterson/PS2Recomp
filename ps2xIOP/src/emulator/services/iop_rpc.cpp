@@ -7,6 +7,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -44,8 +46,25 @@ namespace ps2x::iop::detail
             constexpr uint32_t kMaxDescriptors = 32u;
             const uint32_t descriptorAddress = cpu.gpr[4];
             const uint32_t descriptorCount = cpu.gpr[5];
+            // PS2X_SIF_RPC_LOG=1 also traces IOP->EE sceSifSetDma descriptors.
+            static const bool logSetDma = std::getenv("PS2X_SIF_RPC_LOG") != nullptr;
+            const auto traceSetDma = [&](const char *outcome)
+            {
+                if (!logSetDma)
+                    return;
+                std::fprintf(stderr, "[iop-setdma] ra=0x%x desc=0x%x count=%u -> %s\n",
+                             cpu.gpr[31], descriptorAddress, descriptorCount, outcome);
+                for (uint32_t i = 0u; i < descriptorCount && i < 32u; ++i)
+                {
+                    uint32_t words[4]{};
+                    if (m_memory.readRam(descriptorAddress + i * 16u, words, sizeof(words)))
+                        std::fprintf(stderr, "    [%u] src=0x%x dst=0x%x size=0x%x attr=0x%x\n",
+                                     i, words[0], words[1], words[2], words[3]);
+                }
+            };
             if (descriptorAddress == 0u || descriptorCount == 0u || descriptorCount > kMaxDescriptors)
             {
+                traceSetDma("bad args");
                 setV0(0u);
                 return true;
             }
@@ -61,6 +80,7 @@ namespace ps2x::iop::detail
             const size_t descriptorBytes = static_cast<size_t>(descriptorCount) * kDescriptorSize;
             if (!m_memory.readRam(descriptorAddress, descriptorWords.data(), descriptorBytes))
             {
+                traceSetDma("descriptor read failed");
                 setV0(0u);
                 return true;
             }
@@ -79,6 +99,7 @@ namespace ps2x::iop::detail
                 const uint32_t size = static_cast<uint32_t>(signedSize);
                 if (!m_memory.ownsRamRange(source, size))
                 {
+                    traceSetDma("source outside IOP RAM");
                     setV0(0u);
                     return true;
                 }
@@ -96,6 +117,7 @@ namespace ps2x::iop::detail
                 const PendingTransfer &transfer = pending[i];
                 if (!m_host.readGuest(transfer.destination, scratch.data(), transfer.size))
                 {
+                    traceSetDma("EE destination invalid");
                     setV0(0u);
                     return true;
                 }
@@ -106,6 +128,7 @@ namespace ps2x::iop::detail
                 const PendingTransfer &transfer = pending[i];
                 if (!m_memory.readRam(transfer.source, scratch.data(), transfer.size) || !m_host.writeGuest(transfer.destination, scratch.data(), transfer.size))
                 {
+                    traceSetDma("copy failed");
                     setV0(0u);
                     return true;
                 }
@@ -116,6 +139,7 @@ namespace ps2x::iop::detail
             {
                 m_nextDmaId = 1u;
             }
+            traceSetDma("ok");
             setV0(dmaId);
             return true;
         }

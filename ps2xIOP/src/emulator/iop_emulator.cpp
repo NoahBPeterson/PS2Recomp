@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <optional>
 #include <span>
@@ -560,6 +561,11 @@ namespace ps2x::iop::detail
                 const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
+                    if (threadDumpEnabled && totalCycles >= nextThreadDumpCycle)
+                    {
+                        kernel.dumpThreads(totalCycles);
+                        nextThreadDumpCycle = totalCycles + 36864000u * 5u;
+                    }
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
                     timrman.serviceDue(totalCycles, *this);
@@ -702,6 +708,9 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // PS2X_IOP_THREAD_DUMP=1 dumps IOP thread/wait state roughly every 5s of IOP time.
+        bool threadDumpEnabled = std::getenv("PS2X_IOP_THREAD_DUMP") != nullptr;
+        uint64_t nextThreadDumpCycle = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;

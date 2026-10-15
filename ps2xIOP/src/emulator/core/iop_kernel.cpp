@@ -4,6 +4,8 @@
 #include "../iop_emulator_const.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <iterator>
 
 namespace ps2x::iop::detail
 {
@@ -705,6 +707,27 @@ namespace ps2x::iop::detail
                 nextWake = std::min(nextWake, thread.wakeCycle);
         }
         return nextWake;
+    }
+
+    void IopKernel::dumpThreads(uint64_t currentCycle) const
+    {
+        static constexpr const char *kStateNames[] = {
+            "Dormant", "Ready", "Running", "Sleep", "Delay", "Semaphore", "EventFlag", "Suspended", "Dead"};
+        std::fprintf(stderr, "[IOP threads] cycle=%llu count=%zu\n",
+                     static_cast<unsigned long long>(currentCycle), m_threads.size());
+        for (const auto &[id, thread] : m_threads)
+        {
+            const auto stateIndex = static_cast<size_t>(thread.state);
+            const char *stateName = stateIndex < std::size(kStateNames) ? kStateNames[stateIndex] : "?";
+            std::fprintf(stderr,
+                         "  tid=%d state=%s waitId=%d waitBits=0x%x waitMode=0x%x wakeups=%d prio=0x%x entry=0x%x pc=0x%x ra=0x%x sp=0x%x\n",
+                         id, stateName, thread.waitId, thread.waitBits, thread.waitMode, thread.wakeupCount,
+                         thread.priority, thread.entry, thread.cpu.pc, thread.cpu.gpr[31], thread.cpu.gpr[29]);
+        }
+        for (const auto &[id, sema] : m_semaphores)
+            std::fprintf(stderr, "  sema=%d count=%d/%d\n", id, sema.current, sema.maximum);
+        for (const auto &[id, event] : m_eventFlags)
+            std::fprintf(stderr, "  evf=%d bits=0x%x\n", id, event.bits);
     }
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)

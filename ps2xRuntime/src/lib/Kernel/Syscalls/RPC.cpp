@@ -2,6 +2,8 @@
 #include "RPC.h"
 #include "../../ps2_iop_transport.h"
 
+#include <cstdlib>
+
 namespace ps2_syscalls
 {
     namespace
@@ -19,6 +21,18 @@ namespace ps2_syscalls
         void pushSifRpcDebugEventLocked(SifRpcDebugEvent event)
         {
             event.seq = ++g_sif_rpc_debug_next_seq;
+            // PS2X_SIF_RPC_LOG=1 mirrors every RPC debug event to stderr (first 4096 events).
+            static const bool logToStderr = std::getenv("PS2X_SIF_RPC_LOG") != nullptr;
+            if (logToStderr && event.seq <= 4096u)
+            {
+                std::fprintf(stderr,
+                             "[sif-rpc] #%llu %s tid=%u pc=0x%x ra=0x%x sid=0x%x fn=0x%x mode=0x%x client=0x%x server=0x%x "
+                             "send=0x%x/%u recv=0x%x/%u result=0x%x end=0x%x/0x%x sema=0x%x flags=0x%x ret=%d\n",
+                             static_cast<unsigned long long>(event.seq), event.op, event.threadId, event.pc, event.ra,
+                             event.sid, event.rpcNum, event.mode, event.clientPtr, event.serverPtr,
+                             event.sendBuf, event.sendSize, event.recvBuf, event.recvSize, event.resultPtr,
+                             event.endFunc, event.endParam, event.semaId, event.flags, event.result);
+            }
             g_sif_rpc_debug_history[event.seq % kSifRpcDebugHistoryCount] = event;
         }
 

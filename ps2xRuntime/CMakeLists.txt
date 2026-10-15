@@ -512,6 +512,17 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
+# Instrument the hand-written runtime/IOP code only; the generated game code stays
+# uninstrumented so sanitizer builds remain tractable. Example: -DPS2X_SANITIZE=address,undefined
+set(PS2X_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list for ps2_runtime/ps2_iop (e.g. address,undefined or thread)")
+if(PS2X_SANITIZE AND NOT MSVC)
+    foreach(ps2x_sanitized_target ps2_runtime ps2_iop)
+        target_compile_options(${ps2x_sanitized_target} PRIVATE
+            -fsanitize=${PS2X_SANITIZE} -fno-omit-frame-pointer -g)
+    endforeach()
+    target_link_options(ps2EntryRunner PRIVATE -fsanitize=${PS2X_SANITIZE})
+endif()
+
 if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
