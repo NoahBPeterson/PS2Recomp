@@ -30,6 +30,7 @@
 // Presented host frames; read by debug switches (e.g. PS2X_PAD_SCRIPT in Pad.cpp).
 std::atomic<uint32_t> g_ps2xHostFrame{0u};
 extern std::atomic<uint32_t> g_ps2xGsFlips[2];
+extern std::atomic<uint32_t> g_ps2xPadReadsPort0;
 static std::string g_ps2xWindowTitle;
 
 namespace ps2_stubs
@@ -2597,21 +2598,26 @@ void PS2Runtime::run()
             }
         }
 
-        // Window title readout, refreshed twice a second: game FPS counts guest display flips
-        // (DISPFB changes; the busier of the two read circuits), host FPS is the present loop.
+        // Window title readout, refreshed twice a second. Game FPS is the faster of two per-frame
+        // signals: guest display flips (DISPFB changes, for double-buffering games) and port-0 pad
+        // polls (once per game-loop iteration; covers games like TC NYC that draw into one fixed
+        // display buffer and never flip). Host FPS is the present loop.
         {
             static double lastTime = GetTime();
             static uint32_t lastFlips[2] = {0u, 0u};
+            static uint32_t lastPadReads = 0u;
             const double now = GetTime();
             if (now - lastTime >= 0.5)
             {
                 const uint32_t flips0 = g_ps2xGsFlips[0].load(std::memory_order_relaxed);
                 const uint32_t flips1 = g_ps2xGsFlips[1].load(std::memory_order_relaxed);
-                const uint32_t flips = std::max(flips0 - lastFlips[0], flips1 - lastFlips[1]);
+                const uint32_t padReads = g_ps2xPadReadsPort0.load(std::memory_order_relaxed);
+                const uint32_t frames = std::max({flips0 - lastFlips[0], flips1 - lastFlips[1], padReads - lastPadReads});
                 SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(),
-                                          flips / (now - lastTime), GetFPS()));
+                                          frames / (now - lastTime), GetFPS()));
                 lastFlips[0] = flips0;
                 lastFlips[1] = flips1;
+                lastPadReads = padReads;
                 lastTime = now;
             }
         }

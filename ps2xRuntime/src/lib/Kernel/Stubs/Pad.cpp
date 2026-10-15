@@ -7,6 +7,10 @@
 
 extern std::atomic<uint32_t> g_ps2xHostFrame;
 
+// Successful port-0 scePadRead calls. Games poll the pad once per game-loop iteration,
+// so the host loop uses this as the game-FPS readout in the window title.
+std::atomic<uint32_t> g_ps2xPadReadsPort0{0u};
+
 namespace ps2_stubs
 {
     namespace
@@ -755,6 +759,10 @@ namespace ps2_stubs
             }
             setReturnS32(ctx, 0);
             return;
+        }
+        if (port == 0)
+        {
+            g_ps2xPadReadsPort0.fetch_add(1u, std::memory_order_relaxed);
         }
         if (g_padLog)
         {
