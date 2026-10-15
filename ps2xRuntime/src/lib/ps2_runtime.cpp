@@ -27,6 +27,9 @@
 #include <unordered_map>
 #include <sstream>
 
+// Presented host frames; read by debug switches (e.g. PS2X_PAD_SCRIPT in Pad.cpp).
+std::atomic<uint32_t> g_ps2xHostFrame{0u};
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -2540,7 +2543,9 @@ void PS2Runtime::run()
             return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
         }();
         static uint32_t presentedFrames = 0u;
-        if (screenshotEvery != 0u && (++presentedFrames % screenshotEvery) == 0u)
+        ++presentedFrames;
+        g_ps2xHostFrame.store(presentedFrames, std::memory_order_relaxed);
+        if (screenshotEvery != 0u && (presentedFrames % screenshotEvery) == 0u)
         {
             TakeScreenshot(TextFormat("ps2x_frame_%05u.png", presentedFrames));
 

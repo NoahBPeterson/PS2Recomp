@@ -1,6 +1,12 @@
 #include "Common.h"
 #include "Pad.h"
 
+#include <cstdlib>
+#include <string>
+#include <vector>
+
+extern std::atomic<uint32_t> g_ps2xHostFrame;
+
 namespace ps2_stubs
 {
     namespace
@@ -66,6 +72,95 @@ namespace ps2_stubs
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+
+        // PS2X_PAD_LOG=1 traces port setup and pad reads (first reads, then every 600th and on change).
+        const bool g_padLog = std::getenv("PS2X_PAD_LOG") != nullptr;
+
+        // PS2X_PAD_SCRIPT="name@frame+dur[*period],..." holds a port-0 button from host frame
+        // `frame` for `dur` frames, repeating every `period` frames if given. Names: start select
+        // cross circle square triangle up down left right l1 r1 l2 r2 l3 r3.
+        struct PadScriptPress
+        {
+            uint16_t mask = 0u;
+            uint32_t frame = 0u;
+            uint32_t duration = 1u;
+            uint32_t period = 0u;
+        };
+
+        uint16_t padButtonByName(const std::string &name)
+        {
+            static const std::pair<const char *, uint16_t> kNames[] = {
+                {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+                {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+                {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+                {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+                {"square", kPadBtnSquare}};
+            for (const auto &[key, mask] : kNames)
+            {
+                if (name == key)
+                {
+                    return mask;
+                }
+            }
+            return 0u;
+        }
+
+        const std::vector<PadScriptPress> &padScript()
+        {
+            static const std::vector<PadScriptPress> script = []
+            {
+                std::vector<PadScriptPress> out;
+                const char *env = std::getenv("PS2X_PAD_SCRIPT");
+                if (!env)
+                {
+                    return out;
+                }
+                const std::string spec(env);
+                size_t start = 0u;
+                while (start < spec.size())
+                {
+                    const size_t end = std::min(spec.find(',', start), spec.size());
+                    const std::string item = spec.substr(start, end - start);
+                    start = end + 1u;
+                    char name[16]{};
+                    unsigned frame = 0u, duration = 1u, period = 0u;
+                    if (std::sscanf(item.c_str(), "%15[a-z0-9]@%u+%u*%u", name, &frame, &duration, &period) < 2)
+                    {
+                        std::fprintf(stderr, "[pad-script] ignoring malformed entry '%s'\n", item.c_str());
+                        continue;
+                    }
+                    PadScriptPress press{padButtonByName(name), frame, duration ? duration : 1u, period};
+                    if (press.mask == 0u)
+                    {
+                        std::fprintf(stderr, "[pad-script] unknown button '%s'\n", name);
+                        continue;
+                    }
+                    std::printf("[pad-script] %s from frame %u for %u frames, period %u\n", name, frame, press.duration, period);
+                    out.push_back(press);
+                }
+                return out;
+            }();
+            return script;
+        }
+
+        // Active-low mask of scripted buttons held at host frame `frame`.
+        uint16_t scriptedButtonsAt(uint32_t frame)
+        {
+            uint16_t held = 0u;
+            for (const PadScriptPress &press : padScript())
+            {
+                if (frame < press.frame)
+                {
+                    continue;
+                }
+                const uint32_t offset = press.period ? (frame - press.frame) % press.period : frame - press.frame;
+                if (offset < press.duration)
+                {
+                    held = static_cast<uint16_t>(held | press.mask);
+                }
+            }
+            return held;
+        }
 
         uint8_t axisToByte(float axis)
         {
@@ -314,6 +409,11 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+            }
+
+            if (port == 0)
+            {
+                state.buttons = static_cast<uint16_t>(state.buttons & ~scriptedButtonsAt(g_ps2xHostFrame.load(std::memory_order_relaxed)));
             }
 
             fillPadStatus(outData, state, portState);
@@ -617,6 +717,11 @@ namespace ps2_stubs
         portState->dmaAddr = dmaAddr;
         portState->reqState = 0u;
         portState->transientState = 0u;
+        if (g_padLog)
+        {
+            std::printf("[pad] PortOpen port=%u slot=%u dma=0x%08x frame=%u\n", getRegU32(ctx, 4), getRegU32(ctx, 5),
+                        dmaAddr, g_ps2xHostFrame.load(std::memory_order_relaxed));
+        }
         if (dmaStr)
         {
             ps2TraceGuestRangeWrite(rdram, dmaAddr, 32u, "scePadPortOpen", ctx);
@@ -640,8 +745,30 @@ namespace ps2_stubs
         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
         if (!readPadPortData(port, slot, runtime, data, dataAddr))
         {
+            if (g_padLog)
+            {
+                static uint32_t failedReads = 0u;
+                if (failedReads++ < 8u)
+                {
+                    std::printf("[pad] Read port=%d slot=%d failed (port not open)\n", port, slot);
+                }
+            }
             setReturnS32(ctx, 0);
             return;
+        }
+        if (g_padLog)
+        {
+            static uint32_t reads = 0u;
+            static uint16_t lastButtons[kPadPortCount] = {0xFFFFu, 0xFFFFu};
+            const uint16_t buttons = static_cast<uint16_t>(data[2] | (data[3] << 8));
+            const size_t idx = static_cast<size_t>(port) % kPadPortCount;
+            ++reads;
+            if (reads <= 4u || (reads % 600u) == 0u || buttons != lastButtons[idx])
+            {
+                std::printf("[pad] Read #%u port=%d mode=0x%02x buttons=0x%04x frame=%u ra=0x%08x\n", reads, port, data[1],
+                            buttons, g_ps2xHostFrame.load(std::memory_order_relaxed), getRegU32(ctx, 31));
+            }
+            lastButtons[idx] = buttons;
         }
 
         PS2_IF_AGRESSIVE_LOGS({
@@ -730,6 +857,10 @@ namespace ps2_stubs
         }
 
         portState->analogMode = (getRegU32(ctx, 6) != 0u);
+        if (g_padLog)
+        {
+            std::printf("[pad] SetMainMode port=%u mode=%u lock=%u\n", getRegU32(ctx, 4), getRegU32(ctx, 6), getRegU32(ctx, 7));
+        }
         portState->reqState = 0u;
         queueExecCmdStateLocked(*portState);
         setReturnS32(ctx, 1);
