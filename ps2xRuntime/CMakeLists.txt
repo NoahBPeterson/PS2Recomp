@@ -450,6 +450,13 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
+# Per-game override modules self-register via static initializers, so they must be
+# linked into the executable directly (a static library would drop them).
+file(GLOB PS2X_GAME_OVERRIDE_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/overrides/*.cpp"
+)
+list(APPEND RUNNER_SRC_FILES ${PS2X_GAME_OVERRIDE_SRC_FILES})
+
 if(PS2X_IS_ANDROID)
     add_library(ps2EntryRunner SHARED
         ${RUNNER_SRC_FILES}

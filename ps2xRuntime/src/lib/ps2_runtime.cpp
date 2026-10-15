@@ -2458,14 +2458,25 @@ void PS2Runtime::run()
                 const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
                 const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
                 const auto eeSnapshot = m_eeScheduler->snapshot();
+                uint32_t gsGifPackets = 0u;
+                uint32_t gsPackedVertices = 0u;
+                uint32_t gsVertexKicks = 0u;
+                GS::debugActivityCounters(gsGifPackets, gsPackedVertices, gsVertexKicks);
 
                 RUNTIME_LOG("[run:tick] tick=" << tick
                                                << " pc=0x" << std::hex << dbgPc
                                                << " ra=0x" << dbgRa
                                                << " sp=0x" << dbgSp
                                                << " gp=0x" << dbgGp
+                                               << std::dec << " gifPkts=" << gsGifPackets
+                                               << " packedVtx=" << gsPackedVertices
+                                               << " kicks=" << gsVertexKicks << std::hex
+                                               << " pmode=0x" << gs.pmode
+                                               << " smode2=0x" << gs.smode2
                                                << " dispfb1=0x" << gs.dispfb1
                                                << " display1=0x" << gs.display1
+                                               << " dispfb2=0x" << gs.dispfb2
+                                               << " display2=0x" << gs.display2
                                                << std::dec
                                                << " activeThreads=" << eeSnapshot.threads.size()
                                                << " dma=" << curDma
@@ -2513,6 +2524,49 @@ void PS2Runtime::run()
         if (screenshotEvery != 0u && (++presentedFrames % screenshotEvery) == 0u)
         {
             TakeScreenshot(TextFormat("ps2x_frame_%05u.png", presentedFrames));
+
+            // PS2X_DUMP_FB="fbp:fbw:psm:w:h[,...]" (decimal fbp/fbw, hex psm) also dumps raw
+            // GS framebuffer regions as ps2x_fb_<frame>_<fbp>_<psm>.png alongside each screenshot.
+            if (const char *dumpSpec = std::getenv("PS2X_DUMP_FB"); dumpSpec && dumpSpec[0] != '\0')
+            {
+                std::string spec(dumpSpec);
+                size_t start = 0u;
+                while (start < spec.size())
+                {
+                    const size_t end = std::min(spec.find(',', start), spec.size());
+                    unsigned fbp = 0u, fbw = 0u, psm = 0u, w = 0u, h = 0u;
+                    if (std::sscanf(spec.substr(start, end - start).c_str(), "%u:%u:%x:%u:%u", &fbp, &fbw, &psm, &w, &h) == 5 &&
+                        w != 0u && h != 0u && w <= 2048u && h <= 2048u)
+                    {
+                        Image image = GenImageColor(static_cast<int>(w), static_cast<int>(h), BLACK);
+                        auto *pixels = static_cast<uint8_t *>(image.data);
+                        for (uint32_t y = 0u; y < h; ++y)
+                        {
+                            for (uint32_t x = 0u; x < w; ++x)
+                            {
+                                const uint32_t value = m_gs.ReadVram(psm, fbp * 32u, fbw, x, y);
+                                uint8_t *px = pixels + (static_cast<size_t>(y) * w + x) * 4u;
+                                if (psm == 0x02u || psm == 0x0Au) // PSMCT16 / PSMCT16S: A1B5G5R5
+                                {
+                                    px[0] = static_cast<uint8_t>((value & 0x1Fu) << 3);
+                                    px[1] = static_cast<uint8_t>(((value >> 5) & 0x1Fu) << 3);
+                                    px[2] = static_cast<uint8_t>(((value >> 10) & 0x1Fu) << 3);
+                                }
+                                else
+                                {
+                                    px[0] = static_cast<uint8_t>(value);
+                                    px[1] = static_cast<uint8_t>(value >> 8);
+                                    px[2] = static_cast<uint8_t>(value >> 16);
+                                }
+                                px[3] = 255u;
+                            }
+                        }
+                        ExportImage(image, TextFormat("ps2x_fb_%05u_%u_%02x.png", presentedFrames, fbp, psm));
+                        UnloadImage(image);
+                    }
+                    start = end + 1u;
+                }
+            }
         }
 
         if (WindowShouldClose())

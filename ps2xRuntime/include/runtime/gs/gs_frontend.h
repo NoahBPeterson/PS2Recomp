@@ -119,6 +119,8 @@ public:
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
     void unlockDisplaySnapshot();
     uint32_t getLastDisplayBaseBytes() const;
+    // Lifetime counters (not capped like the debug logs): GIF packets, packed XYZ vertices, vertex kicks.
+    static void debugActivityCounters(uint32_t &gifPackets, uint32_t &packedVertices, uint32_t &vertexKicks);
     const GSFrameReg &getContextFrame(int index) const
     {
         return m_ctx[(index != 0) ? 1 : 0].frame;

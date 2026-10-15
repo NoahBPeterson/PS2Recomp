@@ -1661,6 +1661,13 @@ void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
     m_backend->Initialize(m_localMemoryStorage, m_localMemorySize);
 }
 
+void GS::debugActivityCounters(uint32_t &gifPackets, uint32_t &packedVertices, uint32_t &vertexKicks)
+{
+    gifPackets = s_debugGifPacketCount.load(std::memory_order_relaxed);
+    packedVertices = s_debugGsPackedVertexCount.load(std::memory_order_relaxed);
+    vertexKicks = s_debugGsVertexKickCount.load(std::memory_order_relaxed);
+}
+
 uint32_t GS::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);

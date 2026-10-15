@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
@@ -98,6 +100,17 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+
+    // PS2X_GS_PRIV_LOG=1 traces writes to GS privileged registers (first 512).
+    inline void traceGsPrivWrite(uint32_t address, uint64_t newValue, unsigned bits)
+    {
+        static const bool enabled = std::getenv("PS2X_GS_PRIV_LOG") != nullptr;
+        static std::atomic<uint32_t> logged{0u};
+        if (!enabled || logged.fetch_add(1u, std::memory_order_relaxed) >= 512u)
+            return;
+        std::fprintf(stderr, "[gs-priv] w%u addr=0x%08x reg=0x%04x value=0x%016llx\n", bits, address,
+                     (address - PS2_GS_PRIV_REG_BASE) & ~0x7u, static_cast<unsigned long long>(newValue));
+    }
 
     // D_ENABLER (read port) and D_ENABLEW (write port) are the one DMAC enable
     // register; bit 16 (CPND) suspends every channel. The hardware reads 0x1201
@@ -977,6 +990,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             uint64_t mask = 0xFFFFFFFFULL << (off * 8);
             uint64_t newVal = (*reg & ~mask) | ((uint64_t)value << (off * 8));
             *reg = newVal;
+            traceGsPrivWrite(address, newVal, 32u);
         }
         return;
     }
@@ -1034,6 +1048,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
         else if (uint64_t *reg = gsRegPtr(gs_regs, address))
         {
             *reg = value;
+            traceGsPrivWrite(address, value, 64u);
         }
         return;
     }
@@ -1076,6 +1091,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     if (address & 15)
     {
         throw std::runtime_error("Unaligned 128-bit write at address: 0x" + std::to_string(address));
+    }
+
+    if (isGsPrivReg(address))
+    {
+        // SQ to a 64-bit GS privileged register: the low doubleword lands in the
+        // register, the high one on the (ignored) +8 alias.
+        write64(address, static_cast<uint64_t>(_mm_extract_epi64(value, 0)));
+        write64(address + 8u, static_cast<uint64_t>(_mm_extract_epi64(value, 1)));
+        return;
     }
 
     const bool scratch = isScratchpad(address);
