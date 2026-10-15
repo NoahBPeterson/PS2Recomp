@@ -1929,6 +1929,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         requestStop();
         break;
     case EeEventType::VBlankStart:
+        // GS CSR.VSINT latches at every vsync; with IMR.VSMSK clear it raises
+        // INTC_GS (drained below via consumeCompletedIntcCauses).
+        m_runtime.memory().gs().csr.fetch_or(0x8ull, std::memory_order_acq_rel);
         // Safety net for interrupts queued by DMA/VIF work outside a guest
         // store (e.g. from a stub) while the guest spins on loads only.
         m_runtime.drainCompletedDmacHandlers(m_rdram);

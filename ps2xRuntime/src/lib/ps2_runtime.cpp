@@ -2488,6 +2488,19 @@ void PS2Runtime::run()
                                                << " gsw=" << curGs
                                                << " vif=" << curVif
                                                << std::endl);
+                for (const auto &thread : eeSnapshot.threads)
+                {
+                    RUNTIME_LOG("  [ee-thread] id=" << thread.id
+                                                    << " status=" << static_cast<int>(thread.status)
+                                                    << " wait=" << static_cast<int>(thread.waitReason)
+                                                    << " waitId=" << thread.waitId
+                                                    << " prio=" << thread.currentPriority
+                                                    << std::hex << " entry=0x" << thread.entry
+                                                    << " pc=0x" << thread.pc
+                                                    << " ra=0x" << thread.ra << std::dec
+                                                    << " wakeups=" << thread.wakeupCount
+                                                    << std::endl);
+                }
 
             }
         });
@@ -2511,7 +2524,9 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        if (m_debugUiInitialized && m_debugUiDrawCallback)
+        // PS2X_HIDE_DEBUG_UI=1 keeps the debug panel off the presented frame (clean screenshots).
+        static const bool hideDebugUi = std::getenv("PS2X_HIDE_DEBUG_UI") != nullptr;
+        if (m_debugUiInitialized && m_debugUiDrawCallback && !hideDebugUi)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }

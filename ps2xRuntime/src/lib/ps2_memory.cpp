@@ -2004,6 +2004,21 @@ std::vector<uint32_t> PS2Memory::consumeCompletedIntcCauses()
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     std::vector<uint32_t> causes;
     causes.swap(m_completedIntcCauses);
+
+    // The GS asserts INTC_GS (cause 0) when a SIGNAL/FINISH/VSYNC event sets its CSR bit and
+    // the matching IMR mask (bit 8 SIGMSK, bit 9 FINISHMSK, bit 11 VSMSK) is clear. The frontend only
+    // latches CSR, so raise the interrupt here once per event; clearing the CSR bit
+    // (write-one-to-clear) re-arms it.
+    static uint64_t s_raisedGsEvents = 0u;
+    // CSR bits: 0 SIGNAL, 1 FINISH, 3 VSINT; IMR masks at bits 8, 9, 11.
+    const uint64_t gsEvents = gs_regs.csr.load(std::memory_order_relaxed) & 0xBu;
+    const uint64_t unmaskedEvents = gsEvents & ~((gs_regs.imr >> 8u) & 0xBu);
+    const uint64_t freshEvents = unmaskedEvents & ~s_raisedGsEvents;
+    s_raisedGsEvents = (s_raisedGsEvents | freshEvents) & gsEvents;
+    if (freshEvents != 0u)
+    {
+        causes.push_back(0u); // INTC_GS
+    }
     return causes;
 }
 
