@@ -263,6 +263,17 @@ namespace ps2recomp
                            vfd, vfd);
     }
 
+    // VU MAX/MINI compare the raw lane words in sign-magnitude order (PS2 floats have no Inf/NaN,
+    // and +0 > -0); host fmax/fmin turn exponent-255 lanes into NaN. Defines `res`.
+    static std::string vuMinMaxStatement(const std::string &a, const std::string &b, bool isMax)
+    {
+        return "__m128 res; { const __m128 mA = " + a + "; const __m128 mB = " + b + "; "
+               "const __m128i iA = _mm_castps_si128(mA), iB = _mm_castps_si128(mB); "
+               "const __m128i kA = _mm_xor_si128(iA, _mm_and_si128(_mm_srai_epi32(iA, 31), _mm_set1_epi32(0x7FFFFFFF))); "
+               "const __m128i kB = _mm_xor_si128(iB, _mm_and_si128(_mm_srai_epi32(iB, 31), _mm_set1_epi32(0x7FFFFFFF))); "
+               "res = _mm_blendv_ps(mB, mA, _mm_castsi128_ps(" + std::string(isMax ? "_mm_cmpgt_epi32(kA, kB)" : "_mm_cmpgt_epi32(kB, kA)") + ")); } ";
+    }
+
     std::string CodeGenerator::translateVU_VMINI_Field(const Instruction &inst)
     {
         uint8_t vfd = inst.sa;
@@ -270,13 +281,13 @@ namespace ps2recomp
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
         uint8_t field = inst.function & 0x3;
-
-        std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = fmt::format("_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE({1},{1},{1},{1}))", vft, field);
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs, vft, vft, shuffle_pattern,
+                           vuMinMaxStatement(a, b, false),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -289,13 +300,13 @@ namespace ps2recomp
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
         uint8_t field = inst.function & 0x3;
-
-        std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = fmt::format("_mm_shuffle_ps(ctx->vu0_vf[{0}], ctx->vu0_vf[{0}], _MM_SHUFFLE({1},{1},{1},{1}))", vft, field);
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs, vft, vft, shuffle_pattern,
+                           vuMinMaxStatement(a, b, true),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -353,10 +364,13 @@ namespace ps2recomp
         uint8_t vfs = inst.rd;
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = fmt::format("ctx->vu0_vf[{}]", vft);
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs, vft,
+                           vuMinMaxStatement(a, b, true),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -366,11 +380,15 @@ namespace ps2recomp
     {
         uint8_t vfd = inst.sa;
         uint8_t vfs = inst.rd;
+        uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = std::string("_mm_set1_ps(ctx->vu0_i)");
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs,
+                           vuMinMaxStatement(a, b, true),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -380,11 +398,15 @@ namespace ps2recomp
     {
         uint8_t vfd = inst.sa;
         uint8_t vfs = inst.rd;
+        uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = std::string("_mm_set1_ps(ctx->vu0_i)");
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs,
+                           vuMinMaxStatement(a, b, false),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -486,10 +508,13 @@ namespace ps2recomp
         uint8_t vfs = inst.rd;
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+        (void)vft;
+        const std::string a = fmt::format("ctx->vu0_vf[{}]", vfs);
+        const std::string b = fmt::format("ctx->vu0_vf[{}]", vft);
+        return fmt::format("{{ {}"
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vfs, vft,
+                           vuMinMaxStatement(a, b, false),
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            vfd, vfd);
@@ -783,10 +808,17 @@ namespace ps2recomp
         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
                            "src = _mm_mul_ps(src, _mm_set1_ps({})); "
                            "__m128i res_i = _mm_cvttps_epi32(src); "
+                           // Out-of-range lanes (incl. exponent 255) saturate by sign, as on the PS2;
+                           // the host conversion gives 0x80000000 for all of them.
+                           "{{ const __m128i bits = _mm_castps_si128(ctx->vu0_vf[{}]); "
+                           "const __m128i over = _mm_cmpgt_epi32(_mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(0x{:08X})); "
+                           "const __m128i sat = _mm_xor_si128(_mm_srai_epi32(bits, 31), _mm_set1_epi32(0x7FFFFFFF)); "
+                           "res_i = _mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(res_i), _mm_castsi128_ps(sat), _mm_castsi128_ps(over))); }} "
                            "__m128 res = _mm_castsi128_ps(res_i); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, codegen::formatFloatLiteral(scale),
+                           vfs, (0x4F000000u - (static_cast<uint32_t>(shift) << 23)) - 1u,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
                            inst.rt, inst.rt);
