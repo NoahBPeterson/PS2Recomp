@@ -13,6 +13,8 @@
 #include <filesystem>
 #include <limits>
 #include <string>
+#include <cstdio>
+#include <cstdlib>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -653,6 +655,19 @@ namespace ps2x::iop::detail
 
         bool readSectors(uint32_t lsn, uint32_t sectors, uint32_t destination)
         {
+            // PS2X_CDVD_LOG=1 traces IOP sceCdRead requests (first 256) and every failure.
+            static const bool logReads = std::getenv("PS2X_CDVD_LOG") != nullptr;
+            static uint32_t loggedReads = 0u;
+            const auto trace = [&](const char *outcome)
+            {
+                const bool failure = std::strcmp(outcome, "ok") != 0;
+                if (logReads && (failure || loggedReads < 256u))
+                {
+                    ++loggedReads;
+                    std::fprintf(stderr, "[iop-cdread] lsn=%u sectors=%u dst=0x%x image=%d -> %s\n",
+                                 lsn, sectors, destination, imageHandle != 0u ? 1 : 0, outcome);
+                }
+            };
             if (sectors == 0u)
             {
                 lastError = kCdvdErrorNone;
@@ -661,6 +676,7 @@ namespace ps2x::iop::detail
             const uint64_t byteCount64 = static_cast<uint64_t>(sectors) * kSectorSize;
             if (byteCount64 > IopMemory::RamSize || !memory.ownsRamRange(destination, static_cast<size_t>(byteCount64)))
             {
+                trace("destination outside IOP RAM");
                 lastError = kCdvdErrorRead;
                 return false;
             }
@@ -700,9 +716,11 @@ namespace ps2x::iop::detail
 
             if (!read || !memory.writeRam(destination, bytes.data(), bytes.size()))
             {
+                trace(read ? "write to IOP RAM failed" : "sector read failed");
                 lastError = kCdvdErrorRead;
                 return false;
             }
+            trace("ok");
             lastError = kCdvdErrorNone;
             return true;
         }

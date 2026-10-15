@@ -1065,6 +1065,13 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
 
+    // PS2X_CD_IMAGE=/path/to/game.iso lets raw-LSN CD reads hit the real disc layout
+    // instead of the virtual ISO synthesized from the extracted folder.
+    if (const char *cdImage = std::getenv("PS2X_CD_IMAGE"); cdImage && cdImage[0] != '\0')
+    {
+        paths.cdImage = std::filesystem::path(cdImage);
+    }
+
     setIoPaths(paths);
 }
 
