@@ -812,11 +812,24 @@ namespace ps2x::iop::detail
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // The EE accounts time in tiny steps (8 cycles per guest dispatch), and every runCycles()
+        // call makes a full pass over DMA, callbacks, alarms, timers and threads. Batch EE time
+        // until a slice of IOP time has built up: 128 IOP cycles is ~3.5 us of guest time, far
+        // below anything IOP drivers observe. PS2X_IOP_BATCH=<iop cycles> overrides (1 = old).
+        static const uint64_t batchIopCycles = []
+        {
+            const char *value = std::getenv("PS2X_IOP_BATCH");
+            const unsigned long parsed = value ? std::strtoul(value, nullptr, 10) : 128ul;
+            return static_cast<uint64_t>(parsed != 0ul ? parsed : 1ul);
+        }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
-        const uint64_t iopCycles = total / 8u;
+        if (total < batchIopCycles * 8u)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        m_impl->runCycles(total / 8u);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
