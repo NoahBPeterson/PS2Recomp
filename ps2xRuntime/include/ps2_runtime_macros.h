@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <bit>
+#include <limits>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -991,6 +992,31 @@ static inline void ps2_vu0_set_mac(R5900Context *ctx, __m128 result, uint32_t de
 #define PS2_VU0_SET_MAC(ctx_ptr, result, dest) ps2_vu0_set_mac((ctx_ptr), (result), (dest))
 
 // Additional VU0 operations
+static inline float Ps2VuDivQ(float fs, float ft)
+{
+    if (ft != 0.0f)
+    {
+        return fs / ft;
+    }
+    return (std::signbit(fs) != std::signbit(ft))
+               ? -std::numeric_limits<float>::max()
+               : std::numeric_limits<float>::max();
+}
+
+static inline float Ps2VuSqrtQ(float ft)
+{
+    return std::sqrt(std::fabs(ft));
+}
+
+static inline float Ps2VuRsqrtQ(float fs, float ft)
+{
+    return Ps2VuDivQ(fs, Ps2VuSqrtQ(ft));
+}
+
+#define PS2_VU_DIV_Q(fs, ft) Ps2VuDivQ((fs), (ft))
+#define PS2_VU_SQRT_Q(ft) Ps2VuSqrtQ((ft))
+#define PS2_VU_RSQRT_Q(fs, ft) Ps2VuRsqrtQ((fs), (ft))
+
 #define PS2_VSQRT(x) sqrtf(x)
 #define PS2_VRSQRT(x) (1.0f / sqrtf(x))
 
