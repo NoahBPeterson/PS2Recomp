@@ -317,7 +317,15 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     if (requestedEnd > static_cast<uint64_t>(PS2_RAM_SIZE))
         sizeBytes = PS2_RAM_SIZE - srcPhys;
 
+    // Normal-mode transfer straight from RDRAM: a stall inside it re-reads the rest on resume.
+    const uint8_t *savedBuffer = m_vif1Sources.buffer;
+    Vif1ChainSources saved = std::move(m_vif1Sources.current);
+    m_vif1Sources.buffer = m_rdram + srcPhys;
+    m_vif1Sources.current = Vif1ChainSources{};
+    m_vif1Sources.current.segments = {Vif1SourceSegment{0u, sizeBytes, srcPhys, false}};
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
+    m_vif1Sources.buffer = savedBuffer;
+    m_vif1Sources.current = std::move(saved);
 }
 
 // Forwards the data of a VIF1 DIRECT/DIRECTHL to GIF PATH2. The GS frontends consume each forwarded packet on its own,
@@ -383,6 +391,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             m_vif1IrqStallPending = false;
             m_vif1Stalled = true;
+            m_vif1Sources.noteStall(data, pos, sizeBytes, static_cast<uint32_t>(m_vif1StalledData.size()));
             m_vif1StalledData.insert(m_vif1StalledData.end(), data + pos, data + sizeBytes);
             return;
         }
@@ -896,7 +905,64 @@ void PS2Memory::resumeVIF1AfterStall()
     m_vif1Stalled = false;
     std::vector<uint8_t> rest;
     rest.swap(m_vif1StalledData);
+    // The DMAC reads the held-back part of the list only now: re-read the rest of the current
+    // tag and walk the chain again from the next tag (see ps2_vif1_source_map.h).
+    Vif1StalledSources held = std::move(m_vif1Sources.stalled);
+    m_vif1Sources.stalled.clear();
+    Vif1ChainSources restSources;
+    size_t changed = 0u;
+    if (held.valid)
+    {
+        changed = Vif1SourceTracking::refresh(rest, held.segments, m_rdram, PS2_RAM_SIZE, m_scratchpad, PS2_SCRATCHPAD_SIZE);
+        restSources.segments = held.segments;
+        if (held.rewalk && held.tailBegin <= held.tailEnd && held.tailEnd <= rest.size())
+        {
+            DmaChainCursor cursor;
+            cursor.tagAddr = held.resume.tagAddr;
+            cursor.asr0 = held.resume.asr0;
+            cursor.asr1 = held.resume.asr1;
+            cursor.asp = held.resume.asp;
+            std::vector<uint8_t> tail;
+            Vif1ChainSources tailSources;
+            walkDmaChain(0x10009000u, held.chcr, cursor, tail, &tailSources);
+            const size_t oldTail = held.tailEnd - held.tailBegin;
+            if (tail.size() != oldTail || std::memcmp(tail.data(), rest.data() + held.tailBegin, oldTail) != 0)
+                changed += tail.size() > oldTail ? tail.size() - oldTail : oldTail - tail.size() + 1u;
+            std::vector<uint8_t> merged;
+            merged.reserve(rest.size() - oldTail + tail.size());
+            merged.insert(merged.end(), rest.begin(), rest.begin() + held.tailBegin);
+            merged.insert(merged.end(), tail.begin(), tail.end());
+            merged.insert(merged.end(), rest.begin() + held.tailEnd, rest.end());
+            rest.swap(merged);
+            restSources.chcr = held.chcr;
+            Vif1TagMark first = held.resume;
+            first.endOffset = held.tailBegin;
+            restSources.marks.push_back(first);
+            for (auto seg : tailSources.segments)
+            {
+                seg.offset += held.tailBegin;
+                restSources.segments.push_back(seg);
+            }
+            for (auto mark : tailSources.marks)
+            {
+                mark.endOffset += held.tailBegin;
+                restSources.marks.push_back(mark);
+            }
+        }
+    }
+    {
+        // PS2X_VIF1_STALL_LOG=1 reports lists the EE rewrote while VIF1 was stalled.
+        static const bool trace = std::getenv("PS2X_VIF1_STALL_LOG") != nullptr;
+        if (trace && changed)
+            std::fprintf(stderr, "[vif1-stall] resume: the held-back list changed in guest memory (~%zu byte(s))\n", changed);
+    }
+    const uint8_t *savedBuffer = m_vif1Sources.buffer;
+    Vif1ChainSources saved = std::move(m_vif1Sources.current);
+    m_vif1Sources.buffer = held.valid ? rest.data() : nullptr;
+    m_vif1Sources.current = std::move(restSources);
     processVIF1Data(rest.data(), static_cast<uint32_t>(rest.size()));
+    m_vif1Sources.buffer = savedBuffer;
+    m_vif1Sources.current = std::move(saved);
     if (m_gifArbiter)
         m_gifArbiter->drain();
     if (!m_vif1Stalled && m_vif1DmaHeld)

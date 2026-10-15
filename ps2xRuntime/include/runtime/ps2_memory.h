@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include "gs/ps2_gif_arbiter.h"
+#include "ps2_vif1_source_map.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #elif defined(USE_SSE2NEON)
@@ -270,12 +271,15 @@ public:
     void queueIntcCause(uint32_t cause);
     void completeVif1Dma();
     void resumeVIF1AfterStall();
+    void walkDmaChain(uint32_t channelBase, uint32_t chcr, DmaChainCursor &cursor, std::vector<uint8_t> &chainBuf,
+                      Vif1ChainSources *sources);
     // VIF1 i-bit stall: data behind the stall, and whether the VIF1 DMA
     // completion is held until the stall is released.
     bool m_vif1IrqStallPending = false;
     bool m_vif1Stalled = false;
     bool m_vif1DmaHeld = false;
     std::vector<uint8_t> m_vif1StalledData;
+    Vif1SourceTracking m_vif1Sources; // guest addresses of m_vif1StalledData, re-read on resume
 
     struct CodeRegion
     {

@@ -861,6 +861,103 @@ void register_ps2_memory_tests()
             t.IsTrue((mem.vif1_regs.stat & (1u << 10)) == 0u, "FBRST.STC should clear STAT.VIS");
         });
 
+        // True Crime: New York City "texture noise": the VIF1 interrupt handler (one i-bit NOP per
+        // texture group) patches TEX0/FRAME into the part of the display list the DMAC has not
+        // read yet. The runtime copied the whole chain at CHCR.STR, so the rest of the list ran
+        // with values from two frames earlier and sampled unrelated VRAM.
+        tc.Run("VIF1 chain held behind an i-bit stall is re-read from memory on FBRST.STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kChain = 0x00120000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+
+            writeDmaTag(rdram, kChain, makeDmaTag(1u, 1u, 0u, false)); // CNT, one qword
+            putU32(kChain + 16u, 0x80000000u | makeVifCmd(0x07u, 0u, 0x1111u)); // MARK with the i-bit
+            putU32(kChain + 20u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 24u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 28u, makeVifCmd(0x00u, 0u, 0u));
+            writeDmaTag(rdram, kChain + 32u, makeDmaTag(1u, 7u, 0u, false)); // END, one qword
+            putU32(kChain + 48u, makeVifCmd(0x07u, 0u, 0x2222u));              // MARK, patched below
+            putU32(kChain + 52u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 56u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 60u, makeVifCmd(0x00u, 0u, 0u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x1111u, "VIF1 should stop after the i-bit MARK");
+            const std::vector<uint32_t> causes = mem.consumeCompletedIntcCauses();
+            t.IsTrue(std::find(causes.begin(), causes.end(), 5u) != causes.end(), "the i-bit should raise INTC VIF1");
+
+            // The "interrupt handler" rewrites the part of the list that is still in memory.
+            putU32(kChain + 48u, makeVifCmd(0x07u, 0u, 0x3333u));
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST STC write should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x3333u, "the rest of the list should be read after the stall, not at CHCR.STR");
+        });
+
+        tc.Run("VIF1 chain tags behind an i-bit stall are walked again on FBRST.STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kChain = 0x00140000u;
+            constexpr uint32_t kListA = 0x00141000u;
+            constexpr uint32_t kListB = 0x00142000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+            auto putMarkQword = [&](uint32_t addr, uint16_t mark, bool irq)
+            {
+                putU32(addr, (irq ? 0x80000000u : 0u) | makeVifCmd(0x07u, 0u, mark));
+                putU32(addr + 4u, 0u);
+                putU32(addr + 8u, 0u);
+                putU32(addr + 12u, 0u);
+            };
+
+            writeDmaTag(rdram, kChain, makeDmaTag(1u, 1u, 0u, false)); // CNT: i-bit MARK
+            putMarkQword(kChain + 16u, 0x1111u, true);
+            writeDmaTag(rdram, kChain + 32u, makeDmaTag(0u, 2u, kListA, false)); // NEXT -> A
+            writeDmaTag(rdram, kListA, makeDmaTag(1u, 7u, 0u, false));          // END: MARK 0x2222
+            putMarkQword(kListA + 16u, 0x2222u, false);
+            writeDmaTag(rdram, kListB, makeDmaTag(1u, 7u, 0u, false));          // END: MARK 0x4444
+            putMarkQword(kListB + 16u, 0x4444u, false);
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x1111u, "VIF1 should stop after the i-bit MARK");
+
+            writeDmaTag(rdram, kChain + 32u, makeDmaTag(0u, 2u, kListB, false)); // the handler relinks the list
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST STC write should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x4444u, "tags after the stall should be read after it");
+        });
+
+        tc.Run("VIF1 normal-mode transfer held behind an i-bit stall is re-read on FBRST.STC", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kData = 0x00130000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+            putU32(kData + 0u, 0x80000000u | makeVifCmd(0x07u, 0u, 0x1111u));
+            putU32(kData + 4u, makeVifCmd(0x07u, 0u, 0x2222u));
+            putU32(kData + 8u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kData + 12u, makeVifCmd(0x00u, 0u, 0u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kData), "write VIF1 MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, 1u), "write VIF1 QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x101u), "write VIF1 CHCR STR|DIR should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x1111u, "VIF1 should stop after the i-bit MARK");
+
+            putU32(kData + 4u, makeVifCmd(0x07u, 0u, 0x3333u));
+            t.IsTrue(mem.writeIORegister(0x10003C10u, 0x8u), "FBRST STC write should succeed");
+            t.Equals(mem.vif1_regs.mark, 0x3333u, "the held-back qword should be read after the stall");
+        });
+
         tc.Run("VIF1_ERR.MII masks the VIFcode i-bit", [](TestCase &t)
         {
             PS2Memory mem;
