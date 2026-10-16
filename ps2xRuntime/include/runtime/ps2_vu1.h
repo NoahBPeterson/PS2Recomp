@@ -222,6 +222,15 @@ private:
         uint64_t issueCycle = 0;
         bool active = false;
         bool currentTagEop = false;
+
+        // Everything but the packet buffer: only bytes below copiedBytes are ever read, and
+        // finishXgkick() submits totalBytes <= copiedBytes, so clearing 64 KB per kick is waste.
+        void resetState()
+        {
+            sourceAddress = totalBytes = copiedBytes = currentTagEnd = cycleCredit = 0u;
+            issueCycle = 0u;
+            active = currentTagEop = false;
+        }
     };
 
     static constexpr uint32_t kFmacLatency = 4u;

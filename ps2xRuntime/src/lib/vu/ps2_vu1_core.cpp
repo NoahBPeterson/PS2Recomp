@@ -74,7 +74,7 @@ void VU1Interpreter::resetScheduler()
     m_vfPendingUntil = m_accPendingUntil = 0u;
     for (WheelBucket &bucket : m_wheel)
         bucket.count = 0u;
-    m_xgkick = {};
+    m_xgkick.resetState();
     m_vfReady = {};
     m_viReady = {};
     m_accReady = {};
@@ -555,7 +555,7 @@ void VU1Interpreter::startXgkick(uint32_t qwordAddress)
         return;
 
     const uint32_t sourceAddress = (qwordAddress * 16u) % m_activeVuDataSize;
-    m_xgkick = {};
+    m_xgkick.resetState();
     m_xgkick.active = true;
     m_xgkick.sourceAddress = sourceAddress;
     m_xgkick.cycleCredit = 1u; // XGKICK's issue cycle counts toward PATH1.
