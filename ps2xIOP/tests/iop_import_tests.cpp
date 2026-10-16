@@ -189,7 +189,7 @@ namespace
         clear.gpr[4] = static_cast<uint32_t>(eventId);
         clear.gpr[5] = ~0x29u;
         if (!expect(kernel.dispatchEventImport(8u, clear), "ClearEventFlag was not handled") ||
-            !pollEvent(kernel, eventId, 0x29u, eventResult, -418))
+            !pollEvent(kernel, eventId, 0x29u, eventResult, -421)) // KE_EVF_COND (the Sony THREADMAN; was -418)
             return false;
 
         cpu = {};
@@ -326,12 +326,59 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    // R3000A cache isolation: with SR.IsC set, stores must not reach memory (LOADCORE's FlushIcache
+    // stores zeros over 0x0000-0x0FFF that way; found by the ground-truth boot of the Sony kernel).
+    bool testCacheIsolatedStores()
+    {
+        IopMemory memory;
+        IopCpuCore core(memory);
+        constexpr uint32_t code = 0x2000u, data = 0x3000u;
+        const uint32_t program[] = {
+            0xAC850000u, // sw  a1, 0(a0)
+            0xA0850004u, // sb  a1, 4(a0)
+            0xA4850008u, // sh  a1, 8(a0)
+            0xA885000Fu, // swl a1, 15(a0)
+            0xB8850010u, // swr a1, 16(a0)
+        };
+        (void)memory.writeRam(code, program, sizeof(program));
+        for (uint32_t i = 0; i < 6; ++i)
+            memory.write32(data + 4 * i, 0x11111111u);
+        IopCpuState cpu{};
+        cpu.pc = code;
+        cpu.gpr[4] = data;
+        cpu.gpr[5] = 0xAABBCCDDu;
+        cpu.cop0[12] = 0x10000u; // IsC
+        for (int i = 0; i < 5; ++i)
+            (void)core.executeInstruction(cpu);
+        for (uint32_t i = 0; i < 6; ++i)
+            if (!expect(memory.read32(data + 4 * i) == 0x11111111u, "a store reached memory with the cache isolated"))
+                return false;
+        cpu.pc = code;
+        cpu.cop0[12] = 0u;
+        (void)core.executeInstruction(cpu);
+        return expect(memory.read32(data) == 0xAABBCCDDu, "a store did not reach memory with the cache not isolated");
+    }
+
+    // COP0 PRId must identify the PS2 IOP (>= 0x10); the BIOS INTRMANI/TIMEMANI check it.
+    bool testPrid()
+    {
+        IopMemory memory;
+        IopCpuCore core(memory);
+        const uint32_t program[] = {0x40027800u /* mfc0 v0, $15 */, 0x00000000u};
+        (void)memory.writeRam(0x2000u, program, sizeof(program));
+        IopCpuState cpu{};
+        cpu.pc = 0x2000u;
+        (void)core.executeInstruction(cpu);
+        (void)core.executeInstruction(cpu); // load delay
+        return expect(cpu.gpr[2] == 0x1Fu, "mfc0 $15 did not return the IOP processor ID");
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testTimrmanPeriodicCallback() || !testCacheIsolatedStores() || !testPrid())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

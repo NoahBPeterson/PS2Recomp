@@ -62,6 +62,15 @@ if(PS2X_IOP_BUILD_TESTS)
     target_include_directories(ps2_iop_import_version_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ps2_iop_import_version_tests COMMAND ps2_iop_import_version_tests)
 
+    # Differential checks against the original Sony IOP modules (read at run time from the disc /
+    # BIOS; see tools/conformance/iop.sh). Not an add_test: it needs the firmware images.
+    add_executable(ps2_iop_ground_truth
+        tests/ground_truth/gt_main.cpp
+        tests/ground_truth/gt_stage1.cpp
+        tests/ground_truth/gt_stage2.cpp)
+    target_link_libraries(ps2_iop_ground_truth PRIVATE ps2_iop)
+    target_include_directories(ps2_iop_ground_truth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 endif()
 
 install(TARGETS ps2_iop

@@ -125,6 +125,8 @@ namespace ps2x::iop::detail
             intrman.reset();
             timrman.reset();
             ioman.reset();
+            sysclib.reset();
+            stdio.reset();
             pendingDmaInterrupts.clear();
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
@@ -336,7 +338,7 @@ namespace ps2x::iop::detail
                 return ImportDisposition::Handled;
             if (iequals(call.library, "sysclib"))
             {
-                return sysclib.dispatchImport(call.ordinal, cpu)
+                return sysclib.dispatchImport(call.ordinal, cpu, this)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }

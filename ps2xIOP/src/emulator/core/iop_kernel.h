@@ -91,6 +91,7 @@ namespace ps2x::iop::detail
             uint32_t attr = 0;
             uint32_t option = 0;
             int current = 0;
+            int initial = 0;
             int maximum = 1;
         };
 
@@ -98,6 +99,7 @@ namespace ps2x::iop::detail
         {
             int id = 0;
             uint32_t bits = 0;
+            uint32_t initBits = 0;
             uint32_t attr = 0;
             uint32_t option = 0;
         };

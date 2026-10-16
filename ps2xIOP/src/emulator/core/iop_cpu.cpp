@@ -113,6 +113,11 @@ namespace ps2x::iop::detail
                 write(reg, static_cast<uint32_t>(static_cast<int32_t>(result)));
         };
 
+        // COP0 SR bit 16 (IsC, isolate cache): loads and stores reach only the cache, never
+        // memory. The kernel's cache flushes (LOADCORE/EXCEPMAN FlushIcache) store zeros to
+        // 0x0000-0x0FFF with IsC set; without this they would wipe the exception vectors and SYSMEM.
+        const bool cacheIsolated = (cpu.cop0[12] & 0x10000u) != 0u;
+
         // TODO kill this magic number and make it a constant somewhere
         switch (opcode)
         {
@@ -317,7 +322,9 @@ namespace ps2x::iop::detail
         {
             const uint32_t copRs = rs;
             if (copRs == 0x00)
-                load(rt, cpu.cop0[rd]);
+                // PRId (r15) is read-only: the PS2's IOP reports revision 0x1F (a PS1 R3000A has
+                // 0x02). INTRMANI and TIMEMANI refuse to stay resident when PRId < 0x10.
+                load(rt, rd == 15u ? 0x1Fu : cpu.cop0[rd]);
             else if (copRs == 0x04)
                 cpu.cop0[rd] = cpu.gpr[rt];
             else if (copRs == 0x10 && funct == 0x10)
@@ -392,7 +399,8 @@ namespace ps2x::iop::detail
             break;
         }
         case 0x28:
-            m_memory.write8(cpu.gpr[rs] + static_cast<uint32_t>(simm), static_cast<uint8_t>(cpu.gpr[rt]));
+            if (!cacheIsolated)
+                m_memory.write8(cpu.gpr[rs] + static_cast<uint32_t>(simm), static_cast<uint8_t>(cpu.gpr[rt]));
             break;
         case 0x29:
         {
@@ -402,7 +410,8 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 5u, pc, wasDelaySlot, address);
                 break;
             }
-            m_memory.write16(address, static_cast<uint16_t>(cpu.gpr[rt]));
+            if (!cacheIsolated)
+                m_memory.write16(address, static_cast<uint16_t>(cpu.gpr[rt]));
             break;
         }
         case 0x2A:
@@ -427,7 +436,8 @@ namespace ps2x::iop::detail
                 result = value;
                 break;
             }
-            m_memory.write32(aligned, result);
+            if (!cacheIsolated)
+                m_memory.write32(aligned, result);
             break;
         }
         case 0x2B:
@@ -438,7 +448,8 @@ namespace ps2x::iop::detail
                 raiseException(cpu, 5u, pc, wasDelaySlot, address);
                 break;
             }
-            m_memory.write32(address, cpu.gpr[rt]);
+            if (!cacheIsolated)
+                m_memory.write32(address, cpu.gpr[rt]);
             break;
         }
         case 0x2E:
@@ -463,7 +474,8 @@ namespace ps2x::iop::detail
                 result = (old & 0x00FFFFFFu) | (value << 24u);
                 break;
             }
-            m_memory.write32(aligned, result);
+            if (!cacheIsolated)
+                m_memory.write32(aligned, result);
             break;
         }
         default:
