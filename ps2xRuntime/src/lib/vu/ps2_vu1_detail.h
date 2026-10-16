@@ -130,20 +130,9 @@ inline void VU1Interpreter::updateFmacFlags(const uint8_t laneFlags[4], uint8_t 
         status |= flags;
     }
 
-    const int slot = firstFreeSlot(m_flagMask, kMaxFlagEntries);
-    if (slot < 0)
-    {
-        reportReservedInstruction(true, 0xFFFFFFFFu);
+    FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFFu);
+    if (!entry)
         return;
-    }
-    FlagPipelineEntry *entry = &m_flagPipeline[slot];
-    m_flagMask |= 1u << slot;
-
-    *entry = {};
-    entry->valid = true;
-    entry->issueCycle = m_cycle;
-    entry->readyCycle = m_cycle + kFmacLatency;
-    wheelPush(WheelFlag, static_cast<uint32_t>(slot), entry->readyCycle);
     entry->mac = mac;
     entry->status = status;
     entry->extraSticky = extraSticky;
@@ -163,7 +152,34 @@ inline void VU1Interpreter::wheelPush(WheelKind kind, uint32_t slot, uint64_t re
     }
     WheelBucket &bucket = m_wheel[commitCycle & (kWheelSize - 1u)];
     bucket.items[bucket.count++] = static_cast<uint8_t>((static_cast<uint32_t>(kind) << 5) | slot);
-    bucket.flagCount += kind == WheelFlag ? 1u : 0u;
+}
+
+inline VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEntry(bool upper, uint32_t overflowCode)
+{
+    FlagSlot &slot = m_flagRing[m_cycle & (kFlagRingSize - 1u)];
+    if (slot.issueCycle != m_cycle)
+    {
+        slot.issueCycle = m_cycle; // its previous entries committed kFlagRingSize - kFmacLatency cycles ago
+        slot.count = 0u;
+    }
+    if (slot.count >= slot.entries.size())
+    {
+        reportReservedInstruction(upper, overflowCode);
+        return nullptr;
+    }
+    FlagPipelineEntry *entry = &slot.entries[slot.count++];
+    *entry = {};
+    entry->valid = true;
+    entry->issueCycle = m_cycle;
+    entry->readyCycle = m_cycle + kFmacLatency;
+    m_flagPendingUntil = std::max(m_flagPendingUntil, entry->readyCycle);
+    return entry;
+}
+
+inline VU1Interpreter::FlagSlot *VU1Interpreter::currentFlagSlot()
+{
+    FlagSlot &slot = m_flagRing[m_cycle & (kFlagRingSize - 1u)];
+    return slot.issueCycle == m_cycle ? &slot : nullptr;
 }
 
 #endif

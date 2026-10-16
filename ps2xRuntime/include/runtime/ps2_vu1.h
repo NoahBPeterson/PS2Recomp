@@ -241,7 +241,20 @@ private:
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
 
-    std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
+    // Flag writes (FMAC MAC/STATUS, CLIP, FSSET, FCSET) all become visible kFmacLatency cycles after
+    // issue, at most one upper and one lower per cycle: slot (issue cycle % 8) holds them in issue
+    // order, and the commit of cycle c takes slot (c - kFmacLatency).
+    struct FlagSlot
+    {
+        uint64_t issueCycle = UINT64_MAX;
+        uint8_t count = 0;
+        std::array<FlagPipelineEntry, 2> entries{};
+    };
+    static constexpr uint32_t kFlagRingSize = 8u;
+    std::array<FlagSlot, kFlagRingSize> m_flagRing{};
+    uint64_t m_flagPendingUntil = 0;
+    FlagPipelineEntry *allocFlagEntry(bool upper, uint32_t overflowCode);
+    FlagSlot *currentFlagSlot();
     ScalarPipelineEntry m_fdiv{};
     std::array<ScalarPipelineEntry, 2> m_efu{};
     std::array<PendingStore, kMaxPendingStores> m_storePipeline{};
@@ -250,7 +263,6 @@ private:
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
     // Bit i set <=> slot i of the matching pipeline array is valid (kept in step with .valid), so
     // the per-cycle commit and the slot searches touch only live entries, in slot order.
-    uint32_t m_flagMask = 0;
     uint32_t m_storeMask = 0;
     uint32_t m_vfWriteMask = 0;
     uint32_t m_viWriteMask = 0;
@@ -262,8 +274,7 @@ private:
     // holds entries due at the current cycle.
     enum WheelKind : uint8_t
     {
-        WheelFlag = 0,
-        WheelStore,
+        WheelStore = 1,
         WheelVf,
         WheelVi,
         WheelAcc
@@ -272,7 +283,6 @@ private:
     struct WheelBucket
     {
         uint8_t count = 0;
-        uint8_t flagCount = 0;
         uint8_t items[kMaxFlagEntries + kMaxPendingStores + kMaxPendingVfWrites + kMaxPendingViWrites +
                       kMaxPendingAccWrites]{};
     };

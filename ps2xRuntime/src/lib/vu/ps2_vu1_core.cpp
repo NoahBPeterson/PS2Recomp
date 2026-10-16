@@ -62,17 +62,18 @@ VU1Interpreter::VU1Interpreter(Unit unit)
 
 void VU1Interpreter::resetScheduler()
 {
-    m_flagPipeline = {};
+    m_flagRing = {};
+    m_flagPendingUntil = 0u;
     m_fdiv = {};
     m_efu = {};
     m_storePipeline = {};
     m_vfWritePipeline = {};
     m_viWritePipeline = {};
     m_accWritePipeline = {};
-    m_flagMask = m_storeMask = m_vfWriteMask = m_viWriteMask = m_accWriteMask = 0u;
+    m_storeMask = m_vfWriteMask = m_viWriteMask = m_accWriteMask = 0u;
     m_vfPendingUntil = m_accPendingUntil = 0u;
     for (WheelBucket &bucket : m_wheel)
-        bucket.count = bucket.flagCount = 0u;
+        bucket.count = 0u;
     m_xgkick = {};
     m_vfReady = {};
     m_viReady = {};
@@ -152,77 +153,38 @@ void VU1Interpreter::recordViWriteForBranch(uint8_t reg, int32_t oldValue)
 
 void VU1Interpreter::queueFsset(uint16_t immediate)
 {
-    for (uint32_t live = m_flagMask; live; live &= live - 1u)
-    {
-        FlagPipelineEntry &entry = m_flagPipeline[__builtin_ctz(live)];
-        if (entry.issueCycle == m_cycle)
-            entry.writesStatus = false;
-    }
+    if (FlagSlot *slot = currentFlagSlot())
+        for (uint32_t index = 0; index < slot->count; ++index)
+            slot->entries[index].writesStatus = false;
 
-    if (const int slot = firstFreeSlot(m_flagMask, kMaxFlagEntries); slot >= 0)
+    if (FlagPipelineEntry *entry = allocFlagEntry(false, 0xFFFFFFFEu))
     {
-        FlagPipelineEntry &entry = m_flagPipeline[slot];
-        m_flagMask |= 1u << slot;
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            wheelPush(WheelFlag, static_cast<uint32_t>(slot), entry.readyCycle);
-            entry.status = static_cast<uint32_t>(immediate) & 0xFC0u;
-            entry.writesSticky = true;
-            return;
-        }
+        entry->status = static_cast<uint32_t>(immediate) & 0xFC0u;
+        entry->writesSticky = true;
     }
-    reportReservedInstruction(false, 0xFFFFFFFEu);
 }
 
 void VU1Interpreter::queueClip(uint32_t clip)
 {
     m_workingClip = ((m_workingClip << 6) | (clip & 0x3Fu)) & 0xFFFFFFu;
-    if (const int slot = firstFreeSlot(m_flagMask, kMaxFlagEntries); slot >= 0)
+    if (FlagPipelineEntry *entry = allocFlagEntry(true, 0xFFFFFFFDu))
     {
-        FlagPipelineEntry &entry = m_flagPipeline[slot];
-        m_flagMask |= 1u << slot;
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            wheelPush(WheelFlag, static_cast<uint32_t>(slot), entry.readyCycle);
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
+        entry->clip = m_workingClip;
+        entry->writesClip = true;
     }
-    reportReservedInstruction(true, 0xFFFFFFFDu);
 }
 
 void VU1Interpreter::queueFcset(uint32_t clip)
 {
     m_workingClip = clip & 0xFFFFFFu;
-    for (uint32_t live = m_flagMask; live; live &= live - 1u)
+    if (FlagSlot *slot = currentFlagSlot())
+        for (uint32_t index = 0; index < slot->count; ++index)
+            slot->entries[index].writesClip = false;
+    if (FlagPipelineEntry *entry = allocFlagEntry(false, 0xFFFFFFFAu))
     {
-        FlagPipelineEntry &entry = m_flagPipeline[__builtin_ctz(live)];
-        if (entry.issueCycle == m_cycle)
-            entry.writesClip = false;
+        entry->clip = m_workingClip;
+        entry->writesClip = true;
     }
-    if (const int slot = firstFreeSlot(m_flagMask, kMaxFlagEntries); slot >= 0)
-    {
-        FlagPipelineEntry &entry = m_flagPipeline[slot];
-        m_flagMask |= 1u << slot;
-        {
-            entry = {};
-            entry.valid = true;
-            entry.issueCycle = m_cycle;
-            entry.readyCycle = m_cycle + kFmacLatency;
-            wheelPush(WheelFlag, static_cast<uint32_t>(slot), entry.readyCycle);
-            entry.clip = m_workingClip;
-            entry.writesClip = true;
-            return;
-        }
-    }
-    reportReservedInstruction(false, 0xFFFFFFFAu);
 }
 
 void VU1Interpreter::queueQ(float value, uint32_t latency, uint32_t statusDi)
@@ -355,23 +317,27 @@ void VU1Interpreter::queueAccWrite(uint8_t laneMask, const float value[4], uint3
 void VU1Interpreter::commitReadyPipelines()
 {
     // Called every simulated cycle. Flags commit before Q and P (all three write STATUS), as with a
-    // scan of every live entry; within flags, entries due together were queued in the same cycle
-    // in slot order (fixed latency). Stores, VF, VI and ACC touch disjoint state, and VF/VI/ACC
+    // scan of every live entry; flag entries due together were issued in the same cycle and commit
+    // in issue order (fixed latency). Stores, VF, VI and ACC touch disjoint state, and VF/VI/ACC
     // writes resolve by sequence number, so their order does not matter. Committed entries are only
     // marked invalid: queueing rewrites every field.
     WheelBucket &bucket = m_wheel[m_cycle & (kWheelSize - 1u)];
     const bool scalarsPending = m_fdiv.valid || m_efu[0].valid || m_efu[1].valid;
-    if (bucket.count == 0u && !scalarsPending)
+    FlagSlot *flags = nullptr;
+    if (m_cycle >= kFmacLatency)
+    {
+        FlagSlot &slot = m_flagRing[(m_cycle - kFmacLatency) & (kFlagRingSize - 1u)];
+        if (slot.issueCycle == m_cycle - kFmacLatency && slot.count != 0u)
+            flags = &slot;
+    }
+    if (bucket.count == 0u && !scalarsPending && !flags)
         return;
 
-    if (bucket.flagCount != 0u)
+    if (flags)
     {
-        for (uint32_t index = 0; index < bucket.count; ++index)
+        for (uint32_t index = 0; index < flags->count; ++index)
         {
-            if ((bucket.items[index] >> 5) != WheelFlag)
-                continue;
-            const uint32_t slot = bucket.items[index] & 31u;
-            FlagPipelineEntry &entry = m_flagPipeline[slot];
+            FlagPipelineEntry &entry = flags->entries[index];
             if (entry.writesMac)
                 m_state.mac = entry.mac;
             if (entry.writesStatus)
@@ -386,8 +352,8 @@ void VU1Interpreter::commitReadyPipelines()
             if (entry.writesClip)
                 m_state.clip = entry.clip;
             entry.valid = false;
-            m_flagMask &= ~(1u << slot);
         }
+        flags->count = 0u;
     }
 
     if (scalarsPending)
@@ -410,7 +376,7 @@ void VU1Interpreter::commitReadyPipelines()
         }
     }
 
-    if (bucket.count != bucket.flagCount)
+    if (bucket.count != 0u)
     {
         for (uint32_t index = 0; index < bucket.count; ++index)
         {
@@ -480,7 +446,6 @@ void VU1Interpreter::commitReadyPipelines()
         }
     }
     bucket.count = 0u;
-    bucket.flagCount = 0u;
 }
 
 void VU1Interpreter::progressXgkick()
@@ -504,11 +469,12 @@ void VU1Interpreter::progressXgkick()
         }
 
         const uint32_t qwordOffset = m_xgkick.copiedBytes;
-        for (uint32_t i = 0; i < 16u; ++i)
-        {
-            const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes + i) % m_activeVuDataSize;
-            m_xgkick.packet[m_xgkick.copiedBytes + i] = m_activeVuData[source];
-        }
+        // One qword from VU memory, wrapping at its end (a straight copy unless it straddles it).
+        const uint32_t source = (m_xgkick.sourceAddress + m_xgkick.copiedBytes) % m_activeVuDataSize;
+        const uint32_t firstPart = std::min(16u, m_activeVuDataSize - source);
+        std::memcpy(m_xgkick.packet.data() + qwordOffset, m_activeVuData + source, firstPart);
+        for (uint32_t i = firstPart; i < 16u; ++i)
+            m_xgkick.packet[qwordOffset + i] = m_activeVuData[(source + i) % m_activeVuDataSize];
         m_xgkick.copiedBytes += 16u;
 
         if (m_xgkick.currentTagEnd == 0u)
@@ -619,7 +585,7 @@ bool VU1Interpreter::pipelinesPending() const
     for (const ScalarPipelineEntry &entry : m_efu)
         if (entry.valid)
             return true;
-    return (m_flagMask | m_storeMask | m_vfWriteMask | m_viWriteMask | m_accWriteMask) != 0u ||
+    return (m_storeMask | m_vfWriteMask | m_viWriteMask | m_accWriteMask) != 0u || m_cycle < m_flagPendingUntil ||
            m_cycle < m_vfPendingUntil || m_cycle < m_accPendingUntil;
 }
 
