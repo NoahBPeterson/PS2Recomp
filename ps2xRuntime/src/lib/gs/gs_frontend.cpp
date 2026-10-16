@@ -3,7 +3,13 @@
 #include "runtime/gs/gs_dump_writer.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
+
+// Set by the EE RAM dump (PS2X_RAM_DUMP_VSYNCS) to its vsync; the next GS vsync writes gs_v<N>.bin.
+std::atomic<uint64_t> g_ps2xDebugGsDumpVsync{0};
 #include <atomic>
+#include <cstdlib>
+#include <string>
+#include <vector>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -549,6 +555,21 @@ void GS::latchHostPresentationFrame()
         request = buildPresentationRequestUnlocked();
         if (ps2x_gs_dump::active())
             ps2x_gs_dump::vsync(m_privRegs, request, m_backend.get());
+        // PS2X_RAM_DUMP_VSYNCS also snapshots GS local memory, at the first GS vsync after the EE one.
+        if (const uint64_t pending = g_ps2xDebugGsDumpVsync.exchange(0u, std::memory_order_acq_rel))
+        {
+            std::vector<uint8_t> vram;
+            m_backend->Flush();
+            m_backend->Sync(GSSyncReason::DebugReadback);
+            m_backend->SnapshotVram(vram);
+            const char *dir = std::getenv("PS2X_RAM_DUMP_DIR");
+            const std::string path = std::string(dir && *dir ? dir : ".") + "/gs_v" + std::to_string(pending) + ".bin";
+            if (FILE *f = std::fopen(path.c_str(), "wb"))
+            {
+                std::fwrite(vram.data(), 1, vram.size(), f);
+                std::fclose(f);
+            }
+        }
     }
 
     PresentationFrame frame{};

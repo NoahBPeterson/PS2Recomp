@@ -4,7 +4,8 @@
 //   PS2X_HOST_WRITE_RANGE=lo-hi      keep only writes overlapping [lo, hi) (physical, hex)
 // The file is flushed at every new vsync, so a killed run loses at most the current frame.
 //   PS2X_RAM_DUMP_VSYNCS=N[,N...]     write EE RAM to <PS2X_RAM_DUMP_DIR or .>/ram_v<N>.bin at those
-//                                     vsyncs (on the EE scheduler thread, between guest slices)
+//                                     vsyncs (on the EE scheduler thread, between guest slices),
+//                                     and GS local memory to gs_v<N>.bin at the next GS vsync
 #include "ps2_cpu_context.h"
 
 #include <cstdio>
@@ -17,6 +18,7 @@
 #endif
 
 std::atomic<bool> g_ps2HostWriteTraceOn{false};
+extern std::atomic<uint64_t> g_ps2xDebugGsDumpVsync; // gs_frontend.cpp
 
 namespace
 {
@@ -137,5 +139,6 @@ void ps2DebugRamDumpAtVsync(const uint8_t *rdram, uint64_t vsync)
             std::fwrite(rdram, 1, PS2_RAM_SIZE, f);
             std::fclose(f);
         }
+        g_ps2xDebugGsDumpVsync.store(vsync, std::memory_order_release);
     }
 }

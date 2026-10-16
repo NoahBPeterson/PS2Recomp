@@ -2928,10 +2928,11 @@ void PS2Runtime::run()
                     const double span = std::max(now - windowStart, 1e-3);
                     // vu1_interp: pairs the interpreter issued (not a translated block) per VU1 cycle, in %.
                     const uint64_t vu1Interpreted = g_ps2xVu1InterpretedPairs.load(std::memory_order_relaxed);
-                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f vu1_interp=%.1f%%\n",
+                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f vu1_interp=%.1f%% vsync=%llu\n",
                                 now, presentedFrames, gameFps, hostFps, (pads - windowPads) / span, (finishes - windowFinishes) / span,
                                 (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6,
-                                vu1Cycles > windowVu1Cycles ? 100.0 * double(vu1Interpreted - windowVu1Interpreted) / double(vu1Cycles - windowVu1Cycles) : 0.0);
+                                vu1Cycles > windowVu1Cycles ? 100.0 * double(vu1Interpreted - windowVu1Interpreted) / double(vu1Cycles - windowVu1Cycles) : 0.0,
+                                static_cast<unsigned long long>(m_memory.gs().vsyncTick.load(std::memory_order_acquire)));
                     windowVu1Interpreted = vu1Interpreted;
                     // PS2X_THREAD_REPORT=1: every EE thread (state, what it waits on, last known
                     // pc/ra) and the semaphores with waiters, for diagnosing stalls in unattended runs.
