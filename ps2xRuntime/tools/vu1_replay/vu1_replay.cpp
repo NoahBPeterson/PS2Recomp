@@ -2,8 +2,11 @@
 // through the runtime's VU1 interpreter and checks every run bit-exactly against the recording:
 // final VU1 state, data memory and the PATH1 (XGKICK) packets it sent. Also a benchmark.
 //
-//   ps2x_vu1_replay <trace> [--repeat N] [--examples N] [--quiet]
+//   ps2x_vu1_replay <trace> [--repeat N] [--examples N] [--quiet] [--repin <out trace>]
 // --repeat replays the whole trace N times (timing only; results are checked every time).
+// --repin writes the trace with every run's results (VU1 state, data hash, PATH1 packets) replaced by
+// the interpreter's (blocks off), for an intended behaviour change. A resume whose recorded inputs
+// were the previous run's results gets that run's new results as inputs.
 // Exit status: 0 all runs match, 1 mismatch, 2 usage / bad trace.
 
 #include "runtime/gs/gs_frontend.h"
@@ -34,6 +37,7 @@ namespace
         VU1State before{}, after{};
         uint64_t dataAfterHash = 0u, gifHash = 0u;
         uint32_t gifPackets = 0u, gifBytes = 0u;
+        size_t beforeOffset = 0u; // in the file: before, after, the data hash, the GIF hash/packets/bytes follow
     };
 
     bool load(const char *path, std::vector<uint8_t> &bytes, std::vector<Record> &records)
@@ -78,6 +82,7 @@ namespace
                 return false;
             r.code = code;
             r.data = bytes.data() + pos;
+            r.beforeOffset = pos + kMemSize;
             if (!take(nullptr, kMemSize) || !take(&r.before, sizeof(VU1State)) || !take(&r.after, sizeof(VU1State)) ||
                 !take(&r.dataAfterHash, 8) || !take(&r.gifHash, 8) || !take(&r.gifPackets, 4) || !take(&r.gifBytes, 4))
                 return false;
@@ -161,11 +166,12 @@ int main(int argc, char **argv)
 {
     if (argc < 2)
     {
-        std::fprintf(stderr, "usage: ps2x_vu1_replay <trace> [--repeat N] [--examples N] [--quiet]\n");
+        std::fprintf(stderr, "usage: ps2x_vu1_replay <trace> [--repeat N] [--examples N] [--quiet] [--repin <out>]\n");
         return 2;
     }
     int repeat = 1, examples = 5;
     bool quiet = false;
+    const char *repinPath = nullptr;
     for (int i = 2; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -175,6 +181,8 @@ int main(int argc, char **argv)
             examples = std::atoi(argv[++i]);
         else if (arg == "--quiet")
             quiet = true;
+        else if (arg == "--repin" && i + 1 < argc)
+            repinPath = argv[++i];
         else
         {
             std::fprintf(stderr, "unknown argument %s\n", arg.c_str());
@@ -182,6 +190,15 @@ int main(int argc, char **argv)
         }
     }
 
+    if (repinPath)
+    {
+        repeat = 1;
+#if defined(_WIN32)
+        _putenv_s("PS2X_VU1_NO_AOT", "1"); // the new results come from the interpreter
+#else
+        setenv("PS2X_VU1_NO_AOT", "1", 1);
+#endif
+    }
     std::vector<uint8_t> bytes;
     std::vector<Record> records;
     if (!load(argv[1], bytes, records) || records.empty())
@@ -213,6 +230,13 @@ int main(int argc, char **argv)
     uint8_t *const data = memory.getVU1Data();
 
     uint64_t mismatches = 0u, resumes = 0u, cycles = 0u, codeLoads = 0u;
+    std::vector<VU1State> oldAfter;
+    std::vector<uint64_t> oldDataHash;
+    for (const Record &r : records)
+    {
+        oldAfter.push_back(r.after);
+        oldDataHash.push_back(r.dataAfterHash);
+    }
     std::chrono::nanoseconds vuTime{}; // thread CPU time inside execute/resume only (excludes replay bookkeeping)
     const auto t0 = std::chrono::steady_clock::now();
     for (int pass = 0; pass < repeat; ++pass)
@@ -221,7 +245,21 @@ int main(int argc, char **argv)
         vu1.reset(); // every pass starts like the first: no pipeline state left from the last run
         for (size_t index = 0; index < records.size(); ++index)
         {
-            const Record &r = records[index];
+            Record &r = records[index];
+            if (repinPath && index > 0u && r.header.kind == static_cast<uint32_t>(RunKind::Resume))
+            {
+                // Chained to the previous run (recorded inputs = its recorded results): take its
+                // new results instead. (records[index - 1] already holds them; its old ones are in
+                // the copy made before patching.)
+                const Record &prev = records[index - 1u];
+                if (same(r.before, oldAfter[index - 1u]))
+                {
+                    r.before = prev.after;
+                    std::memcpy(bytes.data() + r.beforeOffset, &r.before, sizeof(VU1State));
+                }
+                if (fnv1a(r.data, kMemSize) == oldDataHash[index - 1u] && r.data != prev.data)
+                    std::memcpy(const_cast<uint8_t *>(r.data), data, kMemSize); // data still holds prev's result
+            }
             if (r.code != loadedCode)
             {
                 std::memcpy(code, r.code, kMemSize);
@@ -255,6 +293,20 @@ int main(int argc, char **argv)
             const uint64_t dataHash = fnv1a(data, kMemSize);
             const bool ok = diff.empty() && dataHash == r.dataAfterHash && gifHash == r.gifHash &&
                             gifPackets == r.gifPackets && gifBytes == r.gifBytes;
+            if (repinPath)
+            {
+                r.after = vu1.state();
+                r.dataAfterHash = dataHash;
+                r.gifHash = gifHash;
+                r.gifPackets = gifPackets;
+                r.gifBytes = gifBytes;
+                uint8_t *const at = bytes.data() + r.beforeOffset + sizeof(VU1State);
+                std::memcpy(at, &r.after, sizeof(VU1State));
+                std::memcpy(at + sizeof(VU1State), &dataHash, 8);
+                std::memcpy(at + sizeof(VU1State) + 8, &gifHash, 8);
+                std::memcpy(at + sizeof(VU1State) + 16, &gifPackets, 4);
+                std::memcpy(at + sizeof(VU1State) + 20, &gifBytes, 4);
+            }
             if (!ok)
             {
                 if (static_cast<int64_t>(mismatches) < examples)
@@ -278,5 +330,16 @@ int main(int argc, char **argv)
                 double(cycles) / (ms * 1000.0));
     (void)quiet;
     (void)codeLoads;
+    if (repinPath)
+    {
+        FILE *f = std::fopen(repinPath, "wb");
+        if (!f || std::fwrite(bytes.data(), 1, bytes.size(), f) != bytes.size() || std::fclose(f) != 0)
+        {
+            std::fprintf(stderr, "%s: cannot write\n", repinPath);
+            return 2;
+        }
+        std::printf("repinned %zu runs (%llu changed) -> %s\n", records.size(), (unsigned long long)mismatches, repinPath);
+        return 0;
+    }
     return mismatches ? 1 : 0;
 }

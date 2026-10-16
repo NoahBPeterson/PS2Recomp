@@ -16,6 +16,7 @@
 //
 //   ps2x_vu1_rec_gen <out dir> <trace.vu1trace>...   (tools/perf/vu1_rec_regen.sh)
 //   ps2x_vu1_rec_gen --selftest-fmac                 SIMD FMAC code against the scalar code
+//   ps2x_vu1_rec_gen --check-fmac-ref <file>         FMAC values against ps2-float (tools/vu1/fmac_ref)
 // Output is disc-derived (game code): not for git.
 
 #include "../../src/lib/vu/ps2_vu1_issue.h"
@@ -25,6 +26,7 @@
 #include "runtime/ps2_vu1_trace.h"
 
 #include <cfenv>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -136,6 +138,113 @@ struct Vu1RecGenerator
 #undef PS2X_FUZZ
         std::printf("fmac self-test: %s\n", bad ? "FAIL" : "PASS");
         return bad ? 1 : 0;
+    }
+
+    // FMAC results against reference results from ps2-float's VU model (PCSX2's arithmetic; file
+    // from tools/vu1/fmac_ref): ADD SUB MUL MADD MSUB, through the generic (execFmac), scalar and
+    // SIMD code. Values only (the model has no flags).
+    static int checkFmacRef(const char *path)
+    {
+        using K = VU1Interpreter::FmacKind;
+        using O = VU1Interpreter::FmacOperand;
+        std::ifstream in(path, std::ios::binary);
+        std::vector<uint32_t> words;
+        if (in)
+        {
+            in.seekg(0, std::ios::end);
+            words.resize(static_cast<size_t>(in.tellg()) / 4u);
+            in.seekg(0);
+            in.read(reinterpret_cast<char *>(words.data()), static_cast<std::streamsize>(words.size() * 4u));
+        }
+        const size_t cases = words.size() / 8u;
+        if (cases < 4u)
+        {
+            std::printf("fmac ref: %s: no cases\n", path);
+            return 1;
+        }
+        auto vu = std::make_unique<VU1Interpreter>(VU1Interpreter::Unit::VU1);
+        vu->reset();
+        if (std::fesetround(FE_TOWARDZERO) != 0) // as VU1Interpreter::run() executes microcode
+        {
+            std::printf("fmac ref: cannot round toward zero\n");
+            return 1;
+        }
+        static const char *kNames[5] = {"ADD", "SUB", "MUL", "MADD", "MSUB"};
+        static const K kKinds[5] = {K::Add, K::Sub, K::Mul, K::Madd, K::Msub};
+        uint64_t bad[5][3]{}; // [op][generic, scalar, SIMD]
+        uint64_t fusedWouldDiffer = 0, shown = 0;
+        constexpr uint32_t instr = (0xFu << 21) | (2u << 16) | (1u << 11) | (3u << 6); // .xyzw vf3, vf1, vf2
+        for (size_t base = 0; base + 4u <= cases; base += 4u)
+        {
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                const uint32_t *w = &words[(base + c) * 8u];
+                std::memcpy(&vu->m_state.acc[c], &w[0], 4);
+                std::memcpy(&vu->m_state.vf[1][c], &w[1], 4);
+                std::memcpy(&vu->m_state.vf[2][c], &w[2], 4);
+            }
+            float vs[4], vt[4], acc[4];
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                vs[c] = vu->normalizeOperand(vu->m_state.vf[1][c]);
+                vt[c] = vu->normalizeOperand(vu->m_state.vf[2][c]);
+                acc[c] = vu->normalizeOperand(vu->m_state.acc[c]);
+                const float fused = std::fma(vs[c], vt[c], acc[c]); // what one rounding would give
+                uint32_t fusedBits, ref = words[(base + c) * 8u + 6u];
+                std::memcpy(&fusedBits, &fused, 4);
+                if ((fusedBits & 0x7F800000u) != 0u && (fusedBits & 0x7F800000u) != 0x7F800000u && fusedBits != ref)
+                    ++fusedWouldDiffer;
+            }
+            for (int op = 0; op < 5; ++op)
+            {
+                vu->reset(); // (execFmac queues a flag update per instruction; cycles never advance here)
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    const uint32_t *w = &words[(base + c) * 8u];
+                    std::memcpy(&vu->m_state.acc[c], &w[0], 4);
+                    std::memcpy(&vu->m_state.vf[1][c], &w[1], 4);
+                    std::memcpy(&vu->m_state.vf[2][c], &w[2], 4);
+                }
+                float out[3][4]{};
+                vu->execFmac(kKinds[op], O::Vector, 0u, false, out[0], 0xFu, vs, vt, acc, 0.0f, 0.0f);
+                uint8_t laneFlags[4]{};
+                uint32_t sticky = 0u;
+                switch (op)
+                {
+                case 0: vu->computeFmacOpScalar<K::Add, O::Vector>(instr, 0xFu, out[1], laneFlags, sticky); vu->computeFmacOp<K::Add, O::Vector>(instr, 0xFu, out[2]); break;
+                case 1: vu->computeFmacOpScalar<K::Sub, O::Vector>(instr, 0xFu, out[1], laneFlags, sticky); vu->computeFmacOp<K::Sub, O::Vector>(instr, 0xFu, out[2]); break;
+                case 2: vu->computeFmacOpScalar<K::Mul, O::Vector>(instr, 0xFu, out[1], laneFlags, sticky); vu->computeFmacOp<K::Mul, O::Vector>(instr, 0xFu, out[2]); break;
+                case 3: vu->computeFmacOpScalar<K::Madd, O::Vector>(instr, 0xFu, out[1], laneFlags, sticky); vu->computeFmacOp<K::Madd, O::Vector>(instr, 0xFu, out[2]); break;
+                default: vu->computeFmacOpScalar<K::Msub, O::Vector>(instr, 0xFu, out[1], laneFlags, sticky); vu->computeFmacOp<K::Msub, O::Vector>(instr, 0xFu, out[2]); break;
+                }
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    const uint32_t *w = &words[(base + c) * 8u];
+                    for (int path = 0; path < 3; ++path)
+                    {
+                        uint32_t got;
+                        std::memcpy(&got, &out[path][c], 4);
+                        if (got == w[3 + op])
+                            continue;
+                        ++bad[op][path];
+                        if (shown++ < 8u)
+                            std::printf("  %s path %d: acc %08x s %08x r %08x: got %08x, model %08x\n", kNames[op], path,
+                                        w[0], w[1], w[2], got, w[3 + op]);
+                    }
+                }
+            }
+        }
+        uint64_t total = 0;
+        for (int op = 0; op < 5; ++op)
+        {
+            std::printf("fmac ref %-4s generic %llu scalar %llu simd %llu bad of %zu\n", kNames[op],
+                        (unsigned long long)bad[op][0], (unsigned long long)bad[op][1], (unsigned long long)bad[op][2],
+                        cases / 4u * 4u);
+            total += bad[op][0] + bad[op][1] + bad[op][2];
+        }
+        std::printf("fmac ref: %s, %zu cases x 5 ops x 3 paths bit-exact vs ps2-float (a fused MADD would differ in %llu)\n",
+                    total ? "FAIL" : "PASS", cases / 4u * 4u, (unsigned long long)fusedWouldDiffer);
+        return total ? 1 : 0;
     }
 
     using Pair = VU1Interpreter::DecodedInstructionPair;
@@ -734,6 +843,8 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && std::strcmp(argv[1], "--selftest-fmac") == 0)
         return Vu1RecGenerator::selfTestFmac();
+    if (argc == 3 && std::strcmp(argv[1], "--check-fmac-ref") == 0)
+        return Vu1RecGenerator::checkFmacRef(argv[2]);
     if (argc < 3)
     {
         std::fprintf(stderr, "usage: ps2x_vu1_rec_gen <out dir> <trace.vu1trace>...\n");

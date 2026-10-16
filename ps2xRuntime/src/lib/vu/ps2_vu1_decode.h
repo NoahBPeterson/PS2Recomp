@@ -11,21 +11,12 @@
 #define PS2X_VU_FMAC_NEON 1
 #elif defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
-#if defined(__FMA__)
-#include <immintrin.h>
-#endif
 #define PS2X_VU_FMAC_SSE2 1
 #endif
 
-// Whether FMAC MADD/MSUB round the product and the sum once (fused) or twice. The scalar code says
-// `a + s * r` and leaves that to the compiler's FP contraction: GCC/Clang fuse it on AArch64 and on
-// x86 with FMA enabled, not on plain x86-64. The SIMD paths below do the same, explicitly.
-// TODO(T-0121): pick the hardware behaviour for every platform (needs PCSX2/hardware evidence).
-#if defined(PS2X_VU_FMAC_NEON) || defined(__FMA__)
-#define PS2X_VU_FMAC_FUSED 1
-#else
-#define PS2X_VU_FMAC_FUSED 0
-#endif
+// FMAC MADD/MSUB/OPMSUB round twice on every platform, like the VU (and PCSX2): the product is
+// chopped (and flushed/clamped like any result), then the add. Every path writes the two steps
+// out; the build turns FP contraction off so the compiler does not fuse the scalar ones.
 
 constexpr void VU1Interpreter::addVfRead(InstructionUsage &usage, uint8_t reg, uint8_t lanes)
 {
@@ -528,7 +519,33 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
         const double la = static_cast<double>(a);
         float value;
         double exact;
-        if constexpr (Kind == FmacKind::Add)
+        if constexpr (productSum)
+        {
+            // Two roundings: the product chopped (and clamped / flushed like any result), then
+            // the add chopped. The product's Z/S/U/O accumulate into the sticky flags.
+            float product = s * r;
+            extraSticky |= normalizeFmacExactResult(product, ls * lr) & 0xFu;
+            const double lp = static_cast<double>(product);
+            if constexpr (Kind == FmacKind::Madd)
+            {
+                value = a + product;
+                exact = la + lp;
+            }
+            else
+            {
+                value = a - product;
+                exact = la - lp;
+            }
+            if constexpr (Kind == FmacKind::Opmsub)
+            {
+                if (component == 3u)
+                {
+                    value = 0.0f;
+                    exact = 0.0;
+                }
+            }
+        }
+        else if constexpr (Kind == FmacKind::Add)
         {
             value = s + r;
             exact = ls + lr;
@@ -538,25 +555,10 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
             value = s - r;
             exact = ls - lr;
         }
-        else if constexpr (Kind == FmacKind::Madd)
-        {
-            value = a + s * r;
-            exact = la + ls * lr;
-        }
-        else if constexpr (Kind == FmacKind::Msub)
-        {
-            value = a - s * r;
-            exact = la - ls * lr;
-        }
         else if constexpr (Kind == FmacKind::Mul)
         {
             value = s * r;
             exact = ls * lr;
-        }
-        else if constexpr (Kind == FmacKind::Opmsub)
-        {
-            value = component == 3u ? 0.0f : a - s * r;
-            exact = component == 3u ? 0.0 : la - ls * lr;
         }
         else
         {
@@ -565,11 +567,6 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
         }
         laneFlags[component] = normalizeFmacExactResult(value, exact);
         result[component] = value;
-        if constexpr (productSum)
-        {
-            float product = 0.0f;
-            extraSticky |= normalizeFmacExactResult(product, ls * lr) & 0xFu;
-        }
     }
 }
 
@@ -622,15 +619,20 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
     if constexpr (usesAcc)
         a = vreinterpretq_f32_u32(normalize(vreinterpretq_u32_f32(vld1q_f32(m_state.acc))));
 
+    // Product-sum: two roundings, the product chopped and flushed/clamped like any result, then
+    // the add chopped.
+    float32x4_t product = vdupq_n_f32(0.0f);
+    if constexpr (productSum)
+        product = vreinterpretq_f32_u32(normalize(vreinterpretq_u32_f32(vmulq_f32(s, r))));
     float32x4_t value;
     if constexpr (Kind == FmacKind::Add)
         value = vaddq_f32(s, r);
     else if constexpr (Kind == FmacKind::Sub)
         value = vsubq_f32(s, r);
     else if constexpr (Kind == FmacKind::Madd)
-        value = PS2X_VU_FMAC_FUSED ? vfmaq_f32(a, s, r) : vaddq_f32(a, vmulq_f32(s, r));
+        value = vaddq_f32(a, product);
     else if constexpr (Kind == FmacKind::Msub || Kind == FmacKind::Opmsub)
-        value = PS2X_VU_FMAC_FUSED ? vfmsq_f32(a, s, r) : vsubq_f32(a, vmulq_f32(s, r));
+        value = vsubq_f32(a, product);
     else
         value = vmulq_f32(s, r);
 
@@ -638,16 +640,15 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
     const uint32x4_t weights = vld1q_u32(kWeights);
     const uint32x4_t destLanes = vtstq_u32(vdupq_n_u32(dest), weights);
     const auto laneBits = [&](uint32x4_t mask) { return vaddvq_u32(vandq_u32(vandq_u32(mask, destLanes), weights)); };
-#if PS2X_VU_FMAC_FUSED
     if constexpr (wZero)
         value = vsetq_lane_f32(0.0f, value, 3);
     {
-        // Fast path. Fused, the float result is the exact one rounded toward zero (run() executes
-        // microcode in FE_TOWARDZERO), so a normal
-        // result below the largest float means no Z/U/O and the float's sign, with nothing to fix
-        // up. A zero result is an exact zero for ADD/SUB, and for MUL when an operand is zero.
-        // Anything else (and every lane of a product-sum's products the same way) takes the full
-        // classification below.
+        // Fast path. Each float result is the exact result of its operation rounded toward zero
+        // (run() executes microcode in FE_TOWARDZERO), so a normal result below the largest
+        // float means no Z/U/O and the float's sign, with nothing to fix up. A zero result is an
+        // exact zero for an add or subtract of normal (or zero) operands, and for MUL when an
+        // operand is zero. Anything else (and every lane of a product-sum's products the same
+        // way) takes the full classification below.
         const auto finite = [](uint32x4_t bits)
         {
             const uint32x4_t magnitude = vandq_u32(bits, vdupq_n_u32(0x7FFFFFFFu));
@@ -658,18 +659,18 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
         const uint32x4_t valueBits = vreinterpretq_u32_f32(value);
         const uint32x4_t valueZero = vceqzq_u32(vandq_u32(valueBits, vdupq_n_u32(0x7FFFFFFFu)));
         uint32x4_t ok = finite(valueBits);
-        if constexpr (Kind == FmacKind::Add || Kind == FmacKind::Sub)
-            ok = vorrq_u32(ok, valueZero);
-        else if constexpr (Kind == FmacKind::Mul || Kind == FmacKind::Opmula)
+        if constexpr (Kind == FmacKind::Mul || Kind == FmacKind::Opmula)
             ok = vorrq_u32(ok, vandq_u32(valueZero, vorrq_u32(sZero, rZero)));
+        else
+            ok = vorrq_u32(ok, valueZero);
         if constexpr (wZero)
             ok = vsetq_lane_u32(0xFFFFFFFFu, ok, 3); // w = exact +0
-        uint32x4_t product{};
+        const uint32x4_t productBits = vreinterpretq_u32_f32(product);
         if constexpr (productSum)
         {
-            product = vreinterpretq_u32_f32(vmulq_f32(s, r));
-            const uint32x4_t productZero = vceqzq_u32(vandq_u32(product, vdupq_n_u32(0x7FFFFFFFu)));
-            ok = vandq_u32(ok, vorrq_u32(finite(product), vandq_u32(productZero, vorrq_u32(sZero, rZero))));
+            // (the normalized product: a flushed or clamped one is not "finite" or an exact zero)
+            const uint32x4_t productZero = vceqzq_u32(vandq_u32(productBits, vdupq_n_u32(0x7FFFFFFFu)));
+            ok = vandq_u32(ok, vorrq_u32(finite(productBits), vandq_u32(productZero, vorrq_u32(sZero, rZero))));
         }
         if (vminvq_u32(vornq_u32(ok, destLanes)) == 0xFFFFFFFFu)
         {
@@ -679,17 +680,16 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
             bits.status = (z ? 1u : 0u) | (sg ? 2u : 0u);
             if constexpr (productSum)
             {
-                const uint32_t pz = laneBits(vceqzq_u32(vandq_u32(product, vdupq_n_u32(0x7FFFFFFFu))));
-                const uint32_t ps = laneBits(vcltzq_s32(vreinterpretq_s32_u32(product)));
+                const uint32_t pz = laneBits(vceqzq_u32(vandq_u32(productBits, vdupq_n_u32(0x7FFFFFFFu))));
+                const uint32_t ps = laneBits(vcltzq_s32(vreinterpretq_s32_u32(productBits)));
                 bits.productSticky = (pz ? 1u : 0u) | (ps ? 2u : 0u);
             }
             return bits;
         }
     }
-#endif
 
-    // The exact result in double (a product of two floats is exact there, so fused or not
-    // makes no difference for it).
+    // The exact result in double (a product of two floats is exact there; for a product-sum, the
+    // exact sum of the accumulator and the chopped product).
     const float64x2_t sLo = vcvt_f64_f32(vget_low_f32(s)), sHi = vcvt_high_f64_f32(s);
     const float64x2_t rLo = vcvt_f64_f32(vget_low_f32(r)), rHi = vcvt_high_f64_f32(r);
     float64x2_t eLo, eHi;
@@ -702,10 +702,11 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
     else
     {
         const float64x2_t aLo = vcvt_f64_f32(vget_low_f32(a)), aHi = vcvt_high_f64_f32(a);
+        const float64x2_t pLo = vcvt_f64_f32(vget_low_f32(product)), pHi = vcvt_high_f64_f32(product);
         if constexpr (Kind == FmacKind::Madd)
-            eLo = vfmaq_f64(aLo, sLo, rLo), eHi = vfmaq_f64(aHi, sHi, rHi);
+            eLo = vaddq_f64(aLo, pLo), eHi = vaddq_f64(aHi, pHi);
         else
-            eLo = vfmsq_f64(aLo, sLo, rLo), eHi = vfmsq_f64(aHi, sHi, rHi);
+            eLo = vsubq_f64(aLo, pLo), eHi = vsubq_f64(aHi, pHi);
     }
     if constexpr (wZero)
     {
@@ -784,23 +785,20 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
     if constexpr (usesAcc)
         a = normalize(_mm_loadu_ps(m_state.acc));
 
+    // Product-sum: two roundings, the product chopped and flushed/clamped like any result, then
+    // the add chopped.
+    __m128 product = _mm_setzero_ps();
+    if constexpr (productSum)
+        product = normalize(_mm_mul_ps(s, r));
     __m128 value;
     if constexpr (Kind == FmacKind::Add)
         value = _mm_add_ps(s, r);
     else if constexpr (Kind == FmacKind::Sub)
         value = _mm_sub_ps(s, r);
     else if constexpr (Kind == FmacKind::Madd)
-#if PS2X_VU_FMAC_FUSED
-        value = _mm_fmadd_ps(s, r, a);
-#else
-        value = _mm_add_ps(a, _mm_mul_ps(s, r));
-#endif
+        value = _mm_add_ps(a, product);
     else if constexpr (Kind == FmacKind::Msub || Kind == FmacKind::Opmsub)
-#if PS2X_VU_FMAC_FUSED
-        value = _mm_fnmadd_ps(s, r, a);
-#else
-        value = _mm_sub_ps(a, _mm_mul_ps(s, r));
-#endif
+        value = _mm_sub_ps(a, product);
     else
         value = _mm_mul_ps(s, r);
 
@@ -816,10 +814,11 @@ template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand>
     else
     {
         const __m128d aLo = _mm_cvtps_pd(a), aHi = _mm_cvtps_pd(_mm_movehl_ps(a, a));
+        const __m128d pLo = _mm_cvtps_pd(product), pHi = _mm_cvtps_pd(_mm_movehl_ps(product, product));
         if constexpr (Kind == FmacKind::Madd)
-            eLo = _mm_add_pd(aLo, _mm_mul_pd(sLo, rLo)), eHi = _mm_add_pd(aHi, _mm_mul_pd(sHi, rHi));
+            eLo = _mm_add_pd(aLo, pLo), eHi = _mm_add_pd(aHi, pHi);
         else
-            eLo = _mm_sub_pd(aLo, _mm_mul_pd(sLo, rLo)), eHi = _mm_sub_pd(aHi, _mm_mul_pd(sHi, rHi));
+            eLo = _mm_sub_pd(aLo, pLo), eHi = _mm_sub_pd(aHi, pHi);
     }
     if constexpr (wZero)
         eHi = _mm_move_sd(_mm_setzero_pd(), eHi); // w = +0
