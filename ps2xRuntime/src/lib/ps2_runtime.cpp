@@ -43,6 +43,7 @@ extern std::atomic<uint32_t> g_ps2xGsFinishes;
 // VU1 microprogram runs (MSCAL/MSCNT) and the VU1 cycles they took; [fps] readout.
 static std::atomic<uint32_t> g_ps2xVu1Runs{0u};
 static std::atomic<uint64_t> g_ps2xVu1Cycles{0u};
+static std::atomic<uint64_t> g_ps2xVu1InterpretedPairs{0u};
 
 namespace
 {
@@ -828,6 +829,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
+                                     g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -852,6 +854,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
+                                     g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -2837,7 +2840,7 @@ void PS2Runtime::run()
                 static int titleUpdates = 0;
                 static double windowStart = now;
                 static uint32_t windowFinishes = 0u, windowVu1Runs = 0u, windowPads = 0u;
-                static uint64_t windowVu1Cycles = 0u;
+                static uint64_t windowVu1Cycles = 0u, windowVu1Interpreted = 0u;
                 if (++titleUpdates % 10 == 0)
                 {
                     const uint32_t finishes = g_ps2xGsFinishes.load(std::memory_order_relaxed);
@@ -2845,9 +2848,32 @@ void PS2Runtime::run()
                     const uint32_t vu1Runs = g_ps2xVu1Runs.load(std::memory_order_relaxed);
                     const uint64_t vu1Cycles = g_ps2xVu1Cycles.load(std::memory_order_relaxed);
                     const double span = std::max(now - windowStart, 1e-3);
-                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f\n",
+                    // vu1_interp: pairs the interpreter issued (not a translated block) per VU1 cycle, in %.
+                    const uint64_t vu1Interpreted = g_ps2xVu1InterpretedPairs.load(std::memory_order_relaxed);
+                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f vu1_interp=%.1f%%\n",
                                 now, presentedFrames, gameFps, hostFps, (pads - windowPads) / span, (finishes - windowFinishes) / span,
-                                (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6);
+                                (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6,
+                                vu1Cycles > windowVu1Cycles ? 100.0 * double(vu1Interpreted - windowVu1Interpreted) / double(vu1Cycles - windowVu1Cycles) : 0.0);
+                    windowVu1Interpreted = vu1Interpreted;
+                    // PS2X_THREAD_REPORT=1: every EE thread (state, what it waits on, last known
+                    // pc/ra) and the semaphores with waiters, for diagnosing stalls in unattended runs.
+                    static const bool threadReport = std::getenv("PS2X_THREAD_REPORT") != nullptr;
+                    if (threadReport && m_eeScheduler)
+                    {
+                        static const char *kStatus[] = {"run", "ready", "wait", "waitsusp", "susp", "dormant"};
+                        static const char *kWait[] = {"-", "sleep", "sema", "evf", "vsync", "ext", "mpeg"};
+                        const EeKernelSnapshot snap = m_eeScheduler->snapshot();
+                        std::printf("[threads] running=%d", snap.runningThreadId);
+                        for (const EeThreadSnapshot &t : snap.threads)
+                            std::printf(" | %d %s/%s:%d pri=%d pc=%x ra=%x entry=%x inv=%u wake=%u", t.id,
+                                        kStatus[static_cast<int>(t.status)], kWait[static_cast<int>(t.waitReason)], t.waitId,
+                                        t.currentPriority, t.pc, t.ra, t.entry, t.invocationDepth, t.wakeupCount);
+                        std::printf("\n[semas]");
+                        for (const EeSemaphoreSnapshot &sema : snap.semaphores)
+                            if (sema.waiters)
+                                std::printf(" %d:%d/%d w=%u", sema.id, sema.count, sema.maxCount, sema.waiters);
+                        std::printf("\n");
+                    }
                     std::fflush(stdout); // unattended runs end with a signal; keep the readout
                     windowStart = now;
                     windowFinishes = finishes;
