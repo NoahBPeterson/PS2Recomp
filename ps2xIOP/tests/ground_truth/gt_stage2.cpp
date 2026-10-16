@@ -4,6 +4,7 @@
 // as UDNL does on TC2's IOP reboot. A generated test IRX goes last in the list: its start routine
 // calls a sequence of exports and records the results. The same IRX is then loaded into our HLE
 // IopEmulator and the two result sets are compared.
+#include <cstdlib>
 #include "gt_stage1.h"
 #include "gt_diff.h"
 
@@ -106,6 +107,10 @@ namespace gt
                   const std::vector<std::string> &order, const std::vector<uint8_t> *testIrx, uint64_t budget)
         {
             m.deliverExceptions = true;
+            // GT_DEVICES=1: root counters, INTC and interrupt delivery (T-0115 step 1).
+            static const bool withDevices = std::getenv("GT_DEVICES") != nullptr;
+            if (withDevices)
+                m.enableDevices();
             auto pick = [&](const std::string &name) -> const std::vector<uint8_t> *
             {
                 if (auto it = ioprp.find(name); it != ioprp.end())
@@ -184,6 +189,18 @@ namespace gt
             r = m.run(cpu, budget);
             finalCpu = cpu;
             lastRun = r;
+            if (withDevices && std::getenv("GT_DEVICES_REPORT"))
+            {
+                std::fprintf(stderr, "[gt-devices] cycle=%llu interrupts=%llu I_STAT=%x I_MASK=%x I_CTRL=%x SR=%x exit=%s\n",
+                             static_cast<unsigned long long>(m.devices.cycle()), static_cast<unsigned long long>(m.interruptsTaken),
+                             m.devices.iStat(), m.devices.iMask(), m.devices.iCtrl(), cpu.cop0[12], exitName(r.exit));
+                for (int i = 0; i < 6; ++i)
+                {
+                    const auto &c = m.devices.counter(i);
+                    std::fprintf(stderr, "[gt-devices]   counter %d mode=%04x rate=%u count=%llx target=%llx\n", i, c.mode, c.rate,
+                                 static_cast<unsigned long long>(c.count), static_cast<unsigned long long>(c.target));
+                }
+            }
             return true;
         }
 

@@ -9,6 +9,7 @@
 
 #include "emulator/core/iop_cpu.h"
 #include "emulator/core/iop_memory.h"
+#include "emulator/core/iop_devices.h"
 #include "emulator/imports/iop_imports.h"
 #include "emulator/iop_emulator_const.h"
 #include "emulator/services/iop_module_loader.h"
@@ -163,6 +164,16 @@ namespace gt
 
         IopMemory memory;
         IopCpuCore core{memory};
+        // Hardware (root counters, INTC) and interrupt delivery: off by default (stage 1 and the
+        // stage-2 probes that predate it run without); enableDevices() turns both on.
+        IopDevices devices;
+        bool interrupts = false;
+        uint64_t interruptsTaken = 0;
+        void enableDevices()
+        {
+            interrupts = true;
+            memory.attachDevices(&devices);
+        }
         IopImportRegistry decoder{memory};
         std::vector<Library> libraries;
         std::vector<Module> modules;
@@ -273,6 +284,23 @@ namespace gt
                     return result;
                 }
                 ++result.instructions;
+                if (interrupts)
+                {
+                    // One IOP cycle per instruction. The INTC line is COP0 Cause.IP2; it is taken
+                    // between instructions (not in a delay slot) when SR.IEc and SR.IM2 allow it,
+                    // as PCSX2's iopEventTest does: (Status & 0xFE01) >= 0x401.
+                    devices.advanceTo(devices.cycle() + 1u);
+                    const bool line = devices.interruptLine();
+                    cpu.cop0[13] = (cpu.cop0[13] & ~0x400u) | (line ? 0x400u : 0u);
+                    if (line && !cpu.branchPending && (cpu.cop0[12] & 0xFE01u) >= 0x401u)
+                    {
+                        flushPendingLoad(cpu);
+                        core.raiseException(cpu, 0u, cpu.pc, false);
+                        cpu.exception = false;
+                        ++interruptsTaken;
+                        continue;
+                    }
+                }
                 if (!cpu.branchPending)
                 {
                     if (const auto call = decoder.decode(cpu.pc))

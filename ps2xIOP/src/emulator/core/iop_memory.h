@@ -10,6 +10,8 @@
 
 namespace ps2x::iop::detail
 {
+    class IopDevices;
+
     class IopMemory
     {
     public:
@@ -68,6 +70,9 @@ namespace ps2x::iop::detail
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
+        // LLE: hardware registers a device models go to it (by access width) instead of the latches.
+        void attachDevices(IopDevices *devices) noexcept { m_devices = devices; }
+        [[nodiscard]] IopDevices *devices() const noexcept { return m_devices; }
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
@@ -87,5 +92,6 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        IopDevices *m_devices = nullptr;
     };
 }

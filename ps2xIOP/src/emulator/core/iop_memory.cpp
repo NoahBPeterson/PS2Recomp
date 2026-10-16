@@ -1,4 +1,5 @@
 #include "iop_memory.h"
+#include "iop_devices.h"
 
 #include <algorithm>
 #include <cstring>
@@ -51,6 +52,8 @@ namespace ps2x::iop::detail
             return m_ram[phys];
         if (phys >= ScratchBase && phys < ScratchBase + ScratchSize)
             return m_scratch[phys - ScratchBase];
+        if (m_devices && IopDevices::handles(phys))
+            return static_cast<uint8_t>(m_devices->read(phys, 1u));
         const uint32_t value = readHardware32(phys & ~3u);
         return static_cast<uint8_t>(value >> ((phys & 3u) * 8u));
     }
@@ -64,6 +67,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        if (m_devices && (phys & 1u) == 0u && IopDevices::handles(phys))
+            return static_cast<uint16_t>(m_devices->read(phys, 2u));
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -82,6 +87,8 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_scratch.data() + (phys - ScratchBase), sizeof(value));
             return value;
         }
+        if (m_devices && (phys & 3u) == 0u && IopDevices::handles(phys))
+            return m_devices->read(phys, 4u);
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
             return readHardware32(phys);
 
@@ -105,6 +112,11 @@ namespace ps2x::iop::detail
             m_scratch[phys - ScratchBase] = value;
             return;
         }
+        if (m_devices && IopDevices::handles(phys))
+        {
+            m_devices->write(phys, 1u, value);
+            return;
+        }
         const uint32_t aligned = phys & ~3u;
         uint32_t current = readHardware32(aligned);
         const uint32_t shift = (phys & 3u) * 8u;
@@ -119,6 +131,11 @@ namespace ps2x::iop::detail
         {
             std::memcpy(m_ram.data() + phys, &value, sizeof(value));
             markOwned(phys, sizeof(value));
+            return;
+        }
+        if (m_devices && (phys & 1u) == 0u && IopDevices::handles(phys))
+        {
+            m_devices->write(phys, 2u, value);
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -137,6 +154,11 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u && phys >= ScratchBase && phys + 3u < ScratchBase + ScratchSize)
         {
             std::memcpy(m_scratch.data() + (phys - ScratchBase), &value, sizeof(value));
+            return;
+        }
+        if (m_devices && (phys & 3u) == 0u && IopDevices::handles(phys))
+        {
+            m_devices->write(phys, 4u, value);
             return;
         }
         if ((phys & 3u) == 0u)

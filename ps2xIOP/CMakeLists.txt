@@ -10,6 +10,7 @@ add_library(ps2_iop STATIC
     src/iop_subsystem.cpp
     src/emulator/iop_emulator.cpp
     src/emulator/core/iop_cpu.cpp
+    src/emulator/core/iop_devices.cpp
     src/emulator/core/iop_kernel.cpp
     src/emulator/core/iop_memory.cpp
     src/emulator/services/iop_module_loader.cpp
@@ -70,6 +71,32 @@ if(PS2X_IOP_BUILD_TESTS)
         tests/ground_truth/gt_stage2.cpp)
     target_link_libraries(ps2_iop_ground_truth PRIVATE ps2_iop)
     target_include_directories(ps2_iop_ground_truth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+    # Differential checks of the IOP device models against PCSX2's own implementation, compiled
+    # from a PCSX2 source tree (GPL-3, read from outside the repo, never committed).
+    set(PS2X_PCSX2_SRC "" CACHE PATH "PCSX2 source tree (tag v2.8.2) for the device-model differential tests")
+    if(PS2X_PCSX2_SRC AND EXISTS "${PS2X_PCSX2_SRC}/pcsx2/IopCounters.cpp")
+        # Copied so that its quoted includes find the stand-ins in tests/pcsx2_ref/shim, not PCSX2's headers.
+        set(_ref ${CMAKE_CURRENT_BINARY_DIR}/pcsx2_ref)
+        configure_file(${PS2X_PCSX2_SRC}/pcsx2/IopCounters.cpp ${_ref}/IopCounters.cpp COPYONLY)
+        configure_file(${PS2X_PCSX2_SRC}/pcsx2/IopCounters.h ${_ref}/include/IopCounters.h COPYONLY)
+        add_executable(ps2_iop_rcnt_diff tests/pcsx2_ref/rcnt_diff.cpp ${_ref}/IopCounters.cpp)
+        target_link_libraries(ps2_iop_rcnt_diff PRIVATE ps2_iop)
+        target_include_directories(ps2_iop_rcnt_diff PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/pcsx2_ref/shim ${_ref}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    endif()
+    if(PS2X_PCSX2_SRC AND EXISTS "${PS2X_PCSX2_SRC}/pcsx2/R3000AInterpreter.cpp")
+        set(_cpu ${CMAKE_CURRENT_BINARY_DIR}/pcsx2_ref_cpu)
+        foreach(f R3000AInterpreter.cpp R3000AOpcodeTables.cpp)
+            configure_file(${PS2X_PCSX2_SRC}/pcsx2/${f} ${_cpu}/${f} COPYONLY)
+        endforeach()
+        configure_file(${PS2X_PCSX2_SRC}/pcsx2/R3000A.h ${_cpu}/include/R3000A.h COPYONLY)
+        add_executable(ps2_iop_cpu_diff tests/pcsx2_ref/cpu_diff.cpp ${_cpu}/R3000AInterpreter.cpp ${_cpu}/R3000AOpcodeTables.cpp)
+        target_link_libraries(ps2_iop_cpu_diff PRIVATE ps2_iop)
+        target_include_directories(ps2_iop_cpu_diff PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/pcsx2_ref/shim_cpu ${_cpu}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_options(ps2_iop_cpu_diff PRIVATE -w)
+    endif()
 
 endif()
 
