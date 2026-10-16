@@ -16,7 +16,8 @@
 // Hashing time is excluded from the reported replay time.
 //
 // The CPU backend honours the runtime's settings: PS2X_GS_THREADS=N raster workers (default 3
-// with PS2X_GS_ASYNC=1, else 1 = rasterize on the replay thread), PS2X_GS_ASYNC=1 asynchronous command execution. Output
+// with asynchronous commands, else 1 = rasterize on the replay thread), PS2X_GS_ASYNC=0
+// synchronous command execution (asynchronous is the default). Output
 // must be bit-identical for every setting (check with --hash-ref).
 
 #include "runtime/gs/gs_frontend.h"

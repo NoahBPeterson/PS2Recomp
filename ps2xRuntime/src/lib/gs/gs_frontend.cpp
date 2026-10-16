@@ -653,15 +653,14 @@ namespace
 {
     // The CPU backend can rasterize on worker threads (PS2X_GS_THREADS). By default every
     // public entry point waits for the primitives it queued before returning, so callers that
-    // read the VRAM allocation directly (tests) see finished pixels. PS2X_GS_ASYNC=1 lets the
-    // workers run on until the next backend call that needs VRAM (CLUT/texture loads,
+    // read the VRAM allocation directly (tests) see finished pixels. Asynchronous mode (the
+    // default; PS2X_GS_ASYNC=0 turns it off) lets the workers run on until the next backend call that needs VRAM (CLUT/texture loads,
     // transfers, presentation, FINISH, readbacks), overlapping rasterization with the EE/VU1.
     bool asyncRaster()
     {
         static const bool async = []
         {
-            const char *env = std::getenv("PS2X_GS_ASYNC");
-            return env && env[0] == '1';
+            return GSCpuBackend::DefaultAsyncCommands();
         }();
         return async;
     }

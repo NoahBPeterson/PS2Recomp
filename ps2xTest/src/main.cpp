@@ -25,6 +25,16 @@ void reset_ps2_test_function_table();
 
 int main()
 {
+    // The GS tests read the VRAM allocation right after submitting packets, so they need the
+    // synchronous GS backend (the runtime's default is asynchronous). Respect an explicit setting.
+    if (!std::getenv("PS2X_GS_ASYNC"))
+    {
+#ifdef _WIN32
+        _putenv_s("PS2X_GS_ASYNC", "0");
+#else
+        setenv("PS2X_GS_ASYNC", "0", 0);
+#endif
+    }
     MiniTest::BeforeEach(reset_ps2_test_function_table);
 
     register_code_generator_tests();

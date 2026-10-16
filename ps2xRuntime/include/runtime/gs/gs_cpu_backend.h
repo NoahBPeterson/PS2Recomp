@@ -22,9 +22,9 @@ public:
     explicit GSCpuBackend(uint32_t rasterThreads, bool asyncCommands = false);
     ~GSCpuBackend() override; // out of line: DecodedTexture is incomplete here
 
-    // PS2X_GS_THREADS (default 3 with PS2X_GS_ASYNC=1, else 1; 1 = rasterize on the calling thread).
+    // PS2X_GS_THREADS (default 3 with asynchronous commands, else 1; 1 = rasterize on the calling thread).
     static uint32_t DefaultRasterThreads();
-    // PS2X_GS_ASYNC=1.
+    // On unless PS2X_GS_ASYNC=0.
     static bool DefaultAsyncCommands();
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;

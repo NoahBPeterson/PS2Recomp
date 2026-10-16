@@ -677,7 +677,7 @@ struct GSCpuBackend::DecodedTexture
 
 
 // ---------------------------------------------------------------------------------------------
-// Asynchronous command execution (PS2X_GS_ASYNC=1): the caller's commands are queued and a
+// Asynchronous command execution (default; PS2X_GS_ASYNC=0 turns it off): the caller's commands are queued and a
 // dispatcher thread runs them, in order, through the same public entry points. Calls that hand
 // back VRAM-derived data wait for the queue to empty first.
 // ---------------------------------------------------------------------------------------------
@@ -823,8 +823,9 @@ struct GSCpuBackend::AsyncQueue
 
 bool GSCpuBackend::DefaultAsyncCommands()
 {
+    // On unless PS2X_GS_ASYNC=0: the game runs ~2x faster and the output is bit-identical.
     const char *env = std::getenv("PS2X_GS_ASYNC");
-    return env && env[0] == '1';
+    return !(env && env[0] == '0');
 }
 
 void GSCpuBackend::StartAsync()
@@ -2790,7 +2791,7 @@ uint32_t GSCpuBackend::DefaultRasterThreads()
     }
     // Workers pay off only with asynchronous commands: in the default synchronous mode every GIF
     // packet waits for them, which costs more than it saves (and starves under CPU contention).
-    // With PS2X_GS_ASYNC=1, 3 workers measured best in game on an 8P+2E M1 Pro (the EE, VU1,
+    // With asynchronous commands (the default), 3 workers measured best in game on an 8P+2E M1 Pro (the EE, VU1,
     // IOP, dispatcher and host threads need cores too).
     return DefaultAsyncCommands() ? 3u : 1u;
 }
