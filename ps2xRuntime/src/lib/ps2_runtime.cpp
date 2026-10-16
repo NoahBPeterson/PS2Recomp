@@ -1245,6 +1245,23 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     const MissingFunctionPolicy policy = missingFunctionPolicy();
     const bool firstReport = !m_missingFunctionReported.exchange(true, std::memory_order_acq_rel);
 
+    // PS2X_MISSING_TARGETS_FILE=<path>: append each missing EE target (once per run) so the next
+    // tools/recomp.sh adds it to the function map. Indirect jumps cannot all be found statically.
+    if (const char *missingLog = std::getenv("PS2X_MISSING_TARGETS_FILE"); missingLog && *missingLog)
+    {
+        static std::mutex missingLogMutex;
+        static std::unordered_set<uint32_t> logged;
+        std::lock_guard<std::mutex> lock(missingLogMutex);
+        if (logged.insert(targetPc).second)
+        {
+            if (FILE *f = std::fopen(missingLog, "a"))
+            {
+                std::fprintf(f, "0x%x  # runtime: %s from 0x%x\n", targetPc, describeGuestBranchKind(kind), sourcePc);
+                std::fclose(f);
+            }
+        }
+    }
+
     const uint32_t pc = ctx->pc;
     const uint32_t ra = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
     const uint32_t sp = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0));

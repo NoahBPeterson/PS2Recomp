@@ -476,6 +476,15 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
         UNITY_BUILD ON
         UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
     )
+    # Stable unity batches: a generated file assigning each function file a UNITY_GROUP by guest
+    # address (see tools/unity_groups.py in the game project). Without it CMake batches files in list
+    # order, so adding one function shifts every later batch and rebuilds most of the game.
+    set(PS2X_RUNNER_UNITY_GROUPS_FILE "" CACHE FILEPATH "CMake file assigning UNITY_GROUP to runner sources")
+    if(PS2X_RUNNER_UNITY_GROUPS_FILE AND EXISTS "${PS2X_RUNNER_UNITY_GROUPS_FILE}")
+        set(PS2X_RUNNER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/runner")
+        include("${PS2X_RUNNER_UNITY_GROUPS_FILE}")
+        set_target_properties(ps2EntryRunner PROPERTIES UNITY_BUILD_MODE GROUP)
+    endif()
     # The generated function table is one large file of its own; compile it on its own job so it
     # runs alongside the other units instead of serializing the end of the build.
     set_source_files_properties(src/runner/register_functions.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
