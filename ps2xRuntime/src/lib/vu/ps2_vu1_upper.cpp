@@ -474,3 +474,139 @@ void VU1Interpreter::execFmac(FmacKind kind, FmacOperand operand, uint8_t bcLane
     else
         applyDest(vd, result, dest);
 }
+
+template <VU1Interpreter::FmacKind Kind, VU1Interpreter::FmacOperand Operand, bool ToAcc, uint8_t Dest>
+void VU1Interpreter::execFmacOp(uint32_t instr)
+{
+    // Same computation as execFmac (see there), with the opcode family fixed at compile time.
+    static constexpr uint8_t kCrossLeft[4] = {1u, 2u, 0u, 3u};
+    static constexpr uint8_t kCrossRight[4] = {2u, 0u, 1u, 3u};
+    constexpr bool cross = Kind == FmacKind::Opmsub || Kind == FmacKind::Opmula;
+    constexpr bool productSum = Kind == FmacKind::Madd || Kind == FmacKind::Msub || Kind == FmacKind::Opmsub;
+    const uint8_t dest = Dest != 0u ? Dest : DEST(instr);
+    const float *vs = m_state.vf[FS(instr)];
+    const float *vt = m_state.vf[FT(instr)];
+    float result[4]{};
+    uint8_t laneFlags[4]{};
+    uint32_t extraSticky = 0u;
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        if ((dest & (1u << (3u - component))) == 0u)
+            continue;
+        const float s = normalizeOperand(vs[cross ? kCrossLeft[component] : component]);
+        float r;
+        if constexpr (Operand == FmacOperand::Broadcast)
+            r = normalizeOperand(vt[instr & 3u]);
+        else if constexpr (Operand == FmacOperand::Q)
+            r = normalizeOperand(m_state.q);
+        else if constexpr (Operand == FmacOperand::I)
+            r = normalizeOperand(m_state.i);
+        else
+            r = normalizeOperand(vt[cross ? kCrossRight[component] : component]);
+        const float a = normalizeOperand(m_state.acc[component]);
+        const long double ls = static_cast<long double>(s);
+        const long double lr = static_cast<long double>(r);
+        const long double la = static_cast<long double>(a);
+        float value;
+        long double exact;
+        if constexpr (Kind == FmacKind::Add)
+        {
+            value = s + r;
+            exact = ls + lr;
+        }
+        else if constexpr (Kind == FmacKind::Sub)
+        {
+            value = s - r;
+            exact = ls - lr;
+        }
+        else if constexpr (Kind == FmacKind::Madd)
+        {
+            value = a + s * r;
+            exact = la + ls * lr;
+        }
+        else if constexpr (Kind == FmacKind::Msub)
+        {
+            value = a - s * r;
+            exact = la - ls * lr;
+        }
+        else if constexpr (Kind == FmacKind::Mul)
+        {
+            value = s * r;
+            exact = ls * lr;
+        }
+        else if constexpr (Kind == FmacKind::Opmsub)
+        {
+            value = component == 3u ? 0.0f : a - s * r;
+            exact = component == 3u ? 0.0L : la - ls * lr;
+        }
+        else
+        {
+            value = component == 3u ? 0.0f : s * r;
+            exact = component == 3u ? 0.0L : ls * lr;
+        }
+        laneFlags[component] = normalizeFmacExactResult(value, exact);
+        result[component] = value;
+        if constexpr (productSum)
+        {
+            float product = 0.0f;
+            extraSticky |= normalizeFmacExactResult(product, ls * lr) & 0xFu;
+        }
+    }
+    updateFmacFlags(laneFlags, dest, extraSticky);
+    if constexpr (ToAcc)
+        applyDestAcc(result, dest);
+    else
+        applyDest(m_state.vf[FD(instr)], result, dest);
+}
+
+VU1Interpreter::UpperHandler VU1Interpreter::fmacHandlerFor(uint32_t upper)
+{
+    using K = FmacKind;
+    using O = FmacOperand;
+    const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
+    const bool toAcc = op >= 0x3Cu;
+    if (op >= 0x30u && !toAcc)
+        return nullptr;
+    const uint8_t code = toAcc ? static_cast<uint8_t>((upper & 3u) | ((upper >> 4) & 0x7Cu)) : op;
+    const uint8_t dest = static_cast<uint8_t>((upper >> 21) & 0xFu);
+#define PS2X_FMAC_D(kind, operand, acc)                                                     \
+    (dest == 0xFu   ? &VU1Interpreter::execFmacOp<K::kind, O::operand, acc, 0xFu>          \
+     : dest == 0xEu ? &VU1Interpreter::execFmacOp<K::kind, O::operand, acc, 0xEu>          \
+                    : &VU1Interpreter::execFmacOp<K::kind, O::operand, acc, 0u>)
+#define PS2X_FMAC(kind, operand) \
+    return toAcc ? PS2X_FMAC_D(kind, operand, true) : PS2X_FMAC_D(kind, operand, false)
+    if (code <= 0x03u)
+        PS2X_FMAC(Add, Broadcast);
+    if (code <= 0x07u)
+        PS2X_FMAC(Sub, Broadcast);
+    if (code <= 0x0Bu)
+        PS2X_FMAC(Madd, Broadcast);
+    if (code <= 0x0Fu)
+        PS2X_FMAC(Msub, Broadcast);
+    if (code >= 0x18u && code <= 0x1Bu)
+        PS2X_FMAC(Mul, Broadcast);
+    switch (code)
+    {
+    case 0x1Cu: PS2X_FMAC(Mul, Q);
+    case 0x1Eu: PS2X_FMAC(Mul, I);
+    case 0x20u: PS2X_FMAC(Add, Q);
+    case 0x21u: PS2X_FMAC(Madd, Q);
+    case 0x22u: PS2X_FMAC(Add, I);
+    case 0x23u: PS2X_FMAC(Madd, I);
+    case 0x24u: PS2X_FMAC(Sub, Q);
+    case 0x25u: PS2X_FMAC(Msub, Q);
+    case 0x26u: PS2X_FMAC(Sub, I);
+    case 0x27u: PS2X_FMAC(Msub, I);
+    case 0x28u: PS2X_FMAC(Add, Vector);
+    case 0x29u: PS2X_FMAC(Madd, Vector);
+    case 0x2Au: PS2X_FMAC(Mul, Vector);
+    case 0x2Cu: PS2X_FMAC(Sub, Vector);
+    case 0x2Du: PS2X_FMAC(Msub, Vector);
+    case 0x2Eu:
+        return toAcc ? PS2X_FMAC_D(Opmula, Vector, true) : PS2X_FMAC_D(Opmsub, Vector, false);
+    default:
+        return nullptr;
+    }
+#undef PS2X_FMAC
+#undef PS2X_FMAC_D
+}

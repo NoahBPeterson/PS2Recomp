@@ -110,8 +110,12 @@ private:
         bool reserved = false;
     };
 
+    using UpperHandler = void (VU1Interpreter::*)(uint32_t);
+
     struct DecodedInstructionPair
     {
+        // Specialized handler for FMAC upper ops (fmacHandlerFor), else nullptr: execUpper.
+        UpperHandler upperHandler = nullptr;
         uint32_t lower = 0;
         uint32_t upper = 0;
         InstructionUsage lowerUsage{};
@@ -354,6 +358,12 @@ private:
     // then applyFmacDest/applyFmacDestAcc.
     void execFmac(FmacKind kind, FmacOperand operand, uint8_t bcLane, bool toAcc, float *vd, uint8_t dest,
                   const float *vs, const float *vt, const float *acc, float q, float i);
+    // execFmac specialized per opcode family, reading fields and registers straight from the
+    // instruction (selected at decode time by fmacHandlerFor; same results as execUpper).
+    // Dest = 0 means "read the dest mask from the instruction"; 0xF / 0xE are specialized.
+    template <FmacKind Kind, FmacOperand Operand, bool ToAcc, uint8_t Dest>
+    void execFmacOp(uint32_t instr);
+    static UpperHandler fmacHandlerFor(uint32_t upper);
 
     void applyDest(float *dst, const float *result, uint8_t dest);
     void applyDestAcc(const float *result, uint8_t dest);
