@@ -79,6 +79,15 @@ if(PS2X_IS_ARM_TARGET)
     endif()
 endif()
 
+# Every float operation the code writes rounds once, the same on every platform: GCC/Clang would
+# otherwise fuse a * b + c into one FMA on some targets (AArch64, x86 with -mfma) and not on others,
+# while the PS2 rounds a VU or FPU multiply-add twice. (MSVC does not contract under /fp:precise.)
+# Code that wants a fused operation says so (std::fma, vfmaq_*). Cost: ~3% of the CPU GS
+# rasterizer's time on AArch64 (2026-10-16); in exchange its pixels are the same on every platform.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-ffp-contract=off)
+endif()
+
 if(PS2X_BUILD_RECOMP)
     add_subdirectory("ps2xRecomp")
 endif()
