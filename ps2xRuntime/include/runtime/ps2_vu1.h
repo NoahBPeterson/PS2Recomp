@@ -382,6 +382,7 @@ private:
 
     void resetScheduler();
     void commitReadyPipelines();
+    bool commitDue() const; // cheap check: anything for commitReadyPipelines() this cycle?
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
     void flushPipelines();

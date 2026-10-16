@@ -176,6 +176,16 @@ inline VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEntry(bool up
     return entry;
 }
 
+inline bool VU1Interpreter::commitDue() const
+{
+    if (m_wheel[m_cycle & (kWheelSize - 1u)].count != 0u || m_fdiv.valid || m_efu[0].valid || m_efu[1].valid)
+        return true;
+    if (m_cycle < kFmacLatency)
+        return false;
+    const FlagSlot &slot = m_flagRing[(m_cycle - kFmacLatency) & (kFlagRingSize - 1u)];
+    return slot.issueCycle == m_cycle - kFmacLatency && slot.count != 0u;
+}
+
 inline VU1Interpreter::FlagSlot *VU1Interpreter::currentFlagSlot()
 {
     FlagSlot &slot = m_flagRing[m_cycle & (kFlagRingSize - 1u)];

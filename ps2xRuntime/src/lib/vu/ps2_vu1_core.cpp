@@ -568,8 +568,10 @@ void VU1Interpreter::advanceOneCycle()
     m_state.cycles = m_cycle;
     // LSU commits become visible at the cycle boundary before PATH1 consumes
     // its next qword from VU memory.
-    commitReadyPipelines();
-    progressXgkick();
+    if (commitDue())
+        commitReadyPipelines();
+    if (m_xgkick.active)
+        progressXgkick();
 }
 
 void VU1Interpreter::advanceTo(uint64_t targetCycle)
@@ -1336,11 +1338,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         float newLowerVf[4]{};
         float oldAcc[4]{};
         float newAcc[4]{};
-        if (hasUpperWrite)
+        // On VU1's immediate-write path, the specialized FMAC handlers write exactly their
+        // dest lanes (= the usage lanes), so there is nothing to restore for them.
+        const bool immediateWrites = m_unit == Unit::VU1 && m_cycle + kImmediateWriteMargin < budgetEnd;
+        const bool upperExactLanes = immediateWrites && decoded.upperHandler != nullptr;
+        if (hasUpperWrite && !upperExactLanes)
             std::memcpy(oldUpperVf, m_state.vf[upperWrite.reg], sizeof(oldUpperVf));
         if (hasDistinctLowerWrite)
             std::memcpy(oldLowerVf, m_state.vf[lowerWrite.reg], sizeof(oldLowerVf));
-        if (decoded.upperUsage.accWrite != 0u)
+        if (decoded.upperUsage.accWrite != 0u && !upperExactLanes)
             std::memcpy(oldAcc, m_state.acc, sizeof(oldAcc));
 
         if (decoded.iBit)
@@ -1397,7 +1403,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // queued write left over from such a run cannot land on top of them after a resume.
         // Lanes outside the write mask keep their old values, as a queued write would leave them.
         // VU0 always queues: the EE can read its registers while a microprogram runs.
-        if (m_unit == Unit::VU1 && m_cycle + kImmediateWriteMargin < budgetEnd)
+        if (immediateWrites)
         {
             auto land = [this](float *reg, const float *old, uint8_t lanes, std::array<uint64_t, 4> &latest)
             {
@@ -1412,10 +1418,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             };
             if (hasUpperWrite && upperWrite.lanes != 0u)
             {
-                land(m_state.vf[upperWrite.reg], oldUpperVf, upperWrite.lanes, m_vfLatestWrite[upperWrite.reg]);
+                if (upperExactLanes)
+                {
+                    const uint64_t sequence = ++m_nextWriteSequence;
+                    for (uint32_t component = 0; component < 4u; ++component)
+                        if ((upperWrite.lanes & laneForComponent(component)) != 0u)
+                            m_vfLatestWrite[upperWrite.reg][component] = sequence;
+                }
+                else
+                    land(m_state.vf[upperWrite.reg], oldUpperVf, upperWrite.lanes, m_vfLatestWrite[upperWrite.reg]);
                 m_vfPendingUntil = std::max(m_vfPendingUntil, m_cycle + decoded.upperVfWriteLatency);
             }
-            else if (hasUpperWrite)
+            else if (hasUpperWrite && !upperExactLanes)
                 std::memcpy(m_state.vf[upperWrite.reg], oldUpperVf, sizeof(oldUpperVf));
             if (hasDistinctLowerWrite && lowerWrite.lanes != 0u)
             {
@@ -1426,7 +1440,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 std::memcpy(m_state.vf[lowerWrite.reg], oldLowerVf, sizeof(oldLowerVf));
             if (decoded.upperUsage.accWrite != 0u)
             {
-                land(m_state.acc, oldAcc, decoded.upperUsage.accWrite, m_accLatestWrite);
+                if (upperExactLanes)
+                {
+                    const uint64_t sequence = ++m_nextWriteSequence;
+                    for (uint32_t component = 0; component < 4u; ++component)
+                        if ((decoded.upperUsage.accWrite & laneForComponent(component)) != 0u)
+                            m_accLatestWrite[component] = sequence;
+                }
+                else
+                    land(m_state.acc, oldAcc, decoded.upperUsage.accWrite, m_accLatestWrite);
                 m_accPendingUntil = std::max(m_accPendingUntil, m_cycle + kAccForwardLatency);
             }
         }
