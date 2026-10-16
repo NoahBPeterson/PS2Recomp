@@ -494,6 +494,16 @@ namespace
     }
 }
 
+// PS2X_HEADLESS=1: no window and no GL context at all (automated runs; works with the display off or
+// asleep, where creating even a hidden window fails). Frames still go through UploadFrame into
+// g_presentBuffer, which screenshots are written from; host frames are paced at 60 Hz by sleeping.
+static bool noWindow()
+{
+    static const bool value = std::getenv("PS2X_HEADLESS") != nullptr;
+    return value;
+}
+static std::vector<uint8_t> g_presentBuffer(DEFAULT_FB_SIZE, 0u); // FB_WIDTH x FB_HEIGHT RGBA
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -505,7 +515,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastHeight = 0u;
     static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
-    static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    std::vector<uint8_t> &s_uploadBuffer = g_presentBuffer;
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
@@ -536,7 +546,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &usedPreferredDisplaySource))
     {
         Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
+        std::memcpy(s_uploadBuffer.data(), blank.data, std::min<size_t>(s_uploadBuffer.size(), size_t(FB_WIDTH) * FB_HEIGHT * 4u));
+        if (!noWindow())
+            UpdateTexture(tex, blank.data);
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
@@ -592,7 +604,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         }
     }
 
-    UpdateTexture(tex, s_uploadBuffer.data());
+    if (!noWindow())
+        UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
     s_hasUploadedFrame = true;
@@ -870,9 +883,12 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        // PS2X_HEADLESS=1 keeps the window hidden (automated test runs; screenshots still work).
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE | (std::getenv("PS2X_HEADLESS") ? FLAG_WINDOW_HIDDEN : 0u));
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        // PS2X_HEADLESS=1: no window at all (see noWindow()).
+        if (!noWindow())
+        {
+            SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+            InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        }
         g_ps2xWindowTitle = title ? title : "";
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
@@ -895,7 +911,7 @@ bool PS2Runtime::initialize(const char *title)
 #endif
         SetTargetFPS(60);
         SetExitKey(KEY_NULL); // raylib quits on Esc by default; games use Esc-mapped input, so only the window close quits
-        if (m_debugUiInitCallback)
+        if (m_debugUiInitCallback && !noWindow())
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
             m_debugUiInitialized = true;
@@ -2586,8 +2602,14 @@ void PS2Runtime::run()
 
     // A blank image to use as a framebuffer
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
+    Texture2D frameTex{};
+    if (!noWindow())
+        frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    using HostClock = std::chrono::steady_clock;
+    const auto hostStart = HostClock::now();
+    auto nextHostFrame = hostStart;
+    const auto hostSeconds = [&] { return std::chrono::duration<double>(HostClock::now() - hostStart).count(); };
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2675,29 +2697,42 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
-        BeginDrawing();
-        ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        // PS2X_HIDE_DEBUG_UI=1 keeps the debug panel off the presented frame (clean screenshots).
-        static const bool hideDebugUi = std::getenv("PS2X_HIDE_DEBUG_UI") != nullptr;
-        if (m_debugUiInitialized && m_debugUiDrawCallback && !hideDebugUi)
+        if (noWindow())
         {
-            m_debugUiDrawCallback(*this, m_debugUiUserData);
+            // Pace like SetTargetFPS(60) would.
+            nextHostFrame += std::chrono::microseconds(16667);
+            const auto now = HostClock::now();
+            if (nextHostFrame > now)
+                std::this_thread::sleep_until(nextHostFrame);
+            else if (now - nextHostFrame > std::chrono::milliseconds(100))
+                nextHostFrame = now; // fell behind: do not try to catch up
         }
-        EndDrawing();
+        else
+        {
+            BeginDrawing();
+            ClearBackground(BLACK);
+            const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
+            const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+            const float screenWidth = static_cast<float>(GetScreenWidth());
+            const float screenHeight = static_cast<float>(GetScreenHeight());
+            const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
+            const float dstWidth = srcWidth * scale;
+            const float dstHeight = srcHeight * scale;
+            const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
+            const Rectangle dstRect{
+                (screenWidth - dstWidth) * 0.5f,
+                (screenHeight - dstHeight) * 0.5f,
+                dstWidth,
+                dstHeight};
+            DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+            // PS2X_HIDE_DEBUG_UI=1 keeps the debug panel off the presented frame (clean screenshots).
+            static const bool hideDebugUi = std::getenv("PS2X_HIDE_DEBUG_UI") != nullptr;
+            if (m_debugUiInitialized && m_debugUiDrawCallback && !hideDebugUi)
+            {
+                m_debugUiDrawCallback(*this, m_debugUiUserData);
+            }
+            EndDrawing();
+        }
         ps2_stubs::latchHostPadInput(this);
 
         // PS2X_SCREENSHOT_EVERY=N saves the presented frame every N host frames
@@ -2712,7 +2747,24 @@ void PS2Runtime::run()
         g_ps2xHostFrame.store(presentedFrames, std::memory_order_relaxed);
         if (screenshotEvery != 0u && (presentedFrames % screenshotEvery) == 0u)
         {
-            TakeScreenshot(TextFormat("ps2x_frame_%05u.png", presentedFrames));
+            if (noWindow())
+            {
+                // The presented frame itself, at its own size.
+                const int w = static_cast<int>(std::min<uint32_t>(std::max<uint32_t>(presentWidth, 1u), FB_WIDTH));
+                const int h = static_cast<int>(std::min<uint32_t>(std::max<uint32_t>(presentHeight, 1u), FB_HEIGHT));
+                Image image = GenImageColor(w, h, BLACK);
+                for (int y = 0; y < h; ++y)
+                {
+                    uint8_t *row = static_cast<uint8_t *>(image.data) + static_cast<size_t>(y) * w * 4u;
+                    std::memcpy(row, g_presentBuffer.data() + static_cast<size_t>(y) * FB_WIDTH * 4u, static_cast<size_t>(w) * 4u);
+                    for (int x = 0; x < w; ++x)
+                        row[x * 4 + 3] = 255u; // as drawn into the window: opaque
+                }
+                ExportImage(image, TextFormat("ps2x_frame_%05u.png", presentedFrames));
+                UnloadImage(image);
+            }
+            else
+                TakeScreenshot(TextFormat("ps2x_frame_%05u.png", presentedFrames));
 
             // PS2X_DUMP_FB="fbp:fbw:psm:w:h[,...]" (decimal fbp/fbw, hex psm) also dumps raw
             // GS framebuffer regions as ps2x_fb_<frame>_<fbp>_<psm>.png alongside each screenshot.
@@ -2763,18 +2815,22 @@ void PS2Runtime::run()
         // polls (once per game-loop iteration; covers games like TC NYC that draw into one fixed
         // display buffer and never flip). Host FPS is the present loop.
         {
-            static double lastTime = GetTime();
+            static double lastTime = hostSeconds();
+            static uint32_t lastHostFrames = 0u;
             static uint32_t lastFlips[2] = {0u, 0u};
             static uint32_t lastPadReads = 0u;
-            const double now = GetTime();
+            const double now = hostSeconds();
             if (now - lastTime >= 0.5)
             {
+                const int hostFps = noWindow() ? static_cast<int>((presentedFrames - lastHostFrames) / (now - lastTime) + 0.5) : GetFPS();
+                lastHostFrames = presentedFrames;
                 const uint32_t flips0 = g_ps2xGsFlips[0].load(std::memory_order_relaxed);
                 const uint32_t flips1 = g_ps2xGsFlips[1].load(std::memory_order_relaxed);
                 const uint32_t padReads = g_ps2xPadReadsPort0.load(std::memory_order_relaxed);
                 const uint32_t frames = std::max({flips0 - lastFlips[0], flips1 - lastFlips[1], padReads - lastPadReads});
                 const double gameFps = frames / (now - lastTime);
-                SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(), gameFps, GetFPS()));
+                if (!noWindow())
+                    SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(), gameFps, hostFps));
                 // Same readout on stdout every 5 s, for unattended runs.
                 // pad/s (port-0 pad polls: one per TC game-loop iteration), finish/s (GS FINISH writes), VU1 runs/s and VU1 Mcycles/s over the 5 s.
                 static int titleUpdates = 0;
@@ -2789,7 +2845,7 @@ void PS2Runtime::run()
                     const uint64_t vu1Cycles = g_ps2xVu1Cycles.load(std::memory_order_relaxed);
                     const double span = std::max(now - windowStart, 1e-3);
                     std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f\n",
-                                now, presentedFrames, gameFps, GetFPS(), (pads - windowPads) / span, (finishes - windowFinishes) / span,
+                                now, presentedFrames, gameFps, hostFps, (pads - windowPads) / span, (finishes - windowFinishes) / span,
                                 (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6);
                     std::fflush(stdout); // unattended runs end with a signal; keep the readout
                     windowStart = now;
@@ -2805,7 +2861,7 @@ void PS2Runtime::run()
             }
         }
 
-        if (WindowShouldClose())
+        if (!noWindow() && WindowShouldClose())
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
@@ -2824,9 +2880,11 @@ void PS2Runtime::run()
         m_debugUiShutdownCallback(*this, m_debugUiUserData);
         m_debugUiInitialized = false;
     }
-    UnloadTexture(frameTex);
+    if (!noWindow())
+        UnloadTexture(frameTex);
     m_gs.shutdownBackend();
-    CloseWindow();
+    if (IsWindowReady())
+        CloseWindow();
 
     RUNTIME_LOG("[run] exiting loop");
 }
