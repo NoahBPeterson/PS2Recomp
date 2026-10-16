@@ -240,6 +240,7 @@ namespace ps2_stubs
                 return true;
             }
 
+            ps2TraceGuestRangeWrite(rdram, offset, static_cast<uint32_t>(bytes), "sceCdRead", nullptr);
             return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
         };
 
@@ -297,6 +298,7 @@ namespace ps2_stubs
                 const size_t bytes = clampReadBytes(a1, offset);
                 if (bytes > 0)
                 {
+                    ps2TraceGuestRangeWrite(rdram, offset, static_cast<uint32_t>(bytes), "sceCdRead:unresolved-zero", ctx);
                     std::memset(rdram + offset, 0, bytes);
                 }
 
@@ -495,6 +497,7 @@ namespace ps2_stubs
                 bytes = maxBytes;
             }
 
+            ps2TraceGuestRangeWrite(rdram, offset, static_cast<uint32_t>(bytes), "sceCdReadChain", ctx);
             if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
             {
                 ok = false;
@@ -808,6 +811,7 @@ namespace ps2_stubs
 
                 const uint32_t readLbn = g_cdStreamingLbn;
                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+                ps2TraceGuestRangeWrite(rdram, offset, static_cast<uint32_t>(readBytes), "sceCdStRead", ctx);
                 if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
                 {
                     finishCdStRead(rdram, ctx, state, g_lastCdError);

@@ -97,6 +97,35 @@ namespace
     constexpr uint32_t kSchedulerSifDmaDescAddr = 0x00020300u;
     constexpr uint32_t kSchedulerSifDmaHandlerArg = 0x12345678u;
 
+
+    constexpr uint32_t kSifCmdEntryPc = 0x00101100u;
+    constexpr uint32_t kSifCmdHandlerPc = 0x00101120u;
+    constexpr uint32_t kSifCmdId = 0x80000012u;
+    constexpr uint32_t kSifCmdHandlerArg = 0x0BADF00Du;
+    uint32_t g_sifCmdPacketAddr = 0u;
+    uint32_t g_sifCmdHandlerArg = 0u;
+    std::array<uint8_t, 0x30> g_sifCmdPacketSeen{};
+    std::array<uint8_t, 0x30> g_sifCmdPacketSent{};
+
+    void sifCmdHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        g_sifCmdPacketAddr = ::getRegU32(ctx, 4);
+        g_sifCmdHandlerArg = ::getRegU32(ctx, 5);
+        std::memcpy(g_sifCmdPacketSeen.data(), rdram + (g_sifCmdPacketAddr & PS2_RAM_MASK), g_sifCmdPacketSeen.size());
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    void sifCmdEntry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setRegU32(*ctx, 4, kSifCmdId);
+        setRegU32(*ctx, 5, kSifCmdHandlerPc);
+        setRegU32(*ctx, 6, kSifCmdHandlerArg);
+        ps2_stubs::sceSifAddCmdHandler(rdram, ctx, runtime);
+        ps2_stubs::dispatchSifCommand(rdram, runtime, kSifCmdId, g_sifCmdPacketSent.data(), g_sifCmdPacketSent.size());
+        ctx->pc = 0u;
+    }
+
     void testDmacHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)runtime;
@@ -323,6 +352,61 @@ void register_ps2_sif_dma_tests()
             t.Equals(g_dmacHandlerLastCause, 5u, "DMAC handler should observe cause 5");
             t.Equals(g_dmacHandlerLastArg, kSchedulerSifDmaHandlerArg,
                      "DMAC handler should receive registered argument");
+        });
+
+        tc.Run("SIF command packets land in EE kernel RAM, never in the game's heap", [](TestCase &t)
+        {
+            // TC's allocator owns everything from its ELF's end; a packet the runtime placed there
+            // overwrote its heap (T-0120). Model a game heap from 0x100000 with a canary.
+            TestEnv env;
+            ps2_stubs::resetSifState();
+            env.runtime.configureGuestHeap(0x00100000u, 0x01FF8000u);
+            std::memset(env.rdram.data() + 0x00100000u, 0xA5, 0x1000u);
+            for (size_t i = 0; i < g_sifCmdPacketSent.size(); ++i)
+            {
+                g_sifCmdPacketSent[i] = static_cast<uint8_t>(0x10u + i);
+            }
+            g_sifCmdPacketSent[0] = 0x30u; // header: packet size
+            g_sifCmdPacketAddr = 0u;
+            g_sifCmdPacketSeen.fill(0u);
+            env.runtime.registerFunction(kSifCmdEntryPc, sifCmdEntry);
+            env.runtime.registerFunction(kSifCmdHandlerPc, sifCmdHandler);
+
+            R5900Context mainContext{};
+            mainContext.pc = kSifCmdEntryPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_sifCmdPacketAddr != 0u, "the registered SIF command handler should run");
+            t.IsTrue((g_sifCmdPacketAddr & PS2_RAM_MASK) < 0x00100000u,
+                     "the packet should sit in EE kernel RAM, below the game's memory");
+            t.Equals(g_sifCmdHandlerArg, kSifCmdHandlerArg, "the handler should get its registered argument");
+            t.IsTrue(g_sifCmdPacketSeen == g_sifCmdPacketSent, "the handler should see the packet bytes");
+            bool canaryIntact = true;
+            for (uint32_t i = 0; i < 0x1000u; ++i)
+            {
+                canaryIntact = canaryIntact && env.rdram[0x00100000u + i] == 0xA5u;
+            }
+            t.IsTrue(canaryIntact, "game heap memory must be untouched");
+        });
+
+        tc.Run("kernelMalloc stays in its kernel RAM window and apart from guestMalloc", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.configureGuestHeap(0x00100000u, 0x01FF8000u);
+            const uint32_t game = env.runtime.guestMalloc(0x100u, 16u);
+            const uint32_t a = env.runtime.kernelMalloc(0x30u, 16u);
+            const uint32_t b = env.runtime.kernelMalloc(0x70u, 64u);
+            t.Equals(game, 0x00100000u, "guestMalloc should serve the game heap");
+            t.Equals(a, 0x00052000u, "the first kernel block starts the kernel heap");
+            t.IsTrue(b >= 0x00052030u && b < 0x00070000u && (b & 0x3Fu) == 0u,
+                     "a second block follows the first, aligned, inside the window");
+            env.runtime.kernelFree(a);
+            t.Equals(env.runtime.kernelMalloc(0x20u, 16u), a, "kernelFree makes the block reusable");
+            t.Equals(env.runtime.kernelMalloc(0x20000u, 16u), 0u, "requests larger than the window fail");
+            env.runtime.kernelFree(game);
+            t.Equals(env.runtime.guestMalloc(0x100u, 16u), 0x00100000u,
+                     "kernelFree of an address outside its window falls through to guestFree");
         });
 
         tc.Run("resetSifState seeds boot-ready SIF registers", [](TestCase &t)

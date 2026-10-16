@@ -1068,6 +1068,7 @@ namespace ps2_stubs
             }
             else
             {
+                ps2TraceGuestRangeWrite(rdram, dstAddr, static_cast<uint32_t>(size), "sceMcRead", ctx);
                 const size_t bytesRead = std::fread(dst, 1u, static_cast<size_t>(size), it->second.file);
                 result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesRead);
                 if (std::ferror(it->second.file))

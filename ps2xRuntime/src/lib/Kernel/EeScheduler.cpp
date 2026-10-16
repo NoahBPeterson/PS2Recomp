@@ -1361,6 +1361,7 @@ void EeScheduler::setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress)
         if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
         {
             const uint64_t zero = 0u;
+            ps2TraceGuestRangeWrite(m_rdram, physical, sizeof(zero), "vsyncTick:clear", nullptr);
             std::memcpy(m_rdram + physical, &zero, sizeof(zero));
         }
     }
@@ -1936,6 +1937,8 @@ void EeScheduler::processEvent(const EeEvent &event)
         // store (e.g. from a stub) while the guest spins on loads only.
         m_runtime.drainCompletedDmacHandlers(m_rdram);
         ++m_vsyncTick;
+        ps2HostWriteTraceSetVsync(m_vsyncTick);
+        ps2DebugRamDumpAtVsync(m_rdram, m_vsyncTick);
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {
@@ -1951,6 +1954,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             const uint32_t physical = m_vsyncTickAddress & 0x1FFFFFFFu;
             if (m_rdram && physical <= PS2_RAM_SIZE - sizeof(uint64_t))
             {
+                ps2TraceGuestRangeWrite(m_rdram, physical, sizeof(m_vsyncTick), "vsyncTick", nullptr);
                 std::memcpy(m_rdram + physical, &m_vsyncTick, sizeof(m_vsyncTick));
             }
         }
@@ -2059,6 +2063,7 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
     {
         return;
     }
+    ps2TraceGuestRangeWrite(m_rdram, physical, sizeof(value), "EeScheduler::writeGuestU32", nullptr);
     std::memcpy(m_rdram + physical, &value, sizeof(value));
 }
 

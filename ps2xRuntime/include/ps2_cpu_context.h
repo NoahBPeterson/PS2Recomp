@@ -2,6 +2,7 @@
 // The R5900 register context, exception codes and register helpers. Generated code includes this
 // (via ps2_recomp_abi.h); keep it free of the runtime's subsystem headers.
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -235,6 +236,13 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     // TODO we dont need this anymore so on next release it will be deleted
 }
 
+// Host-side writes into EE RAM (SIF/IOP transfers, file reads, libc stubs, ...). Logged only when
+// PS2X_HOST_WRITE_LOG is set; see ps2_host_write_trace.cpp.
+extern std::atomic<bool> g_ps2HostWriteTraceOn;
+void ps2HostWriteTrace(uint32_t guestAddr, uint32_t size, const char *op, const R5900Context *ctx);
+void ps2HostWriteTraceSetVsync(uint64_t vsync);
+void ps2DebugRamDumpAtVsync(const uint8_t *rdram, uint64_t vsync);
+
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     uint32_t guestAddr,
                                     uint32_t size,
@@ -242,9 +250,8 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
                                     const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2HostWriteTraceOn.load(std::memory_order_relaxed))
+    {
+        ps2HostWriteTrace(guestAddr, size, op, ctx);
+    }
 }

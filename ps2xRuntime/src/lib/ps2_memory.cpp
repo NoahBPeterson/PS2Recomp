@@ -2,6 +2,7 @@
 #include <cstdio>
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_address.h"
+#include "ps2_cpu_context.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
 #include <atomic>
@@ -326,6 +327,21 @@ PS2Memory::~PS2Memory()
     }
 }
 
+// Debugger hook: called once with the host base of EE RAM, so a debugger can set a hardware
+// watchpoint on a guest address (break on it, then watch $x0/$rdi + guest offset).
+#if defined(_MSC_VER)
+extern "C" __declspec(noinline) void ps2xDebugRdramReady(uint8_t *rdram)
+{
+    static uint8_t *volatile s_rdram;
+    s_rdram = rdram;
+}
+#else
+extern "C" __attribute__((noinline)) void ps2xDebugRdramReady(uint8_t *rdram)
+{
+    asm volatile("" : : "r"(rdram) : "memory");
+}
+#endif
+
 bool PS2Memory::initialize(size_t ramSize)
 {
     auto cleanup = [this]()
@@ -379,6 +395,7 @@ bool PS2Memory::initialize(size_t ramSize)
         // Allocate main RAM
         m_rdram = new uint8_t[ramSize];
         std::memset(m_rdram, 0, ramSize);
+        ps2xDebugRdramReady(m_rdram);
 
         // Allocate scratchpad
         m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
@@ -1540,6 +1557,7 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         const uint32_t chunk = std::min(bytesLeft, scratchChunk);
         if (fromScratchpad)
         {
+            ps2TraceGuestRangeWrite(m_rdram, mainOffset + copied, chunk, "SPR-from DMA", nullptr);
             std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
             markModified(mainOffset + copied, chunk);
         }

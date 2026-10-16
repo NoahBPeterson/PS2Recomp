@@ -689,7 +689,7 @@ namespace ps2_stubs
                           (static_cast<uint64_t>(0u) << 48);
         uint64_t trxreg = static_cast<uint64_t>(img.height) << 32 | static_cast<uint64_t>(img.width);
 
-        uint32_t pktAddr = runtime->guestMalloc(80u, 16u);
+        uint32_t pktAddr = runtime->kernelMalloc(80u, 16u);
         if (pktAddr == 0)
         {
             setReturnS32(ctx, -1);
@@ -699,7 +699,7 @@ namespace ps2_stubs
         uint8_t *pkt = getMemPtr(rdram, pktAddr);
         if (!pkt)
         {
-            runtime->guestFree(pktAddr);
+            runtime->kernelFree(pktAddr);
             setReturnS32(ctx, -1);
             return;
         }
@@ -726,7 +726,7 @@ namespace ps2_stubs
 
         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
-        runtime->guestFree(pktAddr);
+        runtime->kernelFree(pktAddr);
 
         setReturnS32(ctx, 0);
     }
@@ -796,7 +796,7 @@ namespace ps2_stubs
                 runtime->memory().gs().pmode = pmode;
                 ps2_syscalls::configureGsCrt(runtime->memory().gs(), interlace & 1u, omode & 0xFFu, ffmode & 1u);
 
-                uint32_t pktAddr = runtime->guestMalloc(96u, 16u);
+                uint32_t pktAddr = runtime->kernelMalloc(96u, 16u);
                 if (pktAddr != 0u)
                 {
                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
@@ -822,11 +822,11 @@ namespace ps2_stubs
                         mem.writeIORegister(GIF_CHANNEL + 0x20u, 6u);
                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
                         mem.processPendingTransfers();
-                        runtime->guestFree(pktAddr);
+                        runtime->kernelFree(pktAddr);
                     }
                     else
                     {
-                        runtime->guestFree(pktAddr);
+                        runtime->kernelFree(pktAddr);
                     }
                 }
             }

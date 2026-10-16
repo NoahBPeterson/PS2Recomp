@@ -131,7 +131,10 @@ namespace ps2_stubs
             uint8_t *dst = getMemPtr(rdram, glyphAlloc);
             const uint8_t *src = getConstMemPtr(rdram, glyphSrc);
             if (dst && src)
+            {
+                ps2TraceGuestRangeWrite(rdram, glyphAlloc, 0x2010u, "sceFont:glyphs", ctx);
                 std::memcpy(dst, src, 0x2010u);
+            }
         }
 
         uint32_t isDoubleByte = 0;
@@ -148,7 +151,10 @@ namespace ps2_stubs
                 uint8_t *dst = getMemPtr(rdram, kernAlloc);
                 const uint8_t *src = getConstMemPtr(rdram, kernSrc);
                 if (dst && src)
+                {
+                    ps2TraceGuestRangeWrite(rdram, kernAlloc, 0xc400u, "sceFont:kerning", ctx);
                     std::memcpy(dst, src, 0xc400u);
+                }
             }
         }
 

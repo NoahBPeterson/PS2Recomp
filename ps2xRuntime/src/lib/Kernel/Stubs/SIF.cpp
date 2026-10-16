@@ -247,7 +247,7 @@ namespace ps2_stubs
         if (!runtime->hasFunction(registered.function))
             return false;
 
-        const uint32_t packetAddress = runtime->guestMalloc(static_cast<uint32_t>(packetSize), 16u);
+        const uint32_t packetAddress = runtime->kernelMalloc(static_cast<uint32_t>(packetSize), 16u);
         if (packetAddress == 0u)
             return false;
 
@@ -255,7 +255,7 @@ namespace ps2_stubs
         uint8_t *const last = getMemPtr(rdram, packetAddress + static_cast<uint32_t>(packetSize - 1u));
         if (!first || !last || last < first || static_cast<size_t>(last - first) != packetSize - 1u)
         {
-            runtime->guestFree(packetAddress);
+            runtime->kernelFree(packetAddress);
             return false;
         }
 
@@ -277,14 +277,14 @@ namespace ps2_stubs
             SET_GPR_U32(&invocation.context, 31, 0u);
             invocation.onComplete = [runtime, packetAddress](const R5900Context &, R5900Context &)
             {
-                runtime->guestFree(packetAddress);
+                runtime->kernelFree(packetAddress);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
             return true;
         }
         catch (...)
         {
-            runtime->guestFree(packetAddress);
+            runtime->kernelFree(packetAddress);
             return false;
         }
     }
@@ -442,6 +442,7 @@ namespace ps2_stubs
         // SifRpcReceiveData_t keeps src/dest/size at offsets 0x10/0x14/0x18.
         if (uint8_t *rd = getMemPtr(rdram, rdAddr))
         {
+            ps2TraceGuestRangeWrite(rdram, rdAddr + 0x10u, 12u, "sceSifGetOtherData:rd", ctx);
             std::memcpy(rd + 0x10u, &srcAddr, sizeof(srcAddr));
             std::memcpy(rd + 0x14u, &dstAddr, sizeof(dstAddr));
             std::memcpy(rd + 0x18u, &size, sizeof(size));

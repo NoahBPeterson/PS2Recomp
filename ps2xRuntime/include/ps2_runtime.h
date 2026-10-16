@@ -152,6 +152,10 @@ public:
     uint32_t guestCalloc(uint32_t count, uint32_t size, uint32_t alignment = 16u);
     uint32_t guestRealloc(uint32_t guestAddr, uint32_t newSize, uint32_t alignment = 16u);
     void guestFree(uint32_t guestAddr);
+    // Guest memory owned by the runtime itself (never by the game): EE kernel RAM below the ELF.
+    // Falls back to guestMalloc when the ELF loads too low to leave that region free.
+    uint32_t kernelMalloc(uint32_t size, uint32_t alignment = 16u);
+    void kernelFree(uint32_t guestAddr);
     uint32_t guestHeapBase() const;
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
@@ -243,10 +247,11 @@ private:
     uint32_t clampGuestHeapLimit(uint32_t guestLimit) const;
     void resetGuestHeapLocked(uint32_t guestBase, uint32_t guestLimit);
     void ensureGuestHeapInitializedLocked();
-    int32_t findGuestHeapBlockIndexLocked(uint32_t guestAddr) const;
-    uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
-    void freeGuestBlockLocked(uint32_t guestAddr);
-    void coalesceGuestHeapLocked();
+    static int32_t findGuestHeapBlockIndexLocked(const std::vector<GuestHeapBlock> &blocks, uint32_t guestAddr);
+    static uint32_t allocateGuestBlockLocked(std::vector<GuestHeapBlock> &blocks, uint32_t size, uint32_t alignment,
+                                             uint32_t *highWater);
+    static void freeGuestBlockLocked(std::vector<GuestHeapBlock> &blocks, uint32_t guestAddr);
+    static void coalesceGuestHeapLocked(std::vector<GuestHeapBlock> &blocks);
     void HandleIntegerOverflow(R5900Context *ctx);
 
     [[nodiscard]] ps2x::iop::RpcAbi selectIopRpcAbi(const ps2x::iop::RpcAbiRequest &request) const;
@@ -285,6 +290,10 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
+    std::mutex m_kernelHeapMutex;
+    std::vector<GuestHeapBlock> m_kernelHeapBlocks;
+    uint32_t m_kernelHeapAllocations = 0;
+    bool m_kernelHeapUsable = true;
     // Interrupt/callback invocation stacks are carved downward from [floor, top). The primary
     // region is the free RAM below the ELF; the fallback is the top of RAM, used once the
     // primary region is exhausted (or when the ELF loads too low to leave one).

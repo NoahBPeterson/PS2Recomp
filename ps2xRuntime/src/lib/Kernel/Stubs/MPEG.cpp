@@ -1590,14 +1590,14 @@ namespace ps2_stubs
                 return;
             }
 
-            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+            const uint32_t cbDataAddr = runtime->kernelMalloc(kMpegCallbackDataSize, 16u);
             if (cbDataAddr == 0u)
             {
                 return;
             }
             if (!writeMpegCallbackData(rdram, cbDataAddr, event))
             {
-                runtime->guestFree(cbDataAddr);
+                runtime->kernelFree(cbDataAddr);
                 return;
             }
 
@@ -1615,7 +1615,7 @@ namespace ps2_stubs
             invocation.context = callbackCtx;
             invocation.onComplete = [runtime, cbDataAddr](const R5900Context &, R5900Context &)
             {
-                runtime->guestFree(cbDataAddr);
+                runtime->kernelFree(cbDataAddr);
             };
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
