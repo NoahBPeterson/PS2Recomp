@@ -9,6 +9,7 @@
 #include "runtime/gs/gs_parallel_backend.h"
 #endif
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_vu1_trace.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
@@ -38,6 +39,107 @@ namespace ps2_stubs
 }
 extern std::atomic<uint32_t> g_ps2xGsFlips[2];
 extern std::atomic<uint32_t> g_ps2xPadReadsPort0;
+extern std::atomic<uint32_t> g_ps2xGsFinishes;
+// VU1 microprogram runs (MSCAL/MSCNT) and the VU1 cycles they took; [fps] readout.
+static std::atomic<uint32_t> g_ps2xVu1Runs{0u};
+static std::atomic<uint64_t> g_ps2xVu1Cycles{0u};
+
+namespace
+{
+    // PS2X_VU1_TRACE=<file> records PS2X_VU1_TRACE_RUNS (default 2000) consecutive VU1 runs starting
+    // at host frame PS2X_VU1_TRACE_START (default 0) for ps2x_vu1_replay (runtime/ps2_vu1_trace.h).
+    struct Vu1TraceWriter
+    {
+        FILE *file = nullptr;
+        uint32_t startFrame = 0u;
+        uint32_t remaining = 0u;
+        bool active = false;
+        bool haveCode = false;
+        uint64_t lastCodeHash = 0u;
+        ps2_vu1_trace::Vu1TraceRecordHeader header{};
+        std::vector<uint8_t> code, dataBefore;
+        VU1State before{};
+        uint64_t gifHash = 0u;
+        uint32_t gifPackets = 0u, gifBytes = 0u;
+
+        static Vu1TraceWriter &get()
+        {
+            static Vu1TraceWriter writer = []
+            {
+                Vu1TraceWriter w;
+                const char *path = std::getenv("PS2X_VU1_TRACE");
+                if (!path || !*path)
+                    return w;
+                w.file = std::fopen(path, "wb");
+                if (!w.file)
+                    return w;
+                const char *start = std::getenv("PS2X_VU1_TRACE_START");
+                const char *runs = std::getenv("PS2X_VU1_TRACE_RUNS");
+                w.startFrame = start ? static_cast<uint32_t>(std::strtoul(start, nullptr, 10)) : 0u;
+                w.remaining = runs ? static_cast<uint32_t>(std::strtoul(runs, nullptr, 10)) : 2000u;
+                std::fwrite(ps2_vu1_trace::kMagic, 1, sizeof(ps2_vu1_trace::kMagic), w.file);
+                std::fwrite(&ps2_vu1_trace::kVersion, sizeof(uint32_t), 1, w.file);
+                return w;
+            }();
+            return writer;
+        }
+
+        void begin(ps2_vu1_trace::RunKind kind, uint32_t startPc, uint32_t top, uint32_t itop,
+                   const VU1State &state, const uint8_t *vuCode, const uint8_t *vuData)
+        {
+            if (!file || remaining == 0u || g_ps2xHostFrame.load(std::memory_order_relaxed) < startFrame)
+                return;
+            header = {};
+            header.kind = static_cast<uint32_t>(kind);
+            header.startPc = startPc;
+            header.top = top;
+            header.itop = itop;
+            header.dBitEnabled = state.dBitEnabled;
+            header.tBitEnabled = state.tBitEnabled;
+            const uint64_t codeHash = ps2_vu1_trace::fnv1a(vuCode, ps2_vu1_trace::kMemSize);
+            header.codeIncluded = (!haveCode || codeHash != lastCodeHash) ? 1u : 0u;
+            haveCode = true;
+            lastCodeHash = codeHash;
+            code.assign(vuCode, vuCode + ps2_vu1_trace::kMemSize);
+            dataBefore.assign(vuData, vuData + ps2_vu1_trace::kMemSize);
+            before = state;
+            gifHash = 0xcbf29ce484222325ull;
+            gifPackets = gifBytes = 0u;
+            active = true;
+        }
+
+        void gif(const uint8_t *data, uint32_t size)
+        {
+            gifHash = ps2_vu1_trace::fnv1a(data, size, gifHash);
+            ++gifPackets;
+            gifBytes += size;
+        }
+
+        void end(const VU1State &after, const uint8_t *vuData)
+        {
+            if (!active)
+                return;
+            active = false;
+            std::fwrite(&header, sizeof(header), 1, file);
+            if (header.codeIncluded)
+                std::fwrite(code.data(), 1, code.size(), file);
+            std::fwrite(dataBefore.data(), 1, dataBefore.size(), file);
+            std::fwrite(&before, sizeof(before), 1, file);
+            std::fwrite(&after, sizeof(after), 1, file);
+            const uint64_t dataAfterHash = ps2_vu1_trace::fnv1a(vuData, ps2_vu1_trace::kMemSize);
+            std::fwrite(&dataAfterHash, sizeof(dataAfterHash), 1, file);
+            std::fwrite(&gifHash, sizeof(gifHash), 1, file);
+            std::fwrite(&gifPackets, sizeof(gifPackets), 1, file);
+            std::fwrite(&gifBytes, sizeof(gifBytes), 1, file);
+            if (--remaining == 0u)
+            {
+                std::fclose(file);
+                file = nullptr;
+                std::fprintf(stderr, "[vu1-trace] done\n");
+            }
+        }
+    };
+}
 static std::string g_ps2xWindowTitle;
 
 namespace ps2_stubs
@@ -688,7 +790,10 @@ bool PS2Runtime::syncCoreSubsystems()
 
     m_gs.init(gsVram, static_cast<uint32_t>(PS2_GS_VRAM_SIZE), &m_memory.gs());
     m_gifArbiter.setProcessPacketFn([this](GifPathId path, const uint8_t *data, uint32_t size)
-                                    { m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
+                                    {
+                                        if (Vu1TraceWriter &trace = Vu1TraceWriter::get(); trace.active && path == GifPathId::Path1)
+                                            trace.gif(data, size);
+                                        m_gs.processGIFPacket(data, size, static_cast<uint32_t>(path)); });
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
@@ -701,9 +806,15 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint64_t cycles0 = m_vu1.state().cycles;
+                                     Vu1TraceWriter::get().begin(ps2_vu1_trace::RunKind::Execute, startPC, top, itop, m_vu1.state(),
+                                                                 m_memory.getVU1Code(), m_memory.getVU1Data());
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
+                                     Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
+                                     g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
+                                     g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -719,9 +830,15 @@ bool PS2Runtime::syncCoreSubsystems()
                                          (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
                                      m_vu1.state().tBitEnabled =
                                          (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint64_t cycles0 = m_vu1.state().cycles;
+                                     Vu1TraceWriter::get().begin(ps2_vu1_trace::RunKind::Resume, 0u, top, itop, m_vu1.state(),
+                                                                 m_memory.getVU1Code(), m_memory.getVU1Data());
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
+                                     Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
+                                     g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
+                                     g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -2659,9 +2776,28 @@ void PS2Runtime::run()
                 const double gameFps = frames / (now - lastTime);
                 SetWindowTitle(TextFormat("%s | game %.1f fps | host %d fps", g_ps2xWindowTitle.c_str(), gameFps, GetFPS()));
                 // Same readout on stdout every 5 s, for unattended runs.
+                // pad/s (port-0 pad polls: one per TC game-loop iteration), finish/s (GS FINISH writes), VU1 runs/s and VU1 Mcycles/s over the 5 s.
                 static int titleUpdates = 0;
+                static double windowStart = now;
+                static uint32_t windowFinishes = 0u, windowVu1Runs = 0u, windowPads = 0u;
+                static uint64_t windowVu1Cycles = 0u;
                 if (++titleUpdates % 10 == 0)
-                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d\n", now, presentedFrames, gameFps, GetFPS());
+                {
+                    const uint32_t finishes = g_ps2xGsFinishes.load(std::memory_order_relaxed);
+                    const uint32_t pads = g_ps2xPadReadsPort0.load(std::memory_order_relaxed);
+                    const uint32_t vu1Runs = g_ps2xVu1Runs.load(std::memory_order_relaxed);
+                    const uint64_t vu1Cycles = g_ps2xVu1Cycles.load(std::memory_order_relaxed);
+                    const double span = std::max(now - windowStart, 1e-3);
+                    std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f\n",
+                                now, presentedFrames, gameFps, GetFPS(), (pads - windowPads) / span, (finishes - windowFinishes) / span,
+                                (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6);
+                    std::fflush(stdout); // unattended runs end with a signal; keep the readout
+                    windowStart = now;
+                    windowFinishes = finishes;
+                    windowPads = pads;
+                    windowVu1Runs = vu1Runs;
+                    windowVu1Cycles = vu1Cycles;
+                }
                 lastFlips[0] = flips0;
                 lastFlips[1] = flips1;
                 lastPadReads = padReads;

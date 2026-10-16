@@ -59,6 +59,13 @@ public:
                 GS &gs, PS2Memory *memory = nullptr,
                 uint32_t top = 0, uint32_t itop = 0, uint32_t maxCycles = 65536);
 
+    // Replays (ps2x_vu1_replay): the state and cycle counter a recorded run started from.
+    void restoreState(const VU1State &state)
+    {
+        m_state = state;
+        m_cycle = state.cycles;
+    }
+
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
 

@@ -11,6 +11,9 @@
 #include <iostream>
 #include <sstream>
 
+// GS FINISH register writes (games write one per frame); read by the host loop's [fps] readout.
+std::atomic<uint32_t> g_ps2xGsFinishes{0u};
+
 namespace
 {
     static constexpr uint32_t kHostFrameWidth = 640u;
@@ -1510,6 +1513,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_FINISH:
     {
+        g_ps2xGsFinishes.fetch_add(1u, std::memory_order_relaxed);
         if (m_backend)
         {
             m_backend->Flush();

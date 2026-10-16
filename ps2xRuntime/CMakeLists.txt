@@ -544,6 +544,9 @@ endif()
 if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     add_executable(ps2x_gs_replay tools/gs_replay/gs_replay.cpp)
     target_link_libraries(ps2x_gs_replay PRIVATE ps2_runtime)
+    # VU1 run-trace replayer: bit-exact regression check + benchmark (runtime/ps2_vu1_trace.h).
+    add_executable(ps2x_vu1_replay tools/vu1_replay/vu1_replay.cpp)
+    target_link_libraries(ps2x_vu1_replay PRIVATE ps2_runtime)
 endif()
 
 set(PS2X_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list for ps2_runtime/ps2_iop (e.g. address,undefined or thread)")

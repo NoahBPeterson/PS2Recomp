@@ -160,6 +160,8 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
 
+    void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
+    void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
     uint8_t *getVU1Data() { return m_vu1Data; }
@@ -291,8 +293,6 @@ public:
 
     bool isAddressInRegion(uint32_t address, const CodeRegion &region);
     void markModified(uint32_t address, uint32_t size);
-    void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
-    void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     bool isScratchpad(uint32_t address) const;
     uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit);
     const uint8_t *mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const;
