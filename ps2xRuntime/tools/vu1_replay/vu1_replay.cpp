@@ -195,6 +195,7 @@ int main(int argc, char **argv)
     uint8_t *const data = memory.getVU1Data();
 
     uint64_t mismatches = 0u, resumes = 0u, cycles = 0u, codeLoads = 0u;
+    std::chrono::steady_clock::duration vuTime{}; // inside execute/resume only (excludes replay bookkeeping)
     const auto t0 = std::chrono::steady_clock::now();
     for (int pass = 0; pass < repeat; ++pass)
     {
@@ -216,7 +217,9 @@ int main(int argc, char **argv)
             if (r.header.kind == static_cast<uint32_t>(RunKind::Execute))
             {
                 vu1.restoreState(r.before);
+                const auto start = std::chrono::steady_clock::now();
                 vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, 65536);
+                vuTime += std::chrono::steady_clock::now() - start;
             }
             else
             {
@@ -225,7 +228,9 @@ int main(int argc, char **argv)
                 // matched, and seeds the chain when the trace starts with a resume.
                 ++resumes;
                 vu1.restoreState(r.before);
+                const auto start = std::chrono::steady_clock::now();
                 vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, 65536);
+                vuTime += std::chrono::steady_clock::now() - start;
             }
             cycles += r.after.cycles - r.before.cycles;
             const std::string diff = stateDiff(r.after, vu1.state());
@@ -246,11 +251,12 @@ int main(int argc, char **argv)
             }
         }
     }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double totalMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const double ms = std::chrono::duration<double, std::milli>(vuTime).count();
     const uint64_t runs = records.size() * static_cast<uint64_t>(repeat);
-    std::printf("%s: %llu runs (%zu per pass x %d, %llu resumes), %llu mismatches; %.1f ms, %.2f us/run, %.1f VU1 Mcycles/s\n",
+    std::printf("%s: %llu runs (%zu per pass x %d, %llu resumes), %llu mismatches; VU1 %.1f ms (replay %.0f ms), %.2f us/run, %.1f VU1 Mcycles/s\n",
                 mismatches ? "FAIL" : "PASS", (unsigned long long)runs, records.size(), repeat,
-                (unsigned long long)resumes, (unsigned long long)mismatches, ms, ms * 1000.0 / double(runs),
+                (unsigned long long)resumes, (unsigned long long)mismatches, ms, totalMs, ms * 1000.0 / double(runs),
                 double(cycles) / (ms * 1000.0));
     (void)quiet;
     (void)codeLoads;

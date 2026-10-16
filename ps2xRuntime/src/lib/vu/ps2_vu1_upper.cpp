@@ -54,46 +54,26 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x01:
     case 0x02:
     case 0x03: // ADDbc
-    {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + bc;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Add, FmacOperand::Broadcast, static_cast<uint8_t>(op & 3), false, vd, dest, vs, vt, acc, q, i);
         return;
-    }
     case 0x04:
     case 0x05:
     case 0x06:
     case 0x07: // SUBbc
-    {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - bc;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Sub, FmacOperand::Broadcast, static_cast<uint8_t>(op & 3), false, vd, dest, vs, vt, acc, q, i);
         return;
-    }
     case 0x08:
     case 0x09:
     case 0x0A:
     case 0x0B: // MADDbc
-    {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * bc;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Madd, FmacOperand::Broadcast, static_cast<uint8_t>(op & 3), false, vd, dest, vs, vt, acc, q, i);
         return;
-    }
     case 0x0C:
     case 0x0D:
     case 0x0E:
     case 0x0F: // MSUBbc
-    {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * bc;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Msub, FmacOperand::Broadcast, static_cast<uint8_t>(op & 3), false, vd, dest, vs, vt, acc, q, i);
         return;
-    }
     case 0x10:
     case 0x11:
     case 0x12:
@@ -120,17 +100,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
     case 0x19:
     case 0x1A:
     case 0x1B: // MULbc
-    {
-        float bc = broadcast(vt, op & 3);
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * bc;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Mul, FmacOperand::Broadcast, static_cast<uint8_t>(op & 3), false, vd, dest, vs, vt, acc, q, i);
         return;
-    }
     case 0x1C: // MULq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * q;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Mul, FmacOperand::Q, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x1D: // MAXi
         for (int c = 0; c < 4; c++)
@@ -138,9 +111,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyDest(vd, result, dest);
         return;
     case 0x1E: // MULi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * i;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Mul, FmacOperand::I, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x1F: // MINIi
         for (int c = 0; c < 4; c++)
@@ -148,59 +119,37 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyDest(vd, result, dest);
         return;
     case 0x20: // ADDq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + q;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Add, FmacOperand::Q, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x21: // MADDq
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * q;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Madd, FmacOperand::Q, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x22: // ADDi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + i;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Add, FmacOperand::I, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x23: // MADDi
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * i;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Madd, FmacOperand::I, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x24: // SUBq
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - q;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Sub, FmacOperand::Q, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x25: // MSUBq
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * q;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Msub, FmacOperand::Q, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x26: // SUBi
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - i;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Sub, FmacOperand::I, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x27: // MSUBi
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * i;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Msub, FmacOperand::I, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x28: // ADD
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] + vt[c];
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Add, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x29: // MADD
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] + vs[c] * vt[c];
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Madd, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x2A: // MUL
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] * vt[c];
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Mul, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x2B: // MAX
         for (int c = 0; c < 4; c++)
@@ -208,21 +157,13 @@ void VU1Interpreter::execUpper(uint32_t instr)
         applyDest(vd, result, dest);
         return;
     case 0x2C: // SUB
-        for (int c = 0; c < 4; c++)
-            result[c] = vs[c] - vt[c];
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Sub, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x2D: // MSUB
-        for (int c = 0; c < 4; c++)
-            result[c] = acc[c] - vs[c] * vt[c];
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Msub, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x2E: // OPMSUB
-        result[0] = acc[0] - vs[1] * vt[2];
-        result[1] = acc[1] - vs[2] * vt[0];
-        result[2] = acc[2] - vs[0] * vt[1];
-        result[3] = 0.0f;
-        applyFmacDest(vd, result, dest);
+        execFmac(FmacKind::Opmsub, FmacOperand::Vector, 0u, false, vd, dest, vs, vt, acc, q, i);
         return;
     case 0x2F: // MINI
         for (int c = 0; c < 4; c++)
@@ -248,46 +189,26 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x01:
         case 0x02:
         case 0x03: // ADDAbc
-        {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + bc;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Add, FmacOperand::Broadcast, static_cast<uint8_t>(specialOp & 3), true, nullptr, dest, vs, vt, acc, q, i);
             return;
-        }
         case 0x04:
         case 0x05:
         case 0x06:
         case 0x07: // SUBAbc
-        {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - bc;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Sub, FmacOperand::Broadcast, static_cast<uint8_t>(specialOp & 3), true, nullptr, dest, vs, vt, acc, q, i);
             return;
-        }
         case 0x08:
         case 0x09:
         case 0x0A:
         case 0x0B: // MADDAbc
-        {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * bc;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Madd, FmacOperand::Broadcast, static_cast<uint8_t>(specialOp & 3), true, nullptr, dest, vs, vt, acc, q, i);
             return;
-        }
         case 0x0C:
         case 0x0D:
         case 0x0E:
         case 0x0F: // MSUBAbc
-        {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * bc;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Msub, FmacOperand::Broadcast, static_cast<uint8_t>(specialOp & 3), true, nullptr, dest, vs, vt, acc, q, i);
             return;
-        }
         case 0x10: // ITOF0
             for (int c = 0; c < 4; c++)
             {
@@ -360,17 +281,10 @@ void VU1Interpreter::execUpper(uint32_t instr)
         case 0x19:
         case 0x1A:
         case 0x1B: // MULAbc
-        {
-            float bc = broadcast(vt, specialOp & 3);
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * bc;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Mul, FmacOperand::Broadcast, static_cast<uint8_t>(specialOp & 3), true, nullptr, dest, vs, vt, acc, q, i);
             return;
-        }
         case 0x1C: // MULAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * q;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Mul, FmacOperand::Q, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x1D: // ABS
             for (int c = 0; c < 4; c++)
@@ -378,9 +292,7 @@ void VU1Interpreter::execUpper(uint32_t instr)
             applyDest(vtDest, result, dest);
             return;
         case 0x1E: // MULAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * i;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Mul, FmacOperand::I, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x1F: // CLIP
         {
@@ -415,76 +327,46 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         }
         case 0x20: // ADDAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + q;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Add, FmacOperand::Q, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x21: // MADDAq
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * q;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Madd, FmacOperand::Q, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x22: // ADDAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + i;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Add, FmacOperand::I, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x23: // MADDAi
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * i;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Madd, FmacOperand::I, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x24: // SUBAq
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - q;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Sub, FmacOperand::Q, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x25: // MSUBAq
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * q;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Msub, FmacOperand::Q, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x26: // SUBAi
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - i;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Sub, FmacOperand::I, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x27: // MSUBAi
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * i;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Msub, FmacOperand::I, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x28: // ADDA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] + vt[c];
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Add, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x29: // MADDA
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] + vs[c] * vt[c];
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Madd, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x2A: // MULA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] * vt[c];
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Mul, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x2C: // SUBA
-            for (int c = 0; c < 4; c++)
-                result[c] = vs[c] - vt[c];
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Sub, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x2D: // MSUBA
-            for (int c = 0; c < 4; c++)
-                result[c] = acc[c] - vs[c] * vt[c];
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Msub, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x2E: // OPMULA
-            result[0] = vs[1] * vt[2];
-            result[1] = vs[2] * vt[0];
-            result[2] = vs[0] * vt[1];
-            result[3] = 0.0f;
-            applyFmacDestAcc(result, dest);
+            execFmac(FmacKind::Opmula, FmacOperand::Vector, 0u, true, nullptr, dest, vs, vt, acc, q, i);
             return;
         case 0x2F:
         case 0x30: // NOP
@@ -503,4 +385,92 @@ void VU1Interpreter::execUpper(uint32_t instr)
         reportReservedInstruction(true, instr);
         return;
     }
+}
+
+void VU1Interpreter::execFmac(FmacKind kind, FmacOperand operand, uint8_t bcLane, bool toAcc, float *vd, uint8_t dest,
+                              const float *vs, const float *vt, const float *acc, float q, float i)
+{
+    // vs/vt/acc/q/i arrive normalized. Expression shapes match the per-opcode code this replaced
+    // (the float result in round-to-zero; the exact long double value for the flags), so the
+    // compiler contracts them into the same fused operations.
+    static constexpr uint8_t kCrossLeft[4] = {1u, 2u, 0u, 3u};
+    static constexpr uint8_t kCrossRight[4] = {2u, 0u, 1u, 3u};
+    const bool cross = kind == FmacKind::Opmsub || kind == FmacKind::Opmula;
+    const bool productSum = kind == FmacKind::Madd || kind == FmacKind::Msub || kind == FmacKind::Opmsub;
+    float result[4]{};
+    uint8_t laneFlags[4]{};
+    uint32_t extraSticky = 0u;
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        if ((dest & (1u << (3u - component))) == 0u)
+            continue;
+        const float s = vs[cross ? kCrossLeft[component] : component];
+        float r;
+        switch (operand)
+        {
+        case FmacOperand::Broadcast:
+            r = broadcast(vt, bcLane);
+            break;
+        case FmacOperand::Q:
+            r = q;
+            break;
+        case FmacOperand::I:
+            r = i;
+            break;
+        default:
+            r = vt[cross ? kCrossRight[component] : component];
+            break;
+        }
+        const float a = acc[component];
+        const long double ls = static_cast<long double>(s);
+        const long double lr = static_cast<long double>(r);
+        const long double la = static_cast<long double>(a);
+        float value;
+        long double exact;
+        switch (kind)
+        {
+        case FmacKind::Add:
+            value = s + r;
+            exact = ls + lr;
+            break;
+        case FmacKind::Sub:
+            value = s - r;
+            exact = ls - lr;
+            break;
+        case FmacKind::Madd:
+            value = a + s * r;
+            exact = la + ls * lr;
+            break;
+        case FmacKind::Msub:
+            value = a - s * r;
+            exact = la - ls * lr;
+            break;
+        case FmacKind::Mul:
+            value = s * r;
+            exact = ls * lr;
+            break;
+        case FmacKind::Opmsub:
+            value = component == 3u ? 0.0f : a - s * r;
+            exact = component == 3u ? 0.0L : la - ls * lr;
+            break;
+        default: // Opmula
+            value = component == 3u ? 0.0f : s * r;
+            exact = component == 3u ? 0.0L : ls * lr;
+            break;
+        }
+        laneFlags[component] = normalizeFmacExactResult(value, exact);
+        result[component] = value;
+        if (productSum)
+        {
+            // Product-sum instructions report Z/S/U/O from the add/subtract result as current
+            // flags, while every product condition accumulates into the matching sticky flag.
+            float product = 0.0f;
+            extraSticky |= normalizeFmacExactResult(product, ls * lr) & 0xFu;
+        }
+    }
+    updateFmacFlags(laneFlags, dest, extraSticky);
+    if (toAcc)
+        applyDestAcc(result, dest);
+    else
+        applyDest(vd, result, dest);
 }
