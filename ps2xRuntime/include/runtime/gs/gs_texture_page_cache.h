@@ -30,6 +30,12 @@ namespace GSMem
             return m_bytes.data() + (byteAddress & (kPageSize - 1u));
         }
 
+        // Byte address of the page currently held, or UINT32_MAX when empty.
+        uint32_t PageBase() const noexcept
+        {
+            return m_pageBase;
+        }
+
     private:
         alignas(64) std::array<uint8_t, kPageSize> m_bytes{};
         uint32_t m_pageBase = UINT32_MAX;

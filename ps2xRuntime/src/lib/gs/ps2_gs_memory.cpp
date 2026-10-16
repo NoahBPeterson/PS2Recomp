@@ -192,14 +192,15 @@ namespace GSMem
     }};
 
     // this is going to be massive (an entire page of addess lookups)
-    static C32PageLookupTable  PageTableC32{ };
-    static Z32PageLookupTableT PageTableZ32{ };
-    static C16PageLookupTable  PageTableC16{ };
-    static C16SPageLookupTable PageTableC16S{ };
-    static Z16PageLookupTable  PageTableZ16{ };
-    static Z16SPageLookupTable PageTableZ16S{ };
-    static P8PageLookupTable   PageTableP8{ };
-    static P4PageLookupTable   PageTableP4{ };
+    // (declared in the header so hot paths can inline the swizzle for a known format)
+    C32PageLookupTable  PageTableC32{ };
+    Z32PageLookupTableT PageTableZ32{ };
+    C16PageLookupTable  PageTableC16{ };
+    C16SPageLookupTable PageTableC16S{ };
+    Z16PageLookupTable  PageTableZ16{ };
+    Z16SPageLookupTable PageTableZ16S{ };
+    P8PageLookupTable   PageTableP8{ };
+    P4PageLookupTable   PageTableP4{ };
 
     void InitLookupTables()
     {

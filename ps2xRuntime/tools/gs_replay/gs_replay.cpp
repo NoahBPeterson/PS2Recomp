@@ -7,6 +7,17 @@
 // --ref compares every frame_NNNN.png with the same file in <dir>: a pixel is bad when any RGB
 // channel differs by more than T (default 0); a frame fails with more than N bad pixels
 // (default 0). Exit status: 0 ok, 1 replay error, 2 usage, 3 reference mismatch.
+//
+// Strict (bit-exact) checks of the whole GS state, not only the presented frame:
+//   --hash-out <file>   after every frame (and every --hash-every N packets) writes one line with
+//                       a 64-bit hash of all 4 MiB of VRAM, the CSR and the presented pixels
+//   --hash-ref <file>   compares those lines with a file written by --hash-out; exit 3 on the
+//                       first difference (reported with its line)
+// Hashing time is excluded from the reported replay time.
+//
+// The CPU backend honours the runtime's settings: PS2X_GS_THREADS=N raster workers (default 3
+// with PS2X_GS_ASYNC=1, else 1 = rasterize on the replay thread), PS2X_GS_ASYNC=1 asynchronous command execution. Output
+// must be bit-identical for every setting (check with --hash-ref).
 
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
@@ -286,10 +297,37 @@ namespace
         return bad;
     }
 
+    // 64-bit hash over 8-byte words (4 independent lanes, then mixed): fast enough to run on
+    // 4 MiB after every frame without dominating the replay time.
+    uint64_t hashBytes(const uint8_t *data, size_t size)
+    {
+        constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
+        uint64_t h[4] = {0x243F6A8885A308D3ull, 0x13198A2E03707344ull, 0xA4093822299F31D0ull, 0x082EFA98EC4E6C89ull};
+        size_t i = 0;
+        for (; i + 32u <= size; i += 32u)
+            for (int l = 0; l < 4; ++l)
+            {
+                uint64_t w;
+                std::memcpy(&w, data + i + l * 8, 8);
+                h[l] = (h[l] ^ w) * kMul;
+                h[l] ^= h[l] >> 29;
+            }
+        uint64_t out = size;
+        for (; i < size; ++i)
+            out = (out ^ data[i]) * kMul;
+        for (uint64_t v : h)
+        {
+            out = (out ^ v) * kMul;
+            out ^= out >> 31;
+        }
+        return out;
+    }
+
     void usage()
     {
         std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet]\n"
-                             "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n");
+                             "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n"
+                             "                      [--hash-out <file>] [--hash-ref <file>] [--hash-every <packets>]\n");
     }
 }
 
@@ -304,6 +342,8 @@ int main(int argc, char **argv)
     std::string vramAtPath;
     uint32_t vramFrame = UINT32_MAX; // --vram-frame N file: VRAM (any backend) at vsync N, before presenting it
     std::string vramFramePath;
+    std::string hashOutPath, hashRefPath;
+    uint64_t hashEvery = 0u;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -329,6 +369,12 @@ int main(int argc, char **argv)
             vramFrame = uint32_t(std::strtoul(argv[++i], nullptr, 10));
             vramFramePath = argv[++i];
         }
+        else if (arg == "--hash-out" && i + 1 < argc)
+            hashOutPath = argv[++i];
+        else if (arg == "--hash-ref" && i + 1 < argc)
+            hashRefPath = argv[++i];
+        else if (arg == "--hash-every" && i + 1 < argc)
+            hashEvery = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--quiet")
             quiet = true;
         else if (!arg.empty() && arg[0] != '-' && dumpPath.empty())
@@ -366,16 +412,25 @@ int main(int argc, char **argv)
     GSRegisters priv{};
     applyPrivRegs(priv, dump.privRegs);
     gs.init(vram.data(), kVramSize, &priv);
+    GSRasterBackend *backend = nullptr; // owned by gs; used for the state hashes
     if (backendName == "parallel")
     {
 #if defined(PS2X_GS_PARALLEL)
-        gs.setRasterBackend(CreateParallelGSBackend(priv));
+        auto parallel = CreateParallelGSBackend(priv);
+        backend = parallel.get();
+        gs.setRasterBackend(std::move(parallel));
 #else
         std::fprintf(stderr, "built without PS2X_GS_PARALLEL\n");
         return 1;
 #endif
     }
-    else if (backendName != "cpu")
+    else if (backendName == "cpu")
+    {
+        auto cpu = std::make_unique<GSCpuBackend>(GSCpuBackend::DefaultRasterThreads(), GSCpuBackend::DefaultAsyncCommands());
+        backend = cpu.get();
+        gs.setRasterBackend(std::move(cpu));
+    }
+    else
     {
         usage();
         return 2;
@@ -385,6 +440,58 @@ int main(int argc, char **argv)
     std::error_code ec;
     std::filesystem::create_directories(outDir, ec);
     const auto t1 = std::chrono::steady_clock::now();
+
+    const bool hashing = !hashOutPath.empty() || !hashRefPath.empty();
+    FILE *hashOut = hashOutPath.empty() ? nullptr : std::fopen(hashOutPath.c_str(), "w");
+    if (!hashOutPath.empty() && !hashOut)
+    {
+        std::fprintf(stderr, "cannot write %s\n", hashOutPath.c_str());
+        return 1;
+    }
+    std::vector<std::string> hashRef;
+    if (!hashRefPath.empty())
+    {
+        FILE *hf = std::fopen(hashRefPath.c_str(), "r");
+        if (!hf)
+        {
+            std::fprintf(stderr, "cannot read %s\n", hashRefPath.c_str());
+            return 1;
+        }
+        char line[512];
+        while (std::fgets(line, sizeof(line), hf))
+            hashRef.emplace_back(line);
+        std::fclose(hf);
+    }
+    size_t hashLines = 0u, hashMismatches = 0u;
+    double hashMs = 0.0;
+    // Records one state line. VRAM is read through the backend's Sync + SnapshotVram, so an
+    // asynchronous backend is hashed only after it has finished.
+    std::vector<uint8_t> snap;
+    auto recordHash = [&](const char *what, uint64_t index, const std::vector<uint8_t> *frame)
+    {
+        const auto h0 = std::chrono::steady_clock::now();
+        backend->Sync(GSSyncReason::DebugReadback);
+        backend->SnapshotVram(snap);
+        const uint64_t vramHash = hashBytes(snap.data(), snap.size());
+        const uint64_t frameHash = frame ? hashBytes(frame->data(), frame->size()) : 0u;
+        char line[256];
+        std::snprintf(line, sizeof(line), "%s %llu vram=%016llx csr=%016llx frame=%016llx\n", what,
+                      static_cast<unsigned long long>(index), static_cast<unsigned long long>(vramHash),
+                      static_cast<unsigned long long>(priv.csr.load()), static_cast<unsigned long long>(frameHash));
+        if (hashOut)
+            std::fputs(line, hashOut);
+        if (!hashRefPath.empty())
+        {
+            if (hashLines >= hashRef.size() || hashRef[hashLines] != line)
+            {
+                if (hashMismatches++ == 0u)
+                    std::printf("HASH MISMATCH at line %zu: got %s  expected %s", hashLines + 1u, line,
+                                hashLines < hashRef.size() ? hashRef[hashLines].c_str() : "(end of file)\n");
+            }
+        }
+        ++hashLines;
+        hashMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - h0).count();
+    };
 
     Reader r{dump.bytes.data(), dump.bytes.size(), dump.packetOffset};
     uint32_t frames = 0u, transfers = 0u, fifoReads = 0u, mismatches = 0u;
@@ -404,6 +511,8 @@ int main(int argc, char **argv)
             std::printf("wrote VRAM before packet %llu to %s\n", static_cast<unsigned long long>(vramAtPacket), vramAtPath.c_str());
             return 0;
         }
+        if (hashing && hashEvery && packetIndex % hashEvery == 0u)
+            recordHash("packet", packetIndex, nullptr);
         const uint8_t type = r.get<uint8_t>();
         if (type == 0u)
         {
@@ -438,6 +547,7 @@ int main(int argc, char **argv)
                 gs.unlockDisplaySnapshot();
                 std::printf("wrote VRAM at vsync %u to %s\n", vramFrame, vramFramePath.c_str());
             }
+            backend->Sync(GSSyncReason::DebugReadback); // an asynchronous backend presents this vsync's VRAM
             gs.latchHostPresentationFrame();
             uint32_t width = 0u, height = 0u;
             const std::string name = "frame_" + std::to_string(10000 + frames).substr(1) + ".png";
@@ -448,6 +558,8 @@ int main(int argc, char **argv)
                     std::fprintf(stderr, "failed to write %s\n", png.c_str());
                 else if (!quiet)
                     std::printf("%s %ux%u\n", png.c_str(), width, height);
+                if (hashing)
+                    recordHash("frame", frames, &pixels);
                 if (!refDir.empty())
                 {
                     const int64_t bad = compareWithReference(refDir + "/" + name, pixels, width, height, tol);
@@ -462,6 +574,8 @@ int main(int argc, char **argv)
             }
             else
             {
+                if (hashing)
+                    recordHash("frame", frames, nullptr);
                 std::fprintf(stderr, "frame %u: no presentation frame\n", frames);
                 if (!refDir.empty())
                     ++mismatches;
@@ -492,14 +606,25 @@ int main(int argc, char **argv)
     }
     const auto t2 = std::chrono::steady_clock::now();
     const double loadMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    const double replayMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    const double replayMs = std::chrono::duration<double, std::milli>(t2 - t1).count() - hashMs;
     std::printf("replayed %u frame(s), %u transfers (%.1f MiB GIF), %u FIFO reads, serial '%s', state v%u: "
                 "load %.0f ms, replay %.0f ms (%.1f ms/frame) [%s]\n",
                 frames, transfers, double(gifBytes) / (1024.0 * 1024.0), fifoReads, dump.serial.c_str(), dump.stateVersion,
                 loadMs, replayMs, frames ? replayMs / frames : 0.0, backendName.c_str());
     gs.shutdownBackend();
+    if (hashOut)
+        std::fclose(hashOut);
     if (!frames)
         return 1;
+    if (!hashRefPath.empty())
+    {
+        if (hashLines != hashRef.size())
+            ++hashMismatches;
+        std::printf("%s: %zu/%zu state hash(es) match %s\n", hashMismatches ? "HASH FAIL" : "HASH PASS",
+                    hashLines - std::min(hashLines, hashMismatches), hashRef.size(), hashRefPath.c_str());
+        if (hashMismatches)
+            return 3;
+    }
     if (!refDir.empty())
     {
         std::printf("%s: %u/%u frame(s) match %s\n", mismatches ? "FAIL" : "PASS", frames - mismatches, frames, refDir.c_str());

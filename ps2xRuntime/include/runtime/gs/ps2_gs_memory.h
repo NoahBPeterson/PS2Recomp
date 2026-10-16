@@ -540,6 +540,63 @@ namespace GSMem
 
 	void InitLookupTables();
 
+	// Page lookup tables (filled by InitLookupTables). Exposed so hot paths can inline the
+	// swizzle for a format known at compile time: ReadFast/WriteFast below are bit-identical to
+	// the ReadXX/WriteXX functions further down (same traits, same table).
+	extern PixelStorageTraits<C32>::PageLookupTableT PageTableC32;
+	extern PixelStorageTraits<Z32>::PageLookupTableT PageTableZ32;
+	extern PixelStorageTraits<C16>::PageLookupTableT PageTableC16;
+	extern PixelStorageTraits<C16S>::PageLookupTableT PageTableC16S;
+	extern PixelStorageTraits<Z16>::PageLookupTableT PageTableZ16;
+	extern PixelStorageTraits<Z16S>::PageLookupTableT PageTableZ16S;
+	extern PixelStorageTraits<P8>::PageLookupTableT PageTableP8;
+	extern PixelStorageTraits<P4>::PageLookupTableT PageTableP4;
+
+	template<PixelStorageMode psm>
+	inline const typename PixelStorageTraits<psm>::PageLookupTableT& PageTableFor()
+	{
+		if constexpr (psm == C32 || psm == C24 || psm == P8H || psm == P4HL || psm == P4HH)
+			return PageTableC32;
+		else if constexpr (psm == Z32 || psm == Z24)
+			return PageTableZ32;
+		else if constexpr (psm == C16)
+			return PageTableC16;
+		else if constexpr (psm == C16S)
+			return PageTableC16S;
+		else if constexpr (psm == Z16)
+			return PageTableZ16;
+		else if constexpr (psm == Z16S)
+			return PageTableZ16S;
+		else if constexpr (psm == P8)
+			return PageTableP8;
+		else
+			return PageTableP4;
+	}
+
+	template<PixelStorageMode psm>
+	inline u32 ReadFast(const u8* data, u32 bp, u32 bw, u32 x, u32 y, TexturePageCache* cache = nullptr)
+	{
+		return PixelStorageTraits<psm>::Read(PageTableFor<psm>(), data, bp, bw, x, y, cache);
+	}
+
+	// Byte address that Read/Write access for (x, y): the same arithmetic as Read.
+	template<PixelStorageMode psm>
+	inline u32 ByteAddress(u32 bp, u32 bw, u32 x, u32 y)
+	{
+		using Traits = PixelStorageTraits<psm>;
+		using PackedT = typename Traits::PackedT;
+		const u32 pixel_addr = Traits::Address(PageTableFor<psm>(), bp, bw, x, y);
+		const u32 bits = pixel_addr * UnpackedBitWidth(psm) + Traits::BitOffset();
+		return (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
+	}
+
+	template<PixelStorageMode psm>
+	inline void WriteFast(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
+	{
+		using PackedT = typename PixelStorageTraits<psm>::PackedT;
+		PixelStorageTraits<psm>::Write(PageTableFor<psm>(), data, bp, bw, x, y, static_cast<PackedT>(value));
+	}
+
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 

@@ -110,7 +110,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(std::make_unique<GSCpuBackend>(GSCpuBackend::DefaultRasterThreads(), GSCpuBackend::DefaultAsyncCommands()))
 {
     reset();
 }
@@ -121,7 +121,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = std::make_unique<GSCpuBackend>(GSCpuBackend::DefaultRasterThreads(), GSCpuBackend::DefaultAsyncCommands());
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -649,9 +649,38 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     return true;
 }
 
+namespace
+{
+    // The CPU backend can rasterize on worker threads (PS2X_GS_THREADS). By default every
+    // public entry point waits for the primitives it queued before returning, so callers that
+    // read the VRAM allocation directly (tests) see finished pixels. PS2X_GS_ASYNC=1 lets the
+    // workers run on until the next backend call that needs VRAM (CLUT/texture loads,
+    // transfers, presentation, FINISH, readbacks), overlapping rasterization with the EE/VU1.
+    bool asyncRaster()
+    {
+        static const bool async = []
+        {
+            const char *env = std::getenv("PS2X_GS_ASYNC");
+            return env && env[0] == '1';
+        }();
+        return async;
+    }
+
+    struct RasterSyncGuard
+    {
+        std::unique_ptr<GSRasterBackend> &backend;
+        ~RasterSyncGuard()
+        {
+            if (backend && !backend->UsesRawCommands() && !asyncRaster())
+                backend->Flush();
+        }
+    };
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    RasterSyncGuard rasterSync{m_backend};
     if (ps2x_gs_dump::active())
         ps2x_gs_dump::transfer(path, data, sizeBytes);
     if (m_backend && m_backend->UsesRawCommands())
@@ -758,6 +787,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
 bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    RasterSyncGuard rasterSync{m_backend};
     if (!data || sizeBytes < 16u || !m_backend)
         return false;
 
@@ -812,6 +842,7 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    RasterSyncGuard rasterSync{m_backend};
     if (ps2x_gs_dump::active() && m_backend)
         ps2x_gs_dump::imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
@@ -1092,6 +1123,7 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    RasterSyncGuard rasterSync{m_backend};
     if (ps2x_gs_dump::active())
         ps2x_gs_dump::registerWrite(regAddr, value);
     writeRegisterUnlocked(regAddr, value);
@@ -1697,7 +1729,7 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
 {
     if (!backend)
-        backend = std::make_unique<GSCpuBackend>();
+        backend = std::make_unique<GSCpuBackend>(GSCpuBackend::DefaultRasterThreads(), GSCpuBackend::DefaultAsyncCommands());
 
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     std::lock_guard<std::mutex> backendLock(m_backendLifetimeMutex);
