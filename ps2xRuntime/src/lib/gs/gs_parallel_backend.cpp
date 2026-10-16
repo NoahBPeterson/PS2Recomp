@@ -94,6 +94,19 @@ namespace
         }
     }
 
+    // PCRTC merge: with only one read circuit enabled, its picture is shown as is, as the CPU
+    // backend and PCSX2 2.8.2 do. paraLLEl-GS always blends circuit 1 over the background by
+    // the framebuffer's alpha when PMODE.MMOD=0; TC displays a CT16S buffer whose A bits are all 0
+    // (PMODE=0xff45: EN1 only, MMOD=0), so its whole picture came out black. Rewriting PMODE to
+    // MMOD=1/ALP=0xff gives that pass-through. With both circuits enabled PMODE is passed on as is.
+    uint64_t effectivePmode(uint64_t pmode)
+    {
+        const bool en1 = (pmode & 1u) != 0u, en2 = (pmode & 2u) != 0u;
+        if (!en1 || en2 || (pmode & 0x20u))
+            return pmode;
+        return (pmode & ~0xff20ull) | (1ull << 5) | (0xffull << 8);
+    }
+
     // Owns the Vulkan context/device and returns each scanout as host RGBA pixels. #285 shared
     // the image with OpenGL instead; macOS cannot import Vulkan memory into GL, and a 640x448
     // readback per frame is cheap on unified memory.
@@ -237,11 +250,17 @@ namespace
             ++statStates[key];
         }
 
+        // PS2X_PGS_TRACE_LINES (diagnostic): line budget of the PS2X_PGS_TRACE_AT trace (default 3000).
+        static uint32_t traceLimit()
+        {
+            static const uint32_t limit = std::getenv("PS2X_PGS_TRACE_LINES") ? uint32_t(std::atoi(std::getenv("PS2X_PGS_TRACE_LINES"))) : 3000u;
+            return limit;
+        }
         bool traceActive = false;
         uint32_t traceLines = 0, tracePath = 0;
         void observeRegister(uint8_t addr, uint64_t value)
         {
-            if (traceActive && traceLines < 3000 &&
+            if (traceActive && traceLines < traceLimit() &&
                 (addr <= 0x01 || addr == 0x06 || addr == 0x07 || addr == 0x42 || addr == 0x43 || addr == 0x47 ||
                  addr == 0x48 || addr == 0x4a || addr == 0x4b || addr == 0x4c || addr == 0x4d || addr == 0x50 || addr == 0x53))
             {
@@ -297,7 +316,7 @@ namespace
                     state.reg = state.loop = 0;
                     offset += 16;
                     ++statTags[path];
-                    if (traceActive && traceLines < 3000)
+                    if (traceActive && traceLines < traceLimit())
                     {
                         ++traceLines;
                         std::printf("[pgs-trace] p%u tag nloop=%u eop=%u pre=%u prim=%03x flg=%u nreg=%u regs=%016llx\n", path,
@@ -518,7 +537,7 @@ namespace
             Lock lock(mutex);
             gs.flush();
             auto &p = gs.get_priv_register_state();
-            p.qwords_lo[0] = request.pmode;
+            p.qwords_lo[0] = effectivePmode(request.pmode);
             // PS2X_PGS_FORCE_OPAQUE=1 (diagnostic): merge circuit 1 with constant alpha 0xff
             // (PMODE.MMOD=1, ALP=0xff) instead of the framebuffer's own alpha.
             static const bool forceOpaque = std::getenv("PS2X_PGS_FORCE_OPAQUE") != nullptr;
@@ -552,8 +571,9 @@ namespace
                 statStates.clear();
             }
             if (pgsDebug() && (presentLogs < 6 || (presentLogs % 600) == 0))
-                std::printf("[pgs] priv pmode=%llx smode1=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bg=%llx\n",
-                            (unsigned long long)request.pmode, (unsigned long long)request.smode1, (unsigned long long)request.smode2,
+                std::printf("[pgs] priv pmode=%llx (effective %llx, texa=%llx) smode1=%llx smode2=%llx dispfb1=%llx display1=%llx dispfb2=%llx display2=%llx bg=%llx\n",
+                            (unsigned long long)request.pmode, (unsigned long long)p.qwords_lo[0],
+                            (unsigned long long)gs.get_register_state().texa.bits, (unsigned long long)request.smode1, (unsigned long long)request.smode2,
                             (unsigned long long)request.dispfb1, (unsigned long long)request.display1,
                             (unsigned long long)request.dispfb2, (unsigned long long)request.display2,
                             (unsigned long long)request.bgcolor);

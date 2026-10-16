@@ -289,7 +289,7 @@ namespace
     void usage()
     {
         std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet]\n"
-                             "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>]\n");
+                             "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n");
     }
 }
 
@@ -302,6 +302,8 @@ int main(int argc, char **argv)
     bool quiet = false;
     uint64_t vramAtPacket = UINT64_MAX; // --vram-at N file: raw 4 MiB VRAM before packet N
     std::string vramAtPath;
+    uint32_t vramFrame = UINT32_MAX; // --vram-frame N file: VRAM (any backend) at vsync N, before presenting it
+    std::string vramFramePath;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -321,6 +323,11 @@ int main(int argc, char **argv)
         {
             vramAtPacket = std::strtoull(argv[++i], nullptr, 10);
             vramAtPath = argv[++i];
+        }
+        else if (arg == "--vram-frame" && i + 2 < argc)
+        {
+            vramFrame = uint32_t(std::strtoul(argv[++i], nullptr, 10));
+            vramFramePath = argv[++i];
         }
         else if (arg == "--quiet")
             quiet = true;
@@ -418,6 +425,19 @@ int main(int argc, char **argv)
             csr = (csr & ~(1ull << 13)) | (static_cast<uint64_t>(field & 1u) << 13);
             priv.csr.store(csr);
             priv.vsyncTick.store(frames + 1u);
+            if (frames == vramFrame)
+            {
+                gs.refreshDisplaySnapshot();
+                uint32_t size = 0u;
+                const uint8_t *snap = gs.lockDisplaySnapshot(size);
+                if (FILE *vf = snap ? std::fopen(vramFramePath.c_str(), "wb") : nullptr)
+                {
+                    std::fwrite(snap, 1, size, vf);
+                    std::fclose(vf);
+                }
+                gs.unlockDisplaySnapshot();
+                std::printf("wrote VRAM at vsync %u to %s\n", vramFrame, vramFramePath.c_str());
+            }
             gs.latchHostPresentationFrame();
             uint32_t width = 0u, height = 0u;
             const std::string name = "frame_" + std::to_string(10000 + frames).substr(1) + ".png";

@@ -894,8 +894,9 @@ bool PS2Runtime::initialize(const char *title)
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
 #ifdef PS2X_GS_PARALLEL
-        // PS2X_GS=parallel opts into paraLLEl-GS (Vulkan compute; MoltenVK on macOS). Opt-in until
-        // display alpha is sorted out: TC's in-game 3D currently scans out black with it.
+        // PS2X_GS=parallel opts into paraLLEl-GS (Vulkan compute; MoltenVK on macOS). Opt-in for now:
+        // the game runs several times faster with it and then corrupts textures and calls through a
+        // bad function pointer soon after New Game (T-0120).
         if (const char *gsChoice = std::getenv("PS2X_GS"); gsChoice && std::string(gsChoice) == "parallel")
         {
             try
