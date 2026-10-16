@@ -17,6 +17,7 @@
 //   ps2x_vu1_rec_gen <out dir> <trace.vu1trace>...   (tools/perf/vu1_rec_regen.sh)
 //   ps2x_vu1_rec_gen --selftest-fmac                 SIMD FMAC code against the scalar code
 //   ps2x_vu1_rec_gen --check-fmac-ref <file>         FMAC values against ps2-float (tools/vu1/fmac_ref)
+//   ps2x_vu1_rec_gen --fuzz-blocks <cases>           every translated block against the interpreter
 // Output is disc-derived (game code): not for git.
 
 #include "../../src/lib/vu/ps2_vu1_issue.h"
@@ -25,6 +26,8 @@
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1_trace.h"
 
+#include <algorithm>
+#include <iterator>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
@@ -247,6 +250,255 @@ struct Vu1RecGenerator
         return total ? 1 : 0;
     }
 
+    // Every registered translated block against the interpreter: per case a random VU1 state and
+    // data memory, micro memory holding only the block's code, one run from the
+    // block's pc with translated blocks and one interpreted, compared in full (VU1 state, data
+    // memory, PATH1 packets). Micro memory outside the block holds NOP[E] pairs. Covers blocks no trace runs (static coverage from the ELF). A case in
+    // which the block declined to run does not count; every block must run in at least one.
+    static bool sameState(const VU1State &a, const VU1State &b)
+    {
+        return std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 && std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
+               std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 && std::memcmp(&a.q, &b.q, 4) == 0 &&
+               std::memcmp(&a.p, &b.p, 4) == 0 && std::memcmp(&a.i, &b.i, 4) == 0 && a.r == b.r && a.pc == b.pc &&
+               a.mac == b.mac && a.clip == b.clip && a.status == b.status && a.cycles == b.cycles && a.ebit == b.ebit &&
+               a.haltAfterDelaySlot == b.haltAfterDelaySlot && a.stoppedByD == b.stoppedByD && a.stoppedByT == b.stoppedByT &&
+               a.branchPending == b.branchPending && a.branchTarget == b.branchTarget && a.branchDelay == b.branchDelay;
+    }
+
+    static int fuzzBlocks(int cases)
+    {
+        const auto &list = VU1Interpreter::compiledBlockList();
+        if (list.empty())
+        {
+            std::printf("fuzz blocks: no translated blocks registered\n");
+            return 1;
+        }
+        struct Side
+        {
+            PS2Memory memory;
+            std::unique_ptr<GifArbiter> arbiter;
+            GS gs;
+            VU1Interpreter vu{VU1Interpreter::Unit::VU1};
+            uint64_t gifHash = 0u;
+            uint32_t gifPackets = 0u;
+        };
+        auto a = std::make_unique<Side>(), b = std::make_unique<Side>();
+        for (Side *side : {a.get(), b.get()})
+        {
+            side->memory.initialize();
+            side->arbiter = std::make_unique<GifArbiter>([side](GifPathId, const uint8_t *data, uint32_t size)
+                                                         {
+                                                             side->gifHash = fnv1a(data, size, side->gifHash);
+                                                             ++side->gifPackets;
+                                                         });
+            side->memory.setGifArbiter(side->arbiter.get());
+        }
+        b->vu.setCompiledBlocksEnabled(false);
+        uint64_t seed = 0xD1B54A32D192ED03ull;
+        auto next = [&]()
+        {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            return seed;
+        };
+        auto randomFloat = [&]() -> float
+        {
+            const uint64_t pick = next();
+            uint32_t bits = static_cast<uint32_t>(pick >> 16);
+            switch (pick % 8u)
+            {
+            case 0: bits = 0u; break;
+            case 1: bits = (bits & 0x807FFFFFu) | (((pick >> 48) % 8u + 123u) << 23); break; // near 1
+            case 2: bits = (bits & 0x807FFFFFu) | (((pick >> 48) % 60u + 100u) << 23); break;
+            case 3: break; // anything, specials included
+            default: bits = (bits & 0x807FFFFFu) | (((pick >> 48) % 30u + 112u) << 23); break;
+            }
+            float f;
+            std::memcpy(&f, &bits, 4);
+            return f;
+        };
+        // With blocks on: the block declined at entry if its first pair is interpreted at the entry
+        // cycle; interpreted later (a loop back to its start) it declined a re-entry.
+        static uint32_t s_watchPc = UINT32_MAX;
+        static const VU1Interpreter *s_watchVu = nullptr;
+        static bool s_entryDeclined = false;
+        static uint64_t s_reentryDeclines = 0;
+        VU1Interpreter::s_pcHook = [](const uint8_t *, uint32_t pc)
+        {
+            if (!s_watchVu || pc != s_watchPc)
+                return;
+            if (s_watchVu->m_cycle == 0u)
+                s_entryDeclined = true;
+            else
+            {
+                ++s_reentryDeclines;
+                if (std::getenv("PS2X_FUZZ_WHY"))
+                {
+                    const VU1Interpreter &v = *s_watchVu;
+                    std::fprintf(stderr, "reentry-decline cycle=%llu pc=%04x branchPending=%d halt=%d ebit=%d store=%x vf=%x vi=%x acc=%x\n", (unsigned long long)v.m_cycle, pc,
+                                 v.m_state.branchPending, v.m_state.haltAfterDelaySlot, v.m_state.ebit, unsigned(v.m_storeMask),
+                                 unsigned(v.m_vfWriteMask), unsigned(v.m_viWriteMask), unsigned(v.m_accWriteMask));
+                }
+            }
+        };
+        std::vector<uint8_t> data(kMemSize);
+        uint64_t mismatches = 0, ran = 0, neverRan = 0, shown = 0, errorStops = 0;
+        const uint64_t showLimit = std::getenv("PS2X_FUZZ_SHOW") ? std::strtoull(std::getenv("PS2X_FUZZ_SHOW"), nullptr, 10) : 10u;
+        const char *onlyEnv = std::getenv("PS2X_FUZZ_ONLY"); // one block pc (hex)
+        const char *caseEnv = std::getenv("PS2X_FUZZ_CASE");
+        for (const auto &info : list)
+        {
+            if (onlyEnv)
+            {
+                // "pc" or "from-to" (hex)
+                char *dash = nullptr;
+                const unsigned long from = std::strtoul(onlyEnv, &dash, 16);
+                const unsigned long to = (dash && *dash == '-') ? std::strtoul(dash + 1, nullptr, 16) : from;
+                if (info.pc < from || info.pc > to)
+                    continue;
+            }
+            bool blockRan = false;
+            for (int c = 0; c < cases; ++c)
+            {
+                const bool skipCase = caseEnv && c != std::atoi(caseEnv);
+                if (skipCase)
+                    continue;
+                seed = fnv1a(info.code, info.size, 0x9E3779B97F4A7C15ull ^ (uint64_t(info.pc) << 32) ^ uint64_t(c)) | 1u;
+                VU1State st{};
+                for (auto &reg : st.vf)
+                    for (float &lane : reg)
+                        lane = randomFloat();
+                st.vf[0][0] = st.vf[0][1] = st.vf[0][2] = 0.0f;
+                st.vf[0][3] = 1.0f;
+                for (int r = 1; r < 16; ++r)
+                    st.vi[r] = static_cast<int32_t>((next() % 4u) ? next() % 0x400u : next() & 0xFFFFu);
+                for (float &lane : st.acc)
+                    lane = randomFloat();
+                st.q = randomFloat();
+                st.p = randomFloat();
+                st.i = randomFloat();
+                st.r = 0x3F800000u | static_cast<uint32_t>(next() & 0x7FFFFFu);
+                st.mac = static_cast<uint32_t>(next() & 0xFFFFu);
+                st.status = static_cast<uint32_t>(next() & 0xFFFu);
+                st.clip = static_cast<uint32_t>(next() & 0xFFFFFFu);
+                for (size_t off = 0; off < data.size(); off += 8u)
+                {
+                    const uint64_t w = next();
+                    std::memcpy(data.data() + off, &w, 8);
+                }
+                for (size_t off = 0; off < data.size(); off += 4u)
+                    if (next() % 2u)
+                    {
+                        const float f = randomFloat();
+                        std::memcpy(data.data() + off, &f, 4);
+                    }
+                // Any qword XGKICK may start at reads as a short GIF packet (NLOOP <= 7, EOP): random
+                // tags overflow the transfer buffer, which stops the program as an error with
+                // writes in flight. Only the low mantissa bits of each x lane change.
+                for (size_t off = 0; off < data.size(); off += 16u)
+                {
+                    uint32_t x;
+                    std::memcpy(&x, data.data() + off, 4);
+                    x = (x & ~0xFFFFu) | 0x8000u | static_cast<uint32_t>(next() & 7u);
+                    std::memcpy(data.data() + off, &x, 4);
+                }
+                const uint32_t top = static_cast<uint32_t>(next() % 0x400u), itop = static_cast<uint32_t>(next() % 0x400u);
+
+                VU1State out[2];
+                bool errorStop = false;
+                for (int k = 0; k < 2; ++k)
+                {
+                    Side &side = k == 0 ? *a : *b;
+                    // Outside the block: NOP[E] pairs, so wherever control leaves it the program ends
+                    // normally (pipelines drained) instead of stopping on a reserved instruction.
+                    for (uint32_t off = 0; off < kMemSize; off += 8u)
+                    {
+                        const uint32_t lower = 0x8000033Cu, upper = 0x400002FFu;
+                        std::memcpy(side.memory.getVU1Code() + off, &lower, 4);
+                        std::memcpy(side.memory.getVU1Code() + off + 4u, &upper, 4);
+                    }
+                    std::memcpy(side.memory.getVU1Code() + info.pc, info.code, info.size);
+                    side.memory.markVU1CodeModified();
+                    std::memcpy(side.memory.getVU1Data(), data.data(), kMemSize);
+                    side.gifHash = 0xcbf29ce484222325ull;
+                    side.gifPackets = 0u;
+                    side.vu.reset();
+                    side.vu.restoreState(st);
+                    s_watchVu = k == 0 ? &side.vu : nullptr;
+                    s_watchPc = info.pc;
+                    s_entryDeclined = false;
+                    side.vu.execute(side.memory.getVU1Code(), kMemSize, side.memory.getVU1Data(), kMemSize, side.gs, &side.memory,
+                                    info.pc, top, itop, 65536);
+                    if (k == 0 && !s_entryDeclined)
+                        blockRan = true, ++ran;
+                    out[k] = side.vu.state();
+                    errorStop = errorStop || side.vu.m_stopRequested;
+                }
+                if (errorStop)
+                {
+                    // Stopped on an error (a reserved instruction, an XGKICK packet overflowing its
+                    // buffer after a store wrote over its tag), writes possibly in flight: the
+                    // states are not comparable. Counted, not judged.
+                    ++errorStops;
+                    continue;
+                }
+                const bool ok = sameState(out[0], out[1]) &&
+                                std::memcmp(a->memory.getVU1Data(), b->memory.getVU1Data(), kMemSize) == 0 &&
+                                a->gifHash == b->gifHash && a->gifPackets == b->gifPackets;
+                if (!ok)
+                {
+                    ++mismatches;
+                    if (shown++ < showLimit)
+                    {
+                        std::string what;
+                        const VU1State &x = out[0], &y = out[1];
+                        for (int r = 0; r < 32; ++r)
+                            for (int l = 0; l < 4; ++l)
+                                if (std::memcmp(&x.vf[r][l], &y.vf[r][l], 4) != 0)
+                                {
+                                    uint32_t xb, yb;
+                                    std::memcpy(&xb, &x.vf[r][l], 4);
+                                    std::memcpy(&yb, &y.vf[r][l], 4);
+                                    what += " vf" + std::to_string(r) + "xyzw"[l] + "=" + hex(xb, 8) + "/" + hex(yb, 8);
+                                }
+                        for (int r = 0; r < 16; ++r)
+                            if (x.vi[r] != y.vi[r])
+                                what += " vi" + std::to_string(r);
+                        if (std::memcmp(x.acc, y.acc, sizeof(x.acc)) != 0) what += " acc";
+                        if (std::memcmp(&x.q, &y.q, 4) != 0) what += " q";
+                        if (std::memcmp(&x.p, &y.p, 4) != 0) what += " p";
+                        if (std::memcmp(&x.i, &y.i, 4) != 0) what += " i";
+                        if (x.r != y.r) what += " r";
+                        if (x.mac != y.mac) what += " mac";
+                        if (x.status != y.status) what += " status(" + hex(x.status) + "/" + hex(y.status) + ")";
+                        if (x.clip != y.clip) what += " clip";
+                        if (x.ebit != y.ebit || x.branchPending != y.branchPending || x.haltAfterDelaySlot != y.haltAfterDelaySlot)
+                            what += " control";
+                        if (std::memcmp(a->memory.getVU1Data(), b->memory.getVU1Data(), kMemSize) != 0) what += " data";
+                        if (a->gifHash != b->gifHash) what += " gif";
+                        std::printf("  MISMATCH block pc 0x%04x (%u bytes) case %d: pc %x/%x cycles %llu/%llu:%s\n", info.pc,
+                                    info.size, c, x.pc, y.pc, (unsigned long long)x.cycles, (unsigned long long)y.cycles,
+                                    what.c_str());
+                    }
+                }
+            }
+            if (!blockRan)
+            {
+                ++neverRan;
+                if (shown++ < showLimit)
+                    std::printf("  block pc 0x%04x (%u bytes) declined in every case\n", info.pc, info.size);
+            }
+        }
+        VU1Interpreter::s_pcHook = nullptr;
+        const bool pass = mismatches == 0u && neverRan == 0u;
+        std::printf("fuzz blocks: %s, %zu blocks x %d cases, %llu runs through the block, %llu mismatches, %llu blocks never "
+                    "ran, %llu cases stopped on an error (not compared), %llu loop re-entries declined\n",
+                    pass ? "PASS" : "FAIL", list.size(), cases, (unsigned long long)ran, (unsigned long long)mismatches,
+                    (unsigned long long)neverRan, (unsigned long long)errorStops, (unsigned long long)s_reentryDeclines);
+        return pass ? 0 : 1;
+    }
+
     using Pair = VU1Interpreter::DecodedInstructionPair;
     using Pipeline = VU1Interpreter::Pipeline;
 
@@ -348,6 +600,139 @@ struct Vu1RecGenerator
         if (!p.iBit && opHi(p.lower) >= 0x10u && opHi(p.lower) <= 0x1Cu)
             return true;
         return p.upperHandler == nullptr && !upperNop(p);
+    }
+
+    // Static code from the game's ELF: the main VU1 program (VIF MPG packets in .vutext) alone and
+    // with each overlay for the 0x3800 slot (raw code in vu_code, listed in .DVP.ovlytab). Every pair
+    // of loaded code counts as executed (all-zero padding pairs excepted); entries are the code
+    // starts, branch targets, the pairs after a branch's or E-bit's delay slot (return points,
+    // following programs). A pc reached any other way (JR to a computed address) is interpreted up
+    // to the next block start.
+    static uint32_t branchTarget(uint32_t pc, uint32_t lower)
+    {
+        int32_t imm = static_cast<int32_t>(lower & 0x7FFu);
+        if (imm & 0x400)
+            imm -= 0x800;
+        return static_cast<uint32_t>(static_cast<int32_t>(pc) + 8 + imm * 8) & (kMemSize - 1u);
+    }
+
+    static void analyseStatic(Image &img, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+    {
+        for (const auto &[from, to] : ranges)
+        {
+            img.entries.insert(from);
+            for (uint32_t pc = from; pc + 8u <= to; pc += 8u)
+            {
+                uint64_t words = 0;
+                std::memcpy(&words, img.code.data() + pc, 8);
+                if (words == 0u)
+                    continue;
+                img.executed.insert(pc);
+                const Pair d = decode(img.code, pc);
+                if (reserved(d))
+                    continue;
+                const uint32_t hi = opHi(d.lower);
+                if (isBranch(d))
+                {
+                    if (hi != 0x24u && hi != 0x25u) // JR/JALR: computed target
+                        img.entries.insert(branchTarget(pc, d.lower));
+                    img.entries.insert((pc + 16u) & (kMemSize - 1u));
+                }
+                if (d.eBit)
+                    img.entries.insert((pc + 16u) & (kMemSize - 1u));
+            }
+        }
+    }
+
+    static bool loadElfImages(const char *path, std::map<uint64_t, Image> &images)
+    {
+        std::ifstream in(path, std::ios::binary);
+        std::vector<uint8_t> elf((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        auto u32 = [&](size_t off) -> uint32_t
+        {
+            uint32_t v = 0;
+            if (off + 4u <= elf.size())
+                std::memcpy(&v, elf.data() + off, 4);
+            return v;
+        };
+        auto u16 = [&](size_t off) -> uint32_t { return u32(off) & 0xFFFFu; };
+        if (elf.size() < 52u || std::memcmp(elf.data(), "\x7f" "ELF", 4) != 0)
+            return false;
+        const uint32_t shoff = u32(32), shnum = u16(48), shstrndx = u16(50);
+        struct Section
+        {
+            std::string name;
+            uint32_t addr, offset, size;
+        };
+        std::vector<Section> sections;
+        const uint32_t strOff = u32(shoff + 40u * shstrndx + 16u);
+        for (uint32_t i = 0; i < shnum; ++i)
+        {
+            const size_t h = shoff + 40u * i;
+            const char *name = reinterpret_cast<const char *>(elf.data() + std::min<size_t>(strOff + u32(h), elf.size() - 1u));
+            sections.push_back({name, u32(h + 12u), u32(h + 16u), u32(h + 20u)});
+        }
+        auto find = [&](const char *name) -> const Section *
+        {
+            for (const Section &sec : sections)
+                if (sec.name == name)
+                    return &sec;
+            return nullptr;
+        };
+        const Section *vutext = find(".vutext"), *vucode = find("vu_code"), *table = find(".DVP.ovlytab");
+        if (!vutext)
+            return false;
+        // Main program: MPG packets (VIFcode 0x4A: NUM pairs at ADDR*8, data 64-bit aligned).
+        std::vector<uint8_t> main(kMemSize, 0u);
+        std::vector<std::pair<uint32_t, uint32_t>> mainRanges;
+        for (size_t pos = vutext->offset; pos + 4u <= size_t(vutext->offset) + vutext->size;)
+        {
+            const uint32_t code = u32(pos);
+            pos += 4u;
+            if (((code >> 24) & 0x7Fu) != 0x4Au)
+                continue;
+            const uint32_t num = ((code >> 16) & 0xFFu) ? ((code >> 16) & 0xFFu) : 256u;
+            const uint32_t addr = (code & 0xFFFFu) * 8u;
+            pos = (pos + 7u) & ~size_t(7u);
+            if (addr + num * 8u > kMemSize || pos + num * 8u > elf.size())
+                return false;
+            std::memcpy(main.data() + addr, elf.data() + pos, num * 8u);
+            mainRanges.push_back({addr, addr + num * 8u});
+            pos += num * 8u;
+        }
+        auto add = [&](std::vector<uint8_t> code, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+        {
+            Image &img = images[fnv1a(code.data(), kMemSize)];
+            if (img.code.empty())
+                img.code = std::move(code);
+            analyseStatic(img, ranges);
+        };
+        add(main, mainRanges);
+        if (!vucode || !table)
+            return true;
+        // Overlays for the 0x3800 slot: from their lma to the next overlay's (or the section end).
+        std::vector<std::pair<uint32_t, uint32_t>> slot; // (lma, vma)
+        for (uint32_t off = 0; off + 12u <= table->size; off += 12u)
+        {
+            const uint32_t lma = u32(table->offset + off + 4u), vma = u32(table->offset + off + 8u);
+            if (lma >= vucode->addr && lma < vucode->addr + vucode->size)
+                slot.push_back({lma, vma});
+        }
+        std::sort(slot.begin(), slot.end());
+        for (size_t i = 0; i < slot.size(); ++i)
+        {
+            const auto [lma, vma] = slot[i];
+            const uint32_t end = i + 1u < slot.size() ? slot[i + 1u].first : vucode->addr + vucode->size;
+            const uint32_t size = std::min<uint32_t>(end - lma, kMemSize - vma) & ~7u;
+            if (vma != 0x3800u || size == 0u)
+                continue;
+            std::vector<uint8_t> code = main;
+            std::memcpy(code.data() + vma, elf.data() + vucode->offset + (lma - vucode->addr), size);
+            auto ranges = mainRanges;
+            ranges.push_back({vma, vma + size});
+            add(std::move(code), ranges);
+        }
+        return true;
     }
 
     struct PairPlan
@@ -477,9 +862,9 @@ struct Vu1RecGenerator
     // One block. Each pair issues at t = max(previous issue + 1, its operands' ready cycles), the
     // interpreter's calculatePairReadyCycle with the pair folded in, so stalls on anything in
     // flight, from before the block or inside it, come out as in the interpreter.
-    static void emitBlock(std::ostream &o, uint64_t imageId, const Block &b)
+    static void emitBlock(std::ostream &o, uint64_t codeHash, const Block &b)
     {
-        o << "template <>\nVU1Interpreter::IssueResult VU1Interpreter::runCompiledBlock<" << hex(imageId) << "ull, "
+        o << "template <>\nVU1Interpreter::IssueResult VU1Interpreter::runCompiledBlock<" << hex(codeHash) << "ull, "
           << hex(b.start, 4) << "u>(const BlockArgs &a)\n{\n";
         o << "    const uint64_t e = m_cycle;\n";
         o << "    if (m_state.branchPending || m_state.haltAfterDelaySlot || m_state.ebit) return IssueDeclined;\n";
@@ -845,9 +1230,15 @@ int main(int argc, char **argv)
         return Vu1RecGenerator::selfTestFmac();
     if (argc == 3 && std::strcmp(argv[1], "--check-fmac-ref") == 0)
         return Vu1RecGenerator::checkFmacRef(argv[2]);
+    if (argc == 3 && std::strcmp(argv[1], "--fuzz-blocks") == 0)
+    {
+        if (std::fesetround(FE_TOWARDZERO) != 0)
+            return 1;
+        return Vu1RecGenerator::fuzzBlocks(std::max(1, std::atoi(argv[2])));
+    }
     if (argc < 3)
     {
-        std::fprintf(stderr, "usage: ps2x_vu1_rec_gen <out dir> <trace.vu1trace>...\n");
+        std::fprintf(stderr, "usage: ps2x_vu1_rec_gen <out dir> [--elf <game ELF>] <trace.vu1trace>...\n");
         return 2;
     }
     setenv("PS2X_VU1_NO_AOT", "1", 1); // coverage must see every pair interpreted
@@ -862,7 +1253,18 @@ int main(int argc, char **argv)
     VU1Interpreter vu1(VU1Interpreter::Unit::VU1);
     VU1Interpreter::s_pcHook = onPc;
 
-    for (int t = 2; t < argc; ++t)
+    int firstTrace = 2;
+    if (argc >= 4 && std::strcmp(argv[2], "--elf") == 0)
+    {
+        if (!Vu1RecGenerator::loadElfImages(argv[3], images))
+        {
+            std::fprintf(stderr, "%s: no VU1 code found (.vutext)\n", argv[3]);
+            return 2;
+        }
+        std::printf("%s: %zu static image(s)\n", argv[3], images.size());
+        firstTrace = 4;
+    }
+    for (int t = firstTrace; t < argc; ++t)
     {
         std::vector<uint8_t> bytes;
         std::vector<Record> records;
@@ -904,11 +1306,17 @@ int main(int argc, char **argv)
         if (entry.path().filename().string().rfind("vu1_aot_", 0) == 0)
             std::filesystem::remove(entry.path());
 
-    std::vector<std::string> registrars;
+    // Blocks from every image, deduplicated by (pc, code): a block depends only on its own words.
+    struct Unique
+    {
+        Vu1RecGenerator::Block block;
+        uint64_t hash;
+        std::vector<uint8_t> code;
+    };
+    std::map<std::pair<uint32_t, uint64_t>, Unique> unique;
     for (const auto &[id, img] : images)
     {
-        std::vector<Vu1RecGenerator::Block> blocks;
-        size_t pairs = 0;
+        size_t pairs = 0, blockCount = 0, added = 0;
         // Blocks start at entries and wherever a block (or a pair left to the interpreter) falls through.
         std::set<uint32_t> starts(img.entries.begin(), img.entries.end()), done;
         while (!starts.empty())
@@ -928,57 +1336,65 @@ int main(int argc, char **argv)
                 starts.insert(block.nextPc);
             if (block.end == Vu1RecGenerator::Block::End::Fallthrough && img.executed.count(block.nextPc + 8u))
                 starts.insert(block.nextPc + 8u);
-            Vu1RecGenerator::schedule(block);
             pairs += block.pairs.size();
-            blocks.push_back(std::move(block));
+            ++blockCount;
+            std::vector<uint8_t> code(img.code.begin() + block.start, img.code.begin() + block.start + block.pairs.size() * 8u);
+            const uint64_t hash = fnv1a(code.data(), code.size());
+            auto [it, inserted] = unique.try_emplace({block.start, hash});
+            if (inserted)
+            {
+                Vu1RecGenerator::schedule(block);
+                it->second = {std::move(block), hash, std::move(code)};
+                ++added;
+            }
         }
-        char name[32];
-        std::snprintf(name, sizeof(name), "%016llx", static_cast<unsigned long long>(id));
-        // Blocks go into several files so they compile in parallel; the image file holds the table.
-        const std::string header = "// Generated by ps2x_vu1_rec_gen (T-0121) from recorded VU1 traces. Do not edit; disc-derived.\n"
-                                   "#include \"../lib/vu/ps2_vu1_issue.h\"\n#include \"../lib/vu/ps2_vu1_lower.h\"\n#include \"../lib/vu/ps2_vu1_upper.h\"\n"
-                                   "\n";
-        constexpr size_t kBlocksPerFile = 24u;
-        for (size_t first = 0, part = 0; first < blocks.size(); first += kBlocksPerFile, ++part)
-        {
-            std::ofstream bo(outDir / ("vu1_aot_" + std::string(name) + "_" + std::to_string(part) + ".cpp"));
-            bo << header;
-            for (size_t i = first; i < std::min(blocks.size(), first + kBlocksPerFile); ++i)
-                Vu1RecGenerator::emitBlock(bo, id, blocks[i]);
-        }
-        std::ofstream o(outDir / ("vu1_aot_" + std::string(name) + ".cpp"));
-        o << header;
-        for (const auto &block : blocks)
-            o << "template <>\nVU1Interpreter::IssueResult VU1Interpreter::runCompiledBlock<" << Vu1RecGenerator::hex(id) << "ull, "
-              << Vu1RecGenerator::hex(block.start, 4) << "u>(const BlockArgs &a);\n";
-        o << "\nnamespace\n{\n    alignas(16) const uint8_t kImage[16384] = {\n";
-        for (uint32_t off = 0; off < kMemSize; off += 32)
-        {
-            o << "        ";
-            for (uint32_t i = 0; i < 32; ++i)
-                o << Vu1RecGenerator::hex(img.code[off + i], 2) << ",";
-            o << "\n";
-        }
-        o << "    };\n";
-        o << "    const uint32_t kPcs[] = {";
-        for (const auto &block : blocks)
-            o << Vu1RecGenerator::hex(block.start, 4) << "u, ";
-        o << "};\n    const VU1Interpreter::CompiledBlock kBlocks[] = {\n";
-        for (const auto &block : blocks)
-            o << "        &VU1Interpreter::runCompiledBlock<" << Vu1RecGenerator::hex(id) << "ull, " << Vu1RecGenerator::hex(block.start, 4) << "u>,\n";
-        o << "    };\n}\n\nvoid ps2xVu1AotRegister_" << name << "()\n{\n    VU1Interpreter::registerCompiledImage({kImage, kPcs, kBlocks, "
-          << blocks.size() << "u});\n}\n";
-        registrars.push_back(name);
-        std::printf("image %s: %zu executed pairs, %zu entries, %zu blocks, %zu pairs translated\n", name, img.executed.size(),
-                    img.entries.size(), blocks.size(), pairs);
+        std::printf("image %016llx: %zu executed pairs, %zu entries, %zu blocks (%zu new), %zu pairs translated\n",
+                    static_cast<unsigned long long>(id), img.executed.size(), img.entries.size(), blockCount, added, pairs);
     }
-    std::ofstream reg(outDir / "vu1_aot_register.cpp");
-    reg << "// Generated by ps2x_vu1_rec_gen (T-0121). Do not edit.\n";
-    for (const auto &n : registrars)
-        reg << "void ps2xVu1AotRegister_" << n << "();\n";
-    reg << "\nvoid ps2xVu1AotRegister()\n{\n";
-    for (const auto &n : registrars)
-        reg << "    ps2xVu1AotRegister_" << n << "();\n";
-    reg << "}\n";
+
+    // Blocks go into several files so they compile in parallel; vu1_aot_table.cpp registers them.
+    const std::string header = "// Generated by ps2x_vu1_rec_gen (T-0121) from VU1 traces and the game ELF. Do not edit; disc-derived.\n"
+                               "#include \"../lib/vu/ps2_vu1_issue.h\"\n#include \"../lib/vu/ps2_vu1_lower.h\"\n#include \"../lib/vu/ps2_vu1_upper.h\"\n"
+                               "\n";
+    std::vector<const Unique *> list;
+    for (const auto &[key, u] : unique)
+        list.push_back(&u);
+    constexpr size_t kBlocksPerFile = 24u;
+    size_t totalPairs = 0;
+    for (size_t first = 0, part = 0; first < list.size(); first += kBlocksPerFile, ++part)
+    {
+        char name[48];
+        std::snprintf(name, sizeof(name), "vu1_aot_blocks_%03zu.cpp", part);
+        std::ofstream bo(outDir / name);
+        bo << header;
+        for (size_t i = first; i < std::min(list.size(), first + kBlocksPerFile); ++i)
+        {
+            Vu1RecGenerator::emitBlock(bo, list[i]->hash, list[i]->block);
+            totalPairs += list[i]->block.pairs.size();
+        }
+    }
+    std::ofstream o(outDir / "vu1_aot_table.cpp");
+    o << header;
+    auto fnName = [](const Unique &u)
+    {
+        return "VU1Interpreter::runCompiledBlock<" + Vu1RecGenerator::hex(u.hash) + "ull, " + Vu1RecGenerator::hex(u.block.start, 4) + "u>";
+    };
+    for (const Unique *u : list)
+        o << "template <>\nVU1Interpreter::IssueResult " << fnName(*u) << "(const BlockArgs &a);\n";
+    o << "\nnamespace\n{\n";
+    for (size_t i = 0; i < list.size(); ++i)
+    {
+        o << "    alignas(8) const uint8_t kCode" << i << "[] = {";
+        for (size_t b = 0; b < list[i]->code.size(); ++b)
+            o << (b % 32u == 0u ? "\n        " : "") << Vu1RecGenerator::hex(list[i]->code[b], 2) << ",";
+        o << "};\n";
+    }
+    o << "    const VU1Interpreter::CompiledBlockInfo kBlocks[] = {\n";
+    for (size_t i = 0; i < list.size(); ++i)
+        o << "        {" << Vu1RecGenerator::hex(list[i]->block.start, 4) << "u, " << list[i]->code.size() << "u, kCode" << i
+          << ", &" << fnName(*list[i]) << "},\n";
+    o << "    };\n}\n\nvoid ps2xVu1AotRegister()\n{\n    VU1Interpreter::registerCompiledBlocks(kBlocks, " << list.size()
+      << "u);\n}\n";
+    std::printf("%zu unique blocks, %zu pairs translated\n", list.size(), totalPairs);
     return 0;
 }

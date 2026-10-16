@@ -309,6 +309,32 @@ void register_ps2_vu1_tests()
                      "ITOF0 should convert negative fixed-point source bits");
         });
 
+        tc.Run("ITOF0 rounds integers wider than 24 bits toward zero", [](TestCase &t)
+        {
+            // Like every VU result. Translated blocks once got 2^31 for FTOI's saturated
+            // 0x7FFFFFFF: the compiler folded the conversion rounding to nearest.
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            writeVuInstructionPair(
+                fx.code, 0u, 0u,
+                makeVuUpperSpecial(0x10u, 0xFu, 2u, 1u));
+
+            VU1Interpreter vu1;
+            const int32_t raw[4] = {0x7FFFFFFF, -0x7FFFFFFF, 0x01000001, INT32_MIN};
+            std::memcpy(vu1.state().vf[1], raw, sizeof(raw));
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE,
+                        fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem,
+                        0u, 0u, 0u, 4u);
+
+            uint32_t bits[4];
+            std::memcpy(bits, vu1.state().vf[2], sizeof(bits));
+            t.Equals(bits[0], 0x4EFFFFFFu, "ITOF0 of 0x7FFFFFFF is 2147483520 (chopped), not 2^31");
+            t.Equals(bits[1], 0xCEFFFFFFu, "ITOF0 of -0x7FFFFFFF is -2147483520");
+            t.Equals(bits[2], 0x4B800000u, "ITOF0 of 2^24 + 1 is 2^24");
+            t.Equals(bits[3], 0xCF000000u, "ITOF0 of INT32_MIN is exact");
+        });
+
         tc.Run("MTIR decodes fsf as a component selector", [](TestCase &t)
         {
             Vu1Fixture fx;

@@ -4,6 +4,7 @@
 // its out-of-line copy for the interpreter, while translated VU1 blocks (T-0121) inline it with a
 // constant instruction word, so only that instruction's case is left.
 
+#include <bit>
 #include "runtime/ps2_vu1.h"
 #include "ps2_vu1_detail.h"
 #include "ps2_vu1_decode.h"
@@ -22,6 +23,22 @@ namespace vu1_upper_detail
         if (scaled <= static_cast<double>(std::numeric_limits<int32_t>::min()))
             return std::numeric_limits<int32_t>::min();
         return static_cast<int32_t>(scaled);
+    }
+
+    // ITOF's conversion, rounded toward zero like every VU result, without relying on the host's
+    // rounding mode: the low bits that do not fit a float's 24-bit significand are dropped first,
+    // so the conversion itself is exact. (Inlined after FTOI, the compiler knows a saturated
+    // 0x7FFFFFFF and folds a plain cast to 2^31, rounded to nearest at compile time.)
+    inline float vuIntToFloat(int32_t value)
+    {
+        uint32_t magnitude = value < 0 ? 0u - static_cast<uint32_t>(value) : static_cast<uint32_t>(value);
+        if (magnitude >= (1u << 24))
+        {
+            const int shift = 8 - std::countl_zero(magnitude); // bits below the 24 that are kept
+            magnitude &= ~((1u << shift) - 1u);
+        }
+        const float f = static_cast<float>(magnitude);
+        return value < 0 ? -f : f;
     }
 }
 
@@ -221,7 +238,7 @@ namespace vu1_upper_detail
             {
                 int32_t iv;
                 std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv);
+                result[c] = vu1_upper_detail::vuIntToFloat(iv);
             }
             applyDest(vtDest, result, dest);
             return;
@@ -230,7 +247,7 @@ namespace vu1_upper_detail
             {
                 int32_t iv;
                 std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 16.0f;
+                result[c] = vu1_upper_detail::vuIntToFloat(iv) / 16.0f;
             }
             applyDest(vtDest, result, dest);
             return;
@@ -239,7 +256,7 @@ namespace vu1_upper_detail
             {
                 int32_t iv;
                 std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 4096.0f;
+                result[c] = vu1_upper_detail::vuIntToFloat(iv) / 4096.0f;
             }
             applyDest(vtDest, result, dest);
             return;
@@ -248,7 +265,7 @@ namespace vu1_upper_detail
             {
                 int32_t iv;
                 std::memcpy(&iv, &m_state.vf[fs][c], 4);
-                result[c] = static_cast<float>(iv) / 32768.0f;
+                result[c] = vu1_upper_detail::vuIntToFloat(iv) / 32768.0f;
             }
             applyDest(vtDest, result, dest);
             return;

@@ -528,53 +528,89 @@ VU1Interpreter::DecodedInstructionPair VU1Interpreter::decodeInstructionPair(con
 
 namespace
 {
-    std::vector<VU1Interpreter::CompiledImage> &compiledImages()
+    // Registered blocks, all of them and per pc / 8 (longest first: where blocks of different
+    // lengths match, the longest runs).
+    struct CompiledBlockRegistry
     {
-        static std::vector<VU1Interpreter::CompiledImage> images;
-        return images;
+        std::vector<VU1Interpreter::CompiledBlockInfo> all;
+        std::array<std::vector<VU1Interpreter::CompiledBlockInfo>, 0x4000u / 8u> byPc;
+    };
+    CompiledBlockRegistry &compiledRegistry()
+    {
+        static CompiledBlockRegistry registry;
+        return registry;
     }
 }
 
 void ps2xVu1AotRegister(); // generated (ps2xRuntime/src/vu1_aot) or the empty stub
 
+namespace
+{
+    void ps2xVu1AotRegisterOnce()
+    {
+        static const bool registered = []
+        {
+            ps2xVu1AotRegister();
+            return true;
+        }();
+        (void)registered;
+    }
+}
+
 void (*VU1Interpreter::s_pcHook)(const uint8_t *, uint32_t) = nullptr;
 
-void VU1Interpreter::registerCompiledImage(const CompiledImage &image)
+void VU1Interpreter::registerCompiledBlocks(const CompiledBlockInfo *blocks, uint32_t count)
 {
-    compiledImages().push_back(image);
+    CompiledBlockRegistry &registry = compiledRegistry();
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const CompiledBlockInfo &info = blocks[i];
+        if (info.pc >= 0x4000u || (info.pc & 7u) != 0u || info.size == 0u || info.pc + info.size > 0x4000u)
+            continue;
+        registry.all.push_back(info);
+        auto &bucket = registry.byPc[info.pc >> 3];
+        bucket.push_back(info);
+        std::stable_sort(bucket.begin(), bucket.end(), [](const CompiledBlockInfo &a, const CompiledBlockInfo &b)
+                         { return a.size > b.size; });
+    }
+}
+
+const std::vector<VU1Interpreter::CompiledBlockInfo> &VU1Interpreter::compiledBlockList()
+{
+    ps2xVu1AotRegisterOnce();
+    return compiledRegistry().all;
+}
+
+void VU1Interpreter::resolveCompiledBlock(const uint8_t *vuCode, uint32_t index)
+{
+    m_compiledResolved[index] = true;
+    m_compiledBlocks[index] = nullptr;
+    const uint32_t pc = index << 3;
+    for (const CompiledBlockInfo &info : compiledRegistry().byPc[index])
+        if (std::memcmp(vuCode + pc, info.code, info.size) == 0)
+        {
+            m_compiledBlocks[index] = info.block;
+            return;
+        }
 }
 
 const VU1Interpreter::CompiledBlock *VU1Interpreter::compiledBlocksFor(const uint8_t *vuCode, uint32_t codeSize,
                                                                        const PS2Memory *memory)
 {
-    static const bool registered = []
-    {
-        ps2xVu1AotRegister();
-        return true;
-    }();
-    (void)registered;
+    ps2xVu1AotRegisterOnce();
     static const bool disabled = std::getenv("PS2X_VU1_NO_AOT") != nullptr;
-    if (disabled || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u || compiledImages().empty())
+    if (disabled || !m_compiledEnabled || m_unit != Unit::VU1 || !memory || codeSize != 0x4000u ||
+        compiledRegistry().all.empty())
         return nullptr;
     const uint64_t generation = memory->getVU1CodeGeneration();
     if (generation != m_compiledGeneration || vuCode != m_compiledCode)
     {
-        // Micro memory changed (MPG upload): use translated blocks only for an exact image match.
+        // Micro memory changed (MPG upload): every pc is looked up again when reached.
         m_compiledGeneration = generation;
         m_compiledCode = vuCode;
-        m_compiledValid = false;
-        m_compiledBlocks.fill(nullptr);
-        for (const CompiledImage &image : compiledImages())
-        {
-            if (std::memcmp(image.code, vuCode, 0x4000u) != 0)
-                continue;
-            for (uint32_t index = 0; index < image.blockCount; ++index)
-                m_compiledBlocks[(image.blockPcs[index] & 0x3FFFu) >> 3] = image.blocks[index];
-            m_compiledValid = true;
-            break;
-        }
+        m_compiledResolved.fill(false);
     }
-    return m_compiledValid ? m_compiledBlocks.data() : nullptr;
+    return m_compiledBlocks.data();
 }
 
 void VU1Interpreter::rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize,
@@ -729,7 +765,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         if (compiled && (m_state.pc & 7u) == 0u)
         {
-            if (const CompiledBlock block = compiled[m_state.pc >> 3])
+            const uint32_t index = m_state.pc >> 3;
+            if (!m_compiledResolved[index])
+                resolveCompiledBlock(vuCode, index);
+            if (const CompiledBlock block = compiled[index])
             {
                 const IssueResult issued = (this->*block)(blockArgs);
                 if (issued == IssueStopped)
@@ -747,6 +786,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         if (s_pcHook)
             s_pcHook(vuCode, m_state.pc);
+        ++m_interpretedPairs;
         const uint32_t pairIndex = m_state.pc >> 3;
         const DecodedInstructionPair &decoded =
             ((m_state.pc & 7u) == 0u && pairIndex < cachedPairs)
