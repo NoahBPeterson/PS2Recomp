@@ -18,6 +18,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <time.h>
+#endif
 
 namespace
 {
@@ -139,6 +142,21 @@ namespace
     }
 }
 
+namespace
+{
+    // CPU time of this thread: steadier than wall time on a loaded machine (preemption does not count).
+    std::chrono::nanoseconds threadCpuNow()
+    {
+#if defined(_WIN32)
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch());
+#else
+        timespec ts{};
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+        return std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec);
+#endif
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -195,7 +213,7 @@ int main(int argc, char **argv)
     uint8_t *const data = memory.getVU1Data();
 
     uint64_t mismatches = 0u, resumes = 0u, cycles = 0u, codeLoads = 0u;
-    std::chrono::steady_clock::duration vuTime{}; // inside execute/resume only (excludes replay bookkeeping)
+    std::chrono::nanoseconds vuTime{}; // thread CPU time inside execute/resume only (excludes replay bookkeeping)
     const auto t0 = std::chrono::steady_clock::now();
     for (int pass = 0; pass < repeat; ++pass)
     {
@@ -217,9 +235,9 @@ int main(int argc, char **argv)
             if (r.header.kind == static_cast<uint32_t>(RunKind::Execute))
             {
                 vu1.restoreState(r.before);
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = threadCpuNow();
                 vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, 65536);
-                vuTime += std::chrono::steady_clock::now() - start;
+                vuTime += threadCpuNow() - start;
             }
             else
             {
@@ -228,9 +246,9 @@ int main(int argc, char **argv)
                 // matched, and seeds the chain when the trace starts with a resume.
                 ++resumes;
                 vu1.restoreState(r.before);
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = threadCpuNow();
                 vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, 65536);
-                vuTime += std::chrono::steady_clock::now() - start;
+                vuTime += threadCpuNow() - start;
             }
             cycles += r.after.cycles - r.before.cycles;
             const std::string diff = stateDiff(r.after, vu1.state());

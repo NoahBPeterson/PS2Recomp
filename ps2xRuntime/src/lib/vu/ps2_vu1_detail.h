@@ -4,21 +4,21 @@
 #include <cstdint>
 
 // Instruction field extraction helpers
-static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
-static inline uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
-static inline uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
-static inline uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
-static inline uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
+static constexpr inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+static constexpr inline uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static constexpr inline uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static constexpr inline uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static constexpr inline uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
 
 // Lower instruction field helpers
-static inline uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
-static inline uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
-static inline uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
-static inline uint8_t VIT(uint32_t i) { return (uint8_t)((i >> 16) & 0xF); }
-static inline uint8_t VIS(uint32_t i) { return (uint8_t)((i >> 11) & 0xF); }
-static inline uint8_t VID(uint32_t i) { return (uint8_t)((i >> 6) & 0xF); }
-static inline int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
-static inline int16_t IMM15(uint32_t i)
+static constexpr inline uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static constexpr inline uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static constexpr inline uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static constexpr inline uint8_t VIT(uint32_t i) { return (uint8_t)((i >> 16) & 0xF); }
+static constexpr inline uint8_t VIS(uint32_t i) { return (uint8_t)((i >> 11) & 0xF); }
+static constexpr inline uint8_t VID(uint32_t i) { return (uint8_t)((i >> 6) & 0xF); }
+static constexpr inline int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
+static constexpr inline int16_t IMM15(uint32_t i)
 {
     uint32_t lo11 = i & 0x7FF;
     uint32_t hi4 = (i >> 21) & 0xF;
@@ -75,16 +75,16 @@ inline void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 }
 
 inline uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
-                                                  long double exactResult) const
+                                                  double exactResult) const
 {
     const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+    const double magnitude = std::fabs(exactResult);
+    const double maximum = static_cast<double>(std::numeric_limits<float>::max());
+    const double minimum = static_cast<double>(std::numeric_limits<float>::min());
     uint8_t flags = negative ? 0x2u : 0u;
 
     uint32_t bits = negative ? 0x80000000u : 0u;
-    if (magnitude == 0.0L)
+    if (magnitude == 0.0)
     {
         flags |= 0x1u;
         std::memcpy(&value, &bits, sizeof(value));
@@ -176,9 +176,51 @@ inline VU1Interpreter::FlagPipelineEntry *VU1Interpreter::allocFlagEntry(bool up
     return entry;
 }
 
+inline void VU1Interpreter::commitFlagSlot(FlagSlot &slot)
+{
+    for (uint32_t index = 0; index < slot.count; ++index)
+    {
+        FlagPipelineEntry &entry = slot.entries[index];
+        if (entry.writesMac)
+            m_state.mac = entry.mac;
+        if (entry.writesStatus)
+        {
+            const uint32_t current = entry.status & 0xFu;
+            m_state.status = (m_state.status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+        }
+        if (entry.writesSticky)
+            m_state.status = (m_state.status & 0x03Fu) | (entry.status & 0xFC0u);
+        if (entry.writesClip)
+            m_state.clip = entry.clip;
+        entry.valid = false;
+    }
+    slot.count = 0u;
+}
+
+inline void VU1Interpreter::commitScalars()
+{
+    if (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle)
+    {
+        m_state.q = m_fdiv.value;
+        const uint32_t currentDi = m_fdiv.statusDi & 0x30u;
+        m_state.status = (m_state.status & 0xFCFu) | currentDi | (currentDi << 6);
+        m_fdiv = {};
+    }
+    for (ScalarPipelineEntry &entry : m_efu)
+    {
+        if (entry.valid && entry.readyCycle <= m_cycle)
+        {
+            m_state.p = entry.value;
+            entry = {};
+        }
+    }
+}
+
 inline bool VU1Interpreter::commitDue() const
 {
-    if (m_wheel[m_cycle & (kWheelSize - 1u)].count != 0u || m_fdiv.valid || m_efu[0].valid || m_efu[1].valid)
+    // Q and P commit at their ready cycle; until then there is nothing to do for them.
+    if (m_wheel[m_cycle & (kWheelSize - 1u)].count != 0u || (m_fdiv.valid && m_fdiv.readyCycle <= m_cycle) ||
+        (m_efu[0].valid && m_efu[0].readyCycle <= m_cycle) || (m_efu[1].valid && m_efu[1].readyCycle <= m_cycle))
         return true;
     if (m_cycle < kFmacLatency)
         return false;
