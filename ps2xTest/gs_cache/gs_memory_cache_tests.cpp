@@ -1,6 +1,9 @@
 #include "gs_test_support.h"
 #include "runtime/gs/ps2_gs_memory.h"
 
+#include <array>
+#include <vector>
+
 using namespace GSTest;
 
 namespace
@@ -82,6 +85,48 @@ namespace
         cache.Invalidate();
         expectEqual(GSMem::ReadTexture(cache, f.vram.data(), GS_PSM_CT32, 31, 2, 8, 0), kGreen, "alias after flush");
     }
+    // The spare slot: a page copied earlier is reused only while no write to it is stamped or
+    // pending. Writes here are made behind the cache's back to show which copy a read returns.
+    void spareSlotReuse()
+    {
+        std::vector<uint8_t> vram(4u * 1024u * 1024u, 0u);
+        std::array<uint64_t, 512> stamps{};
+        std::array<uint64_t, 8> pending{};
+        uint64_t writeStamp = 1u;
+        GSMem::TexturePageCache cache;
+        cache.SetWriteTracking(stamps.data(), &writeStamp);
+        constexpr uint32_t kPage = GSMem::TexturePageCache::kPageSize;
+        const auto read = [&](uint32_t page) { return uint32_t(*cache.Resolve(vram.data(), page * kPage + 5u)); };
+        const auto stamp = [&](uint32_t page) { stamps[page] = ++writeStamp; };
+        vram[0u * kPage + 5u] = 1u;
+        vram[1u * kPage + 5u] = 2u;
+        expectEqual(read(0), 1u, "first load");
+        expectEqual(read(1), 2u, "second page into the spare slot");
+        vram[0u * kPage + 5u] = 9u;
+        expectEqual(read(0), 1u, "unwritten page: the earlier copy is reused");
+        stamp(0);
+        expectEqual(read(1), 2u, "other page still reused");
+        expectEqual(read(0), 9u, "stamped write: copied again");
+        vram[1u * kPage + 5u] = 7u;
+        pending[0] = 1ull << 1u;
+        cache.SetPendingWrites(pending.data());
+        expectEqual(read(1), 7u, "pending write: copied again");
+        cache.SetPendingWrites(nullptr);
+        vram[1u * kPage + 5u] = 8u;
+        cache.Invalidate();
+        expectEqual(read(1), 7u, "after Invalidate the current slot is reused when unwritten");
+        stamp(1);
+        cache.Invalidate();
+        expectEqual(read(1), 8u, "after Invalidate a stamped page is copied again");
+        vram[1u * kPage + 5u] = 3u;
+        vram[0u * kPage + 5u] = 4u;
+        cache.InvalidateAll();
+        expectEqual(read(1), 3u, "InvalidateAll drops the current slot");
+        expectEqual(read(0), 4u, "InvalidateAll drops the spare slot");
+        expectEqual(read(5), 0u, "third page evicts the older slot");
+        vram[1u * kPage + 5u] = 6u;
+        expectEqual(read(1), 6u, "evicted page copied again");
+    }
 }
 
 int main(int argc, char** argv)
@@ -94,6 +139,6 @@ int main(int argc, char** argv)
         {"t4hh", addressCoverage<GS_PSM_T4HH>}, {"z32", addressCoverage<GS_PSM_Z32>},
         {"z24", addressCoverage<GS_PSM_Z24>}, {"z16", addressCoverage<GS_PSM_Z16>},
         {"z16s", addressCoverage<GS_PSM_Z16S>}, {"alias_lanes", aliasLanes},
-        {"physical_tag_aliases", physicalTagAliases}
+        {"physical_tag_aliases", physicalTagAliases}, {"spare_slot_reuse", spareSlotReuse}
     });
 }

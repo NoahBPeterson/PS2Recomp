@@ -490,6 +490,7 @@ GSCpuBackend::GSCpuBackend(uint32_t rasterThreads, bool asyncCommands)
     static std::once_flag lookupTablesOnce;
     std::call_once(lookupTablesOnce, []()
                    { InitLookupTables(); });
+    m_texturePageCache.SetWriteTracking(m_pageWriteStamp.data(), &m_vramWriteStamp);
     for (size_t i = 0; i < kPsmHandlerCount; ++i)
     {
         switch (i)
@@ -993,7 +994,7 @@ void GSCpuBackend::ResetUnlocked()
 {
     m_clut.fill(0u);
     m_clutCbp.fill(0u);
-    m_texturePageCache.Invalidate();
+    m_texturePageCache.InvalidateAll(); // the VRAM buffer may be new
     m_cacheDirty = false;
     m_decodedTextures.clear();
     m_decodedTextureBytes = 0u;
@@ -2949,6 +2950,8 @@ void GSCpuBackend::DrainUnlocked()
         if (!w.touches.empty())
             lastDecodeSeq = std::max(lastDecodeSeq, w.touches.back().seq);
     }
+    if (anyWritten)
+        MarkPagesWritten(written); // before the page cache reloads below, so it sees these writes
     uint32_t lastDirectSeq = 0u;
     const RasterCtx::DirectFetch *lastDirect = nullptr;
     for (uint32_t i = 0; i < par.threadCount; ++i)
@@ -3024,8 +3027,6 @@ void GSCpuBackend::DrainUnlocked()
     {
         m_cacheDirty = true;
     }
-    if (anyWritten)
-        MarkPagesWritten(written);
 
     for (uint32_t i = 0; i < par.threadCount; ++i)
     {
@@ -3319,6 +3320,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     rc.pageCache = &m_texturePageCache;
     rc.curSeq = seq;
     const uint32_t cacheBefore = m_texturePageCache.PageBase();
+    m_texturePageCache.SetPendingWrites(rc.written.data()); // stamped only when the primitive ends
     if (m_parallel && m_parallel->stats)
     {
         const auto t0 = std::chrono::steady_clock::now();
@@ -3327,6 +3329,7 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
     }
     else
         rasterDispatch(rc, batch, ps, ts);
+    m_texturePageCache.SetPendingWrites(nullptr);
     if (rc.anyWritten)
         MarkPagesWritten(rc.written);
     const uint32_t cacheAfter = m_texturePageCache.PageBase();
