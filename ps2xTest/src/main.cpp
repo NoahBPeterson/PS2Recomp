@@ -21,6 +21,10 @@ void register_ps2_runtime_expansion_tests();
 void register_ps2_float_semantics_tests();
 void reset_ps2_test_function_table();
 
+#ifdef PS2X_COVERAGE
+extern "C" int __llvm_profile_write_file(void);
+#endif
+
 int main()
 {
     MiniTest::BeforeEach(reset_ps2_test_function_table);
@@ -45,5 +49,10 @@ int main()
     int res = MiniTest::Run();
     std::cout.flush();
     std::cerr.flush();
+#ifdef PS2X_COVERAGE
+    // std::_Exit skips the atexit hook that writes the coverage profile (tools/conformance/coverage.sh
+    // builds with -fprofile-instr-generate -DPS2X_COVERAGE): write it here.
+    __llvm_profile_write_file();
+#endif
     std::_Exit(res);
 }
