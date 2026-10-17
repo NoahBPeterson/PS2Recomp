@@ -3,12 +3,15 @@
 // state, scheduler, present loop and shutdown working together).
 #include "MiniTest.h"
 #include "game_overrides.h"
+#include "games_database.h"
+#include "ps2_iop_transport.h"
 #include "ps2_iop_host.h"
 #include "ps2_recomp_abi.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "Kernel/Stubs/Pad.h"
+#include "Kernel/Stubs/FileIO.h"
 
 #include <algorithm>
 #include <atomic>
@@ -371,7 +374,9 @@ void register_ps2_runtime_boot_tests()
             };
             std::memset(rdram + 0x00240000u, 0xAA, 0x100);
             const std::string path = dir.write("SLUS_000.00", makeElf(kEntry, segs));
+            setEnv("PS2X_CD_IMAGE", (dir.dir / "disc.iso").string().c_str());
             t.IsTrue(runtime.loadELF(path), "loads");
+            setEnv("PS2X_CD_IMAGE", "");
 
             uint32_t w0 = 0u, w1 = 0u, sp = 0u;
             std::memcpy(&w0, rdram + kEntry, 4u);
@@ -397,6 +402,7 @@ void register_ps2_runtime_boot_tests()
             t.Equals(io.elfDirectory, std::filesystem::path(path).parent_path(), "the ELF's directory");
             t.Equals(io.cdRoot, io.elfDirectory, "cdrom0: is served from the ELF's directory");
             t.Equals(io.mcRoot, io.elfDirectory / "mc0", "mc0: is the ELF directory's mc0");
+            t.Equals(io.cdImage, dir.dir / "disc.iso", "PS2X_CD_IMAGE names the disc image");
             // RDRAM segments end at 0x240100; the guest heap starts past them plus a 4 KiB pad.
             t.Equals(runtime.guestHeapBase(), 0x00241100u, "the guest heap begins after the loaded image");
         });
@@ -566,6 +572,21 @@ void register_ps2_runtime_boot_tests()
             }
         });
 
+        t0.Run("sceCdInit, sceCdInitEeCB and sceCdMmode succeed", [&](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            setA(ctx, 4, 0u); // SCECdINIT
+            ps2_stubs::sceCdInit(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 1, "sceCdInit returns 1");
+            ps2_stubs::sceCdInitEeCB(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 1, "sceCdInitEeCB returns 1");
+            setA(ctx, 4, 2u); // SCECdDVD
+            ps2_stubs::sceCdMmode(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 1, "sceCdMmode returns 1");
+        });
+
         t0.Run("sceCdReadClock: sceCdCLOCK in BCD (stat, second, minute, hour, pad, day, month, year) = local time", [&](TestCase &t)
         {
             PS2Runtime runtime;
@@ -653,6 +674,83 @@ void register_ps2_runtime_boot_tests()
             t.IsTrue((at(5) & l1) && (at(6) & l1) && !(at(7) & l1) && (at(15) & l1) && (at(16) & l1) && !(at(17) & l1) && (at(1005) & l1),
                      "l1 held 2 of every 10 frames from frame 5, forever");
             t.Equals(static_cast<uint32_t>(at(115)), static_cast<uint32_t>(start | l1), "overlapping presses combine");
+        });
+    });
+
+    MiniTest::Case("PS2RuntimeOdds", [](TestCase &tc)
+    {
+        tc.Run("sce* file stubs: open, seek, read, ioctl and close a host0: file", [](TestCase &t)
+        {
+            ElfDir dir;
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            PS2Runtime::IoPaths paths;
+            paths.elfPath = dir.dir / "GAME.ELF";
+            PS2Runtime::setIoPaths(paths);
+            dir.write("data.bin", {10, 11, 12, 13, 14, 15, 16, 17});
+            auto reg = [](R5900Context &c, int r, uint32_t v) { c.r[r] = _mm_set_epi64x(0, static_cast<int64_t>(v)); };
+            auto v0 = [](const R5900Context &c) { return static_cast<int32_t>(_mm_cvtsi128_si32(c.r[2])); };
+            const char path[] = "host0:data.bin";
+            std::memcpy(rdram.data() + 0x4000u, path, sizeof(path));
+            R5900Context ctx{};
+            ps2_stubs::sceFsInit(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 0, "sceFsInit");
+            reg(ctx, 4, 0x4000u);
+            reg(ctx, 5, 1u); // SCE_RDONLY
+            ps2_stubs::sceOpen(rdram.data(), &ctx, &runtime);
+            const int32_t fd = v0(ctx);
+            t.IsTrue(fd >= 0, "sceOpen opens the host file");
+            reg(ctx, 4, static_cast<uint32_t>(fd));
+            reg(ctx, 5, 3u);
+            reg(ctx, 6, 0u); // SEEK_SET
+            ps2_stubs::sceLseek(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 3, "sceLseek to 3");
+            reg(ctx, 4, static_cast<uint32_t>(fd));
+            reg(ctx, 5, 0x5000u);
+            reg(ctx, 6, 4u);
+            ps2_stubs::sceRead(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 4, "sceRead reads 4 bytes");
+            t.IsTrue(rdram[0x5000u] == 13u && rdram[0x5003u] == 16u, "from the seek position");
+            std::memset(rdram.data() + 0x6000u, 0xFF, 4);
+            reg(ctx, 4, static_cast<uint32_t>(fd));
+            reg(ctx, 5, 1u);
+            reg(ctx, 6, 0x6000u);
+            ps2_stubs::sceIoctl(rdram.data(), &ctx, &runtime);
+            uint32_t state = 1u;
+            std::memcpy(&state, rdram.data() + 0x6000u, 4);
+            t.IsTrue(v0(ctx) == 0 && state == 0u, "sceIoctl(fd, 1, &state): I/O is not busy");
+            reg(ctx, 4, static_cast<uint32_t>(fd));
+            ps2_stubs::sceClose(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 0, "sceClose");
+            ps2_stubs::sceFsReset(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 0, "sceFsReset");
+        });
+
+        tc.Run("games database: TC's serial is known, an unknown one is not", [](TestCase &t)
+        {
+            const char *name = getGameName("SLUS-21106");
+            t.IsTrue(name != nullptr && std::string(name).find("True Crime") != std::string::npos, "SLUS-21106 is True Crime: New York City");
+            t.IsTrue(getGameName("SLUS-99999") == nullptr, "an unknown serial has no name");
+        });
+
+        tc.Run("TLBP without a matching entry sets Index.P; clearLLBit drops the LL reservation; IOP transport reset", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "memory initialize");
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            R5900Context ctx{};
+            ctx.cop0_entryhi = 0x7FFFE000u;
+            ctx.cop0_index = 3u;
+            runtime.handleTLBP(rdram.data(), &ctx);
+            t.IsTrue((ctx.cop0_index & 0x80000000u) != 0u, "a probe miss sets Index.P (bit 31)");
+            ctx.llbit = 1;
+            ctx.lladdr = 0x1234u;
+            ps2x_abi::clearLLBit(&runtime, &ctx);
+            t.IsTrue(ctx.llbit == 0 && ctx.lladdr == 0u, "clearLLBit clears the LL bit and address");
+            PS2IopTransport::reset(nullptr);
+            PS2IopTransport::reset(&runtime);
+            PS2IopTransport::notifyTransfer(nullptr, rdram.data(), ps2x::iop::SifTransfer{});
+            t.IsTrue(PS2IopTransport::canBindRpc(nullptr, 0x80001300u), "without a runtime every RPC binds");
         });
     });
 }

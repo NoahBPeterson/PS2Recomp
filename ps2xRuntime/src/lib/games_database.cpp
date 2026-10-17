@@ -717,6 +717,7 @@ static const std::unordered_map<std::string, std::string> gameDatabase =
     { "SLUS-20149", "Tribes - Aerial Assault (USA)" },
     { "SLUS-20931", "Trigger Man (USA)" },
     { "SLUS-20168", "Triple Play Baseball (USA)" },
+    { "SLUS-21106", "True Crime - New York City (USA)" },
     { "SLPS-20196", "Tsuki no Hikari - Shizumeru Kane no Satsujin (Japan)" },
     { "SCES-50360", "Twisted Metal - Black (Europe)" },
     { "SCUS-97101", "Twisted Metal - Black (USA)" },
