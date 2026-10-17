@@ -7,7 +7,7 @@
 // wrote elsewhere.
 //
 // usage: ps2x_ee_oracle <vectors.bin> <TC2.ELF> [--func NAME] [--case N] [-v] [--ulp N] [--strict]
-//                       [--examples N] [--known FILE]
+//                       [--examples N] [--known FILE] [--case-timeout-ms MS]
 //
 // Each case lands in one class:
 //   exact    bit-identical
@@ -18,6 +18,8 @@
 //   LOGIC    non-float differences only: a codegen/semantics bug. Exit status 1 when any occur.
 // --strict makes every non-exact case fail (implied for runtime-model vectors). --known lists recorded bugs
 // (function + exact failing-case count) that do not fail the run while the count is unchanged.
+// A case that has not returned after --case-timeout-ms (default 2000; POSIX hosts) is stopped and counts
+// as LOGIC: a runaway loop the oracle did not take.
 // The last line of output is a one-line verdict.
 
 #include "ee_oracle_inputs.h"
@@ -37,6 +39,13 @@
 #include <string>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <csetjmp>
+#include <csignal>
+#include <sys/time.h>
+#define EE_ORACLE_WATCHDOG 1
+#endif
+
 using RecompiledFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 
 #ifndef EE_ORACLE_WIDE
@@ -45,6 +54,27 @@ using RecompiledFn = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 
 namespace
 {
+#ifdef EE_ORACLE_WATCHDOG
+    // Per-case watchdog: the recompiled code has no back-edge hook, so a case that the PS2 arithmetic sends
+    // into a loop the oracle never took cannot be stopped from inside. SIGALRM leaves it with siglongjmp; the
+    // case is then reported as not having returned. The interrupted code is pure generated code on this
+    // single thread, and every case starts from a fresh context and RAM image.
+    sigjmp_buf g_caseEscape;
+    volatile sig_atomic_t g_caseArmed = 0;
+    void onCaseTimeout(int)
+    {
+        if (g_caseArmed)
+            siglongjmp(g_caseEscape, 1);
+    }
+    void armCaseTimer(long ms)
+    {
+        itimerval tv{};
+        tv.it_value.tv_sec = ms / 1000;
+        tv.it_value.tv_usec = (ms % 1000) * 1000;
+        setitimer(ITIMER_REAL, &tv, nullptr);
+    }
+#endif
+
     using namespace ee_oracle;
 
     struct Reader
@@ -385,7 +415,7 @@ int main(int argc, char **argv)
 {
     if (argc < 3)
     {
-        std::fprintf(stderr, "usage: %s <vectors.bin> <TC2.ELF> [--func NAME] [--case N] [-v] [--ulp N] [--strict] [--examples N]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <vectors.bin> <TC2.ELF> [--func NAME] [--case N] [-v] [--ulp N] [--strict] [--examples N] [--case-timeout-ms MS]\n", argv[0]);
         return 2;
     }
     std::string onlyFunc;
@@ -396,6 +426,7 @@ int main(int argc, char **argv)
     bool verbose = false, strict = false, quiet = false;
     uint32_t tol = 4;
     int examples = 2;
+    long caseTimeoutMs = 2000; // --case-timeout-ms: wall-clock budget per case (POSIX hosts)
     for (int i = 3; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -415,6 +446,8 @@ int main(int argc, char **argv)
             knownAnyCount = true;
         else if (a == "--quiet")
             quiet = true; // one line per function only when it is not clean
+        else if (a == "--case-timeout-ms" && i + 1 < argc)
+            caseTimeoutMs = std::strtol(argv[++i], nullptr, 0);
         else if (a == "--ulp" && i + 1 < argc)
             tol = (uint32_t)std::strtoul(argv[++i], nullptr, 0);
         else if (a == "--examples" && i + 1 < argc)
@@ -438,6 +471,9 @@ int main(int argc, char **argv)
         }
     }
 
+#ifdef EE_ORACLE_WATCHDOG
+    std::signal(SIGALRM, onCaseTimeout);
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<uint8_t> vec = readFile(argv[1]);
     const std::vector<uint8_t> elf = readFile(argv[2]);
@@ -548,8 +584,20 @@ int main(int argc, char **argv)
             toContext(in.st, *ctx);
             ctx->pc = fv.addr;
             fn = entryFn; // the dispatch loop below moves fn along the call graph
-            bool returned = false;
-            uint32_t lostAt = 0;
+            volatile bool returned = false;
+            volatile uint32_t lostAt = 0;
+            volatile bool timedOut = false;
+#ifdef EE_ORACLE_WATCHDOG
+            if (sigsetjmp(g_caseEscape, 1) != 0)
+            {
+                g_caseArmed = 0;
+                timedOut = true;
+            }
+            else
+            {
+                g_caseArmed = 1;
+                armCaseTimer(caseTimeoutMs);
+#endif
             for (int iter = 0; iter < 1000000; ++iter)
             {
 #ifdef EE_ORACLE_WIDE
@@ -573,12 +621,19 @@ int main(int argc, char **argv)
                     break;
                 }
             }
+#ifdef EE_ORACLE_WATCHDOG
+                g_caseArmed = 0;
+                armCaseTimer(0);
+            }
+#endif
 
             Diffs d;
             d.tol = tol;
             d.verbose = verbose;
-            if (lostAt)
-                d.note(false, "no recompiled function at pc %08x (missing from the function map?)", lostAt);
+            if (timedOut)
+                d.note(false, "did not return within %ld ms (pc %08x): a runaway loop", caseTimeoutMs, ctx->pc);
+            else if (lostAt)
+                d.note(false, "no recompiled function at pc %08x (missing from the function map?)", (uint32_t)lostAt);
             else if (!returned)
                 d.note(false, "did not return to ra (pc %08x after 1e6 re-entries)", ctx->pc);
             compareStates(expect, fromContext(*ctx), d);
