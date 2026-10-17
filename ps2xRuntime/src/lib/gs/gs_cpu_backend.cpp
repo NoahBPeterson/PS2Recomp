@@ -1999,6 +1999,42 @@ namespace
 
     // ---- primitives ----
 
+    // GS sprite rules, as PCSX2's GSRasterizer::DrawSprite: corners in 12.4 window coordinates,
+    // the pixels with integer coordinates in [ceil(min), ceil(max)) on each axis (pixel centres
+    // are integers, so a sprite from 0 to 16 covers pixels 0..15), cut by the scissor. Each axis is
+    // sorted on its own (drawSprite carries that axis's texture coordinate along). Also the exact
+    // pixel bounds the parallel scheduler uses for sprites.
+    struct SpriteRect
+    {
+        float lx, rx, ty, by; // sorted corners
+        bool swapX, swapY;    // whether vertex 1 is the left / top one
+        int left, top, right, bottom;
+        bool empty() const { return left >= right || top >= bottom; }
+    };
+
+    SpriteRect spriteRect(const GSPrimitiveBatch &batch)
+    {
+        const auto &ctx = batch.state.context;
+        const GSVertex &v0 = batch.vertices[0];
+        const GSVertex &v1 = batch.vertices[1];
+        const float px0 = static_cast<float>(static_cast<int>(v0.x * 16.0f) - static_cast<int>(ctx.xyoffset.ofx)) / 16.0f;
+        const float py0 = static_cast<float>(static_cast<int>(v0.y * 16.0f) - static_cast<int>(ctx.xyoffset.ofy)) / 16.0f;
+        const float px1 = static_cast<float>(static_cast<int>(v1.x * 16.0f) - static_cast<int>(ctx.xyoffset.ofx)) / 16.0f;
+        const float py1 = static_cast<float>(static_cast<int>(v1.y * 16.0f) - static_cast<int>(ctx.xyoffset.ofy)) / 16.0f;
+        SpriteRect r;
+        r.swapX = !(px0 < px1);
+        r.swapY = !(py0 < py1);
+        r.lx = r.swapX ? px1 : px0;
+        r.rx = r.swapX ? px0 : px1;
+        r.ty = r.swapY ? py1 : py0;
+        r.by = r.swapY ? py0 : py1;
+        r.left = std::max(static_cast<int>(std::ceil(r.lx)), static_cast<int>(ctx.scissor.x0));
+        r.top = std::max(static_cast<int>(std::ceil(r.ty)), static_cast<int>(ctx.scissor.y0));
+        r.right = std::min(static_cast<int>(std::ceil(r.rx)), static_cast<int>(ctx.scissor.x1) + 1);
+        r.bottom = std::min(static_cast<int>(std::ceil(r.by)), static_cast<int>(ctx.scissor.y1) + 1);
+        return r;
+    }
+
     template <class W>
     void drawSprite(RasterCtx &rc, const GSPrimitiveBatch &batch, const PixelSetup &ps, const TexSetup &ts)
     {
@@ -2007,15 +2043,9 @@ namespace
         const GSVertex &v1 = batch.vertices[1];
         const auto &ctx = state.context;
 
-        // GS sprite rules, as PCSX2's GSRasterizer::DrawSprite: corners in 12.4 window
-        // coordinates, the pixels with integer coordinates in [ceil(min), ceil(max)) on each axis
-        // (pixel centres are integers, so a sprite from 0 to 16 covers pixels 0..15), and the
-        // texture coordinate interpolated to each pixel's integer position. Each axis is sorted on
-        // its own, carrying that axis's texture coordinate along.
-        const float px0 = static_cast<float>(static_cast<int>(v0.x * 16.0f) - static_cast<int>(ctx.xyoffset.ofx)) / 16.0f;
-        const float py0 = static_cast<float>(static_cast<int>(v0.y * 16.0f) - static_cast<int>(ctx.xyoffset.ofy)) / 16.0f;
-        const float px1 = static_cast<float>(static_cast<int>(v1.x * 16.0f) - static_cast<int>(ctx.xyoffset.ofx)) / 16.0f;
-        const float py1 = static_cast<float>(static_cast<int>(v1.y * 16.0f) - static_cast<int>(ctx.xyoffset.ofy)) / 16.0f;
+        // Pixels as spriteRect; the texture coordinate is interpolated to each pixel's integer
+        // position.
+        const SpriteRect rect = spriteRect(batch);
         u32 z1 = static_cast<u32>(v1.z);
 
         // Texture coordinates in 16.16 texels (as floats). STQ sprites divide by the second
@@ -2040,23 +2070,11 @@ namespace
             }
         }
 
-        float lx = px0, rx = px1, lu = tu0, ru = tu1;
-        if (!(px0 < px1))
-        {
-            lx = px1; rx = px0; lu = tu1; ru = tu0;
-        }
-        float ty = py0, by = py1, tv = tv0, bv = tv1;
-        if (!(py0 < py1))
-        {
-            ty = py1; by = py0; tv = tv1; bv = tv0;
-        }
-
-        // [left, right) x [top, bottom), cut by the scissor (inclusive bounds).
-        const int left = std::max(static_cast<int>(std::ceil(lx)), static_cast<int>(ctx.scissor.x0));
-        const int top = std::max(static_cast<int>(std::ceil(ty)), static_cast<int>(ctx.scissor.y0));
-        const int right = std::min(static_cast<int>(std::ceil(rx)), static_cast<int>(ctx.scissor.x1) + 1);
-        const int bottom = std::min(static_cast<int>(std::ceil(by)), static_cast<int>(ctx.scissor.y1) + 1);
-        if (left >= right || top >= bottom)
+        const float lx = rect.lx, rx = rect.rx, ty = rect.ty, by = rect.by;
+        const float lu = rect.swapX ? tu1 : tu0, ru = rect.swapX ? tu0 : tu1;
+        const float tv = rect.swapY ? tv1 : tv0, bv = rect.swapY ? tv0 : tv1;
+        const int left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom;
+        if (rect.empty())
             return;
 
         uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
@@ -3157,7 +3175,17 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         const bool zAccess = ps.ztestMethod >= 2u || ps.zwrite;
 
         int bx0, by0, bx1, by1;
-        primitiveBounds(batch, bx0, by0, bx1, by1);
+        if (state.prim.type == GS_PRIM_SPRITE)
+        {
+            // Exactly the pixels drawSprite draws (none: an empty range).
+            const SpriteRect rect = spriteRect(batch);
+            bx0 = rect.left;
+            by0 = rect.top;
+            bx1 = rect.empty() ? rect.left - 1 : rect.right - 1;
+            by1 = rect.empty() ? rect.top - 1 : rect.bottom - 1;
+        }
+        else
+            primitiveBounds(batch, bx0, by0, bx1, by1);
         PageSet fbPages{}, zPages{}, texPages{};
         addBufferPages(fbPages, ps.fbMark, bx0, by0, bx1, by1);
         if (zAccess)
