@@ -22,11 +22,12 @@ namespace
     constexpr int KE_NOT_DORMANT = -414;
     constexpr int KE_NOT_SUSPEND = -415;
     constexpr int KE_NOT_WAIT = -416;
-    constexpr int KE_RELEASE_WAIT = -418;
+    // What a blocked EE call returns when ReleaseWaitThread or deleting the object ends the
+    // wait: the EE kernel returns -1 for both (the IOP uses -418 and -425).
+    constexpr int KE_RELEASE_WAIT = -1;
     constexpr int KE_SEMA_ZERO = -419;
-    constexpr int KE_SEMA_OVF = -420;
     constexpr int KE_EVF_COND = -421;
-    constexpr int KE_WAIT_DELETE = -425;
+    constexpr int KE_WAIT_DELETE = -1;
 
     constexpr uint32_t WEF_OR = 0x01u;
     constexpr uint32_t WEF_CLEAR = 0x10u;
@@ -96,17 +97,24 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_nextThreadId = kFirstThreadId;
     m_nextInvocationThreadId = -1;
     m_kernelEventThreadId = 0;
-    m_nextSemaphoreId = 1;
+    m_freeSemaphoreIds.clear();
+    for (int id = kSemaphoreCount - 1; id >= 0; --id)
+    {
+        m_freeSemaphoreIds.push_back(id);
+    }
     m_nextEventFlagId = 1;
-    m_nextAlarmId = 1;
-    m_nextIntcHandlerId = 1;
-    m_nextDmacHandlerId = 1;
+    m_freeIrqHandlerIds.clear();
+    for (int id = 1; id <= kIrqHandlerCount; ++id)
+    {
+        m_freeIrqHandlerIds.push_back(id);
+    }
+    m_irqHandlerCounts = {};
     m_intcHeadOrder = 0;
     m_intcTailOrder = 1000;
     m_dmacHeadOrder = 0;
     m_dmacTailOrder = 1000;
-    m_enabledIntcMask = 0xFFFFFFFFu;
-    m_enabledDmacMask = 0xFFFFFFFFu;
+    m_enabledIntcMask = kBootIntcMask;
+    m_enabledDmacMask = kBootDmacMask;
     m_pendingIntcMask = 0u;
     m_pendingDmacMask = 0u;
     m_currentThreadId = 0;
@@ -477,11 +485,8 @@ int EeScheduler::initThread()
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
-    {
-        return KE_ILLEGAL_PRIORITY;
-    }
-
+    // The EE kernel does not check the priority here (0, 128 and -1 are all accepted); ready
+    // queues clamp it, see readyQueue().
     const int id = allocateThreadId();
     if (id == 0)
     {
@@ -628,6 +633,11 @@ int EeScheduler::suspendThread(int id, bool interruptSafe)
         return KE_DORMANT;
     }
 
+    // The EE kernel does not nest suspensions: suspending a suspended thread fails.
+    if (target->status == EeThreadStatus::Suspended || target->status == EeThreadStatus::WaitingSuspended)
+    {
+        return KE_ERROR;
+    }
     ++target->suspendCount;
     switch (target->status)
     {
@@ -699,7 +709,7 @@ void EeScheduler::sleepCurrent()
     if (self->wakeupCount != 0u)
     {
         --self->wakeupCount;
-        setReturnS32(&self->activeContext(), KE_OK);
+        setReturnS32(&self->activeContext(), self->id);
         return;
     }
     blockCurrent(EeWaitState{EeWaitReason::Sleep, std::monostate{}});
@@ -724,7 +734,7 @@ int EeScheduler::wakeupThread(int id, bool interruptSafe)
     if ((target->status == EeThreadStatus::Waiting || target->status == EeThreadStatus::WaitingSuspended) &&
         target->wait.reason == EeWaitReason::Sleep)
     {
-        makeReady(*target, KE_OK, interruptSafe);
+        makeReady(*target, target->id, interruptSafe);
     }
     else
     {
@@ -755,7 +765,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -767,6 +777,10 @@ int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &o
     if (!target)
     {
         return KE_UNKNOWN_THID;
+    }
+    if (target->status == EeThreadStatus::Dormant)
+    {
+        return KE_DORMANT;
     }
     oldPriority = target->currentPriority;
     if (target->status == EeThreadStatus::Ready)
@@ -817,7 +831,7 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
     }
     else
     {
-        auto &queue = m_readyQueues[priority];
+        auto &queue = readyQueue(priority);
         if (queue.size() > 1u)
         {
             const int head = queue.front();
@@ -875,15 +889,13 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
 {
     assertExecutor();
-    if (maxCount <= 0 || initCount < 0 || initCount > maxCount)
+    // The EE kernel takes the counts as given (init > max and max 0 are accepted).
+    if (m_freeSemaphoreIds.empty())
     {
         return KE_ERROR;
     }
-    const int id = allocatePositiveId(m_nextSemaphoreId, m_semaphores);
-    if (id == 0)
-    {
-        return KE_ERROR;
-    }
+    const int id = m_freeSemaphoreIds.back();
+    m_freeSemaphoreIds.pop_back();
     EeSemaphore semaphore{};
     semaphore.id = id;
     semaphore.count = initCount;
@@ -906,6 +918,7 @@ int EeScheduler::deleteSemaphore(int id, bool interruptSafe)
     }
     std::deque<int> waiters = std::move(it->second.waiters);
     m_semaphores.erase(it);
+    m_freeSemaphoreIds.push_back(id);
     for (const int threadId : waiters)
     {
         if (GuestThread *waiter = thread(threadId))
@@ -935,10 +948,7 @@ int EeScheduler::signalSemaphore(int id, bool interruptSafe)
         publishSnapshot();
         return id;
     }
-    if (object->count == object->maxCount)
-    {
-        return KE_SEMA_OVF;
-    }
+    // No max_count check: the EE kernel counts past it.
     ++object->count;
     publishSnapshot();
     return id;
@@ -967,9 +977,11 @@ void EeScheduler::waitSemaphore(int id)
     EeSemaphore *object = semaphore(id);
     if (!object)
     {
+        // The EE kernel only rejects a negative ID. Any other ID with no live semaphore (deleted, never
+        // used, even 256) returns that ID at once without blocking (measured with eek).
         GuestThread *self = currentThread();
         assert(self != nullptr);
-        setReturnS32(&self->activeContext(), KE_UNKNOWN_SEMID);
+        setReturnS32(&self->activeContext(), id < 0 ? KE_ERROR : id);
         return;
     }
     if (object->count != 0)
@@ -1122,8 +1134,13 @@ int EeScheduler::setAlarm(uint16_t ticks,
     {
         return KE_ERROR;
     }
-    const int id = allocatePositiveId(m_nextAlarmId, m_alarms);
-    if (id == 0)
+    // The EE kernel hands out the lowest free alarm ID (measured with eek).
+    int id = 0;
+    while (id < kAlarmCount && m_alarms.count(id) != 0u)
+    {
+        ++id;
+    }
+    if (id == kAlarmCount)
     {
         return KE_ERROR;
     }
@@ -1138,6 +1155,8 @@ int EeScheduler::setAlarm(uint16_t ticks,
 int EeScheduler::cancelAlarm(int id)
 {
     assertExecutor();
+    // Only the low six bits of the ID count: ReleaseAlarm(64) releases alarm 0 (measured with eek).
+    id &= kAlarmCount - 1;
     if (m_alarms.erase(id) == 0u)
     {
         return KE_ERROR;
@@ -1243,13 +1262,18 @@ int EeScheduler::addIrqHandler(bool dmac,
                                uint32_t sp)
 {
     assertExecutor();
-    auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
-    int &nextId = dmac ? m_nextDmacHandlerId : m_nextIntcHandlerId;
-    const int id = allocatePositiveId(nextId, handlers);
-    if (id == 0)
+    if (cause >= kIrqCauseCount)
     {
         return KE_ERROR;
     }
+    auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
+    if (m_freeIrqHandlerIds.empty())
+    {
+        return KE_ERROR;
+    }
+    const int id = m_freeIrqHandlerIds.front();
+    m_freeIrqHandlerIds.pop_front();
+    ++m_irqHandlerCounts[dmac ? 1 : 0][cause];
     int &head = dmac ? m_dmacHeadOrder : m_intcHeadOrder;
     int &tail = dmac ? m_dmacTailOrder : m_intcTailOrder;
     handlers.emplace(id,
@@ -1267,34 +1291,54 @@ int EeScheduler::addIrqHandler(bool dmac,
 int EeScheduler::removeIrqHandler(bool dmac, uint32_t cause, int id)
 {
     assertExecutor();
+    if (cause >= kIrqCauseCount)
+    {
+        return KE_ERROR;
+    }
+    // The ID may belong to either controller and any cause; see m_freeIrqHandlerIds.
+    if (m_intcHandlers.erase(id) == 0u && m_dmacHandlers.erase(id) == 0u)
+    {
+        return KE_ERROR;
+    }
+    m_freeIrqHandlerIds.push_back(id);
+    return --m_irqHandlerCounts[dmac ? 1 : 0][cause];
+}
+
+int EeScheduler::setIrqHandlerEnabled(bool dmac, uint32_t cause, int id, bool enabled)
+{
+    assertExecutor();
+    // Measured with eek: only a negative cause fails; any other cause (even 64) is echoed back.
+    if (static_cast<int32_t>(cause) < 0)
+    {
+        return KE_ERROR;
+    }
     auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
     auto it = handlers.find(id);
     if (it != handlers.end() && it->second.cause == cause)
     {
-        handlers.erase(it);
-    }
-    return KE_OK;
-}
-
-int EeScheduler::setIrqHandlerEnabled(bool dmac, int id, bool enabled)
-{
-    assertExecutor();
-    auto &handlers = dmac ? m_dmacHandlers : m_intcHandlers;
-    auto it = handlers.find(id);
-    if (it != handlers.end())
-    {
         it->second.enabled = enabled;
     }
-    return KE_OK;
+    // The EE kernel returns the cause, even for an unknown handler ID.
+    return static_cast<int>(cause);
 }
 
 int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
 {
     assertExecutor();
-    if (cause < 32u)
+    // The EE kernel returns 1 when the call changed the mask and 0 when it did not.
+    // It uses only the low five bits of the cause: EnableIntc(64) enables cause 0, EnableIntc(-1) cause 31.
+    // Only mask bits 0..15 exist; a higher bit always reads 0, so enabling one "changes" it every time
+    // and disabling it never does (measured with eek for both INTC and DMAC).
+    cause &= 31u;
+    if (cause >= 16u)
+    {
+        return enabled ? 1 : 0;
+    }
+    int changed = 0;
     {
         uint32_t &mask = dmac ? m_enabledDmacMask : m_enabledIntcMask;
         uint32_t &pending = dmac ? m_pendingDmacMask : m_pendingIntcMask;
+        changed = ((mask >> cause) & 1u) != (enabled ? 1u : 0u) ? 1 : 0;
         if (enabled)
         {
             mask |= 1u << cause;
@@ -1309,7 +1353,7 @@ int EeScheduler::setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled)
             mask &= ~(1u << cause);
         }
     }
-    return KE_OK;
+    return changed;
 }
 
 void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
@@ -1649,9 +1693,8 @@ GuestThread &EeScheduler::acquireInvocationThread()
 
 void EeScheduler::enqueueReady(GuestThread &item, bool front)
 {
-    assert(item.currentPriority >= 0 && item.currentPriority < kPriorityCount);
     item.status = EeThreadStatus::Ready;
-    auto &queue = m_readyQueues[item.currentPriority];
+    auto &queue = readyQueue(item.currentPriority);
     if (front)
     {
         queue.push_front(item.id);
@@ -1668,7 +1711,7 @@ void EeScheduler::removeReady(GuestThread &item)
     {
         return;
     }
-    auto &queue = m_readyQueues[item.currentPriority];
+    auto &queue = readyQueue(item.currentPriority);
     auto it = std::find(queue.begin(), queue.end(), item.id);
     assert(it != queue.end());
     queue.erase(it);
@@ -1706,10 +1749,13 @@ void EeScheduler::makeDormant(GuestThread &item)
     removeReady(item);
     removeFromWaitObject(item);
     item.status = EeThreadStatus::Dormant;
+    // A dormant thread reports its initial priority again (measured with eek).
+    item.currentPriority = item.initialPriority;
     item.wait = {};
     item.resumeCompletion = {};
     item.suspendCount = 0;
-    item.wakeupCount = 0;
+    // Exiting or being terminated keeps the wakeup count; StartThread clears it (the kernel reports a
+    // dormant thread's leftover wakeups, measured with eek).
     item.invocations.clear();
 }
 
@@ -1748,6 +1794,10 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     GuestThread *self = currentThread();
     assert(self != nullptr);
     self->wait = std::move(wait);
+    if (self->wait.reason == EeWaitReason::Semaphore || self->wait.reason == EeWaitReason::EventFlag)
+    {
+        self->lastWaitObjectId = waitObjectId(self->wait);
+    }
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
@@ -2156,6 +2206,11 @@ void EeScheduler::updateNextDeadline()
                                          return left.sequence < right.sequence;
                                      });
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
+}
+
+std::deque<int> &EeScheduler::readyQueue(int priority)
+{
+    return m_readyQueues[static_cast<size_t>(std::clamp(priority, 0, kPriorityCount - 1))];
 }
 
 bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const

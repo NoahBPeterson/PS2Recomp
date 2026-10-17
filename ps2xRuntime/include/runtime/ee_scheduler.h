@@ -118,6 +118,9 @@ struct GuestThread
     EeThreadStatus status = EeThreadStatus::Dormant;
     int suspendCount = 0;
     uint32_t wakeupCount = 0;
+    // The semaphore or event flag this thread last blocked on. The EE kernel never clears it: a thread
+    // that has exited still reports it as waitId (measured with eek).
+    int lastWaitObjectId = 0;
     bool ownsStack = false;
     uint32_t tlsBase = 0;
     EeWaitState wait{};
@@ -262,6 +265,11 @@ public:
     static constexpr int kMainThreadId = 1;
     static constexpr int kFirstThreadId = 2;
     static constexpr int kLastThreadId = 255;
+    static constexpr int kSemaphoreCount = 256;
+    static constexpr int kAlarmCount = 64;
+    // AddIntcHandler/AddDmacHandler reject causes 64 and -1; causes 32..63 are unmeasured.
+    static constexpr uint32_t kIrqCauseCount = 32;
+    static constexpr int kIrqHandlerCount = 128;
     static constexpr int kPriorityCount = 128;
     static constexpr uint64_t kEeClockHz = 294912000ull;
     static constexpr uint32_t kGeneratedCheckpointCycles = 32u;
@@ -336,7 +344,7 @@ public:
                       uint32_t gp,
                       uint32_t sp);
     int removeIrqHandler(bool dmac, uint32_t cause, int id);
-    int setIrqHandlerEnabled(bool dmac, int id, bool enabled);
+    int setIrqHandlerEnabled(bool dmac, uint32_t cause, int id, bool enabled);
     int setIrqCauseEnabled(bool dmac, uint32_t cause, bool enabled);
     void dispatchIrq(bool dmac, uint32_t cause);
     void setVSyncFlag(uint32_t flagAddress, uint32_t tickAddress);
@@ -400,6 +408,8 @@ private:
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
+    // Priorities outside 0..127 (which CreateThread accepts) share the nearest end queue.
+    std::deque<int> &readyQueue(int priority);
     void renewTimeSlice();
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
@@ -417,17 +427,25 @@ private:
     int m_nextThreadId = kFirstThreadId;
     int m_nextInvocationThreadId = -1;
     int m_kernelEventThreadId = 0;
-    int m_nextSemaphoreId = 1;
+    // Free semaphore IDs; the next one handed out is at the back. The EE kernel numbers
+    // semaphores from 0 and reuses the most recently deleted ID first.
+    std::vector<int> m_freeSemaphoreIds;
     int m_nextEventFlagId = 1;
-    int m_nextAlarmId = 1;
-    int m_nextIntcHandlerId = 1;
-    int m_nextDmacHandlerId = 1;
+    // INTC and DMAC handlers share one pool of IDs 1..kIrqHandlerCount, handed out in order; a freed ID
+    // goes to the back of the queue. Remove*Handler frees any valid ID, whatever its kind or cause, then
+    // decrements and returns the counter of the cause it was given (all measured with eek).
+    std::deque<int> m_freeIrqHandlerIds;
+    std::array<std::array<int, kIrqCauseCount>, 2> m_irqHandlerCounts{};
     int m_intcHeadOrder = 0;
     int m_intcTailOrder = 1000;
     int m_dmacHeadOrder = 0;
     int m_dmacTailOrder = 1000;
-    uint32_t m_enabledIntcMask = 0xFFFFFFFFu;
-    uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+    // What the BIOS leaves enabled for a booted ELF: INTC 1 (SBUS) and 12 (TIMER3), DMAC 7
+    // (SIF2). Measured by the mask scan in tools/conformance/ee_kernel.
+    static constexpr uint32_t kBootIntcMask = (1u << 1) | (1u << 12);
+    static constexpr uint32_t kBootDmacMask = 1u << 7;
+    uint32_t m_enabledIntcMask = kBootIntcMask;
+    uint32_t m_enabledDmacMask = kBootDmacMask;
     // Causes raised while masked, delivered on re-enable (INTC_STAT/D_STAT).
     uint32_t m_pendingIntcMask = 0u;
     uint32_t m_pendingDmacMask = 0u;

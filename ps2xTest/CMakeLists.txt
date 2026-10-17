@@ -10,6 +10,7 @@ if(BUILD_TESTING)
     add_subdirectory(gs_cache)
 endif()
 add_subdirectory(ee_oracle)
+add_subdirectory(ee_kernel)
 
 # Static library with test logic (no main), used by ps2xStudio
 add_library(ps2_test_function_table OBJECT

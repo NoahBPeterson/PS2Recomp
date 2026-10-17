@@ -153,9 +153,12 @@ namespace ps2_syscalls
         }
 #endif
 
+        // EE semaphore IDs start at 0; kNoCompletionSema (-1) means there is none.
+        constexpr uint32_t kNoCompletionSema = 0xFFFFFFFFu;
+
         bool signalRpcCompletionSema(PS2Runtime *runtime, uint32_t semaId)
         {
-            if (!runtime || semaId == 0u || semaId > 0xFFFFu)
+            if (!runtime || semaId == kNoCompletionSema || semaId > 0xFFFFu)
             {
                 return false;
             }
@@ -538,9 +541,11 @@ namespace ps2_syscalls
 
         ps2x::iop::RpcResult iopResult{};
         uint32_t completionSemaphore = static_cast<uint32_t>(client->hdr.sema_id);
-        if (completionSemaphore == 0xFFFFFFFFu || completionSemaphore == 0u)
+        if (completionSemaphore == kNoCompletionSema)
         {
-            completionSemaphore = endParameter;
+            // Without a client semaphore, fall back to the end-callback argument; an argument
+            // of 0 still means none (as before sema IDs started at 0).
+            completionSemaphore = endParameter != 0u ? endParameter : kNoCompletionSema;
         }
 
         {

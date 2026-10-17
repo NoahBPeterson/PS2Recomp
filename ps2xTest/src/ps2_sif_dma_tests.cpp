@@ -147,6 +147,7 @@ namespace
                                              kSchedulerSifDmaHandlerArg,
                                              0u,
                                              0u);
+        runtime->eeScheduler().setIrqCauseEnabled(true, 5u, true);
         setRegU32(*ctx, 4, kSchedulerSifDmaDescAddr);
         setRegU32(*ctx, 5, 1u);
         ctx->pc = kSchedulerSifDmaResumePc;
