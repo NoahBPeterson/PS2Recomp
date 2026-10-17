@@ -296,6 +296,16 @@ void register_ps2_vu1_tests()
             const uint32_t mscal4 = makeVifCmd(0x14u, 0u, 0x0004u);
             mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscal4), sizeof(mscal4));
             t.Equals(runtime.cpu().vu0_vpu_stat & 0x0600u, 0x0200u, "a D-bit stop sets VPU_STAT.DBS");
+
+            // MSCNT continues after the D-bit pair, through the runtime's resume hook, to the E bit.
+            const float marker[4] = {7.0f, 7.0f, 7.0f, 7.0f};
+            writeVuQword(mem.getVU1Data(), 9u, marker);
+            uploadVu1Mpg(mem, 5u, makeVuSq(0xFu, 0u, 0u, 9), kVuUpperNop); // data[9] = vf0
+            const uint32_t mscnt = makeVifCmd(0x17u, 0u, 0u);
+            mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscnt), sizeof(mscnt));
+            readVuQword(mem.getVU1Data(), 9u, out);
+            t.IsTrue(out[0] == 0.0f && out[3] == 1.0f, "MSCNT resumed the program after its D-bit stop");
+            t.Equals(runtime.cpu().vu0_vpu_stat & 0x0600u, 0u, "and its E-bit end clears VPU_STAT.DBS");
         });
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {

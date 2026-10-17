@@ -4,9 +4,24 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace ps2_stubs
 {
+    // PS2X_PAD_SCRIPT="name@frame+dur[*period],..." holds a port-0 button from host frame `frame`
+    // for `dur` frames, repeating every `period` frames if given. Names: start select cross circle
+    // square triangle up down left right l1 r1 l2 r2 l3 r3.
+    struct PadScriptPress
+    {
+        uint16_t mask = 0u;
+        uint32_t frame = 0u;
+        uint32_t duration = 1u;
+        uint32_t period = 0u;
+    };
+    uint16_t padButtonByName(const std::string &name); // the button's bit (kPadBtn*), 0 if unknown
+    std::vector<PadScriptPress> parsePadScript(const std::string &spec);
+    uint16_t padScriptButtonsAt(const std::vector<PadScriptPress> &script, uint32_t frame); // buttons held
     void PadSyncCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void scePadEnterPressMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

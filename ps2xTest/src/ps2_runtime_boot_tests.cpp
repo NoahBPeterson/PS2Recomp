@@ -4,9 +4,11 @@
 #include "MiniTest.h"
 #include "game_overrides.h"
 #include "ps2_iop_host.h"
+#include "ps2_recomp_abi.h"
 #include "ps2_runtime.h"
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
+#include "Kernel/Stubs/Pad.h"
 
 #include <algorithm>
 #include <atomic>
@@ -273,6 +275,41 @@ void register_ps2_runtime_boot_tests()
             t.Equals(runtime.Load32(rdram, &ctx, 0x20100014u), 0xDEADBEEFu, "the uncached mirror reads the same RAM");
             t.Equals(ctx.pc, 0x00101000u, "aligned accesses raise nothing");
             t.Equals(ctx.cop0_status & COP0_STATUS_EXL, 0u, "EXL stays clear");
+        });
+
+        tc.Run("the generated code's ps2x_abi entry points reach the runtime: loads, stores, exceptions", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "memory initialize");
+            uint8_t *rdram = runtime.memory().getRDRAM();
+            R5900Context ctx{};
+            ctx.pc = 0x00101000u;
+            PS2Runtime *rt = &runtime;
+            ps2x_abi::Store8(rt, rdram, &ctx, 0x00100100u, 0x5Au);
+            ps2x_abi::Store16(rt, rdram, &ctx, 0x00100102u, 0x1234u);
+            ps2x_abi::Store32(rt, rdram, &ctx, 0x00100104u, 0x89ABCDEFu);
+            ps2x_abi::Store64(rt, rdram, &ctx, 0x00100108u, 0x0011223344556677ull);
+            ps2x_abi::Store128(rt, rdram, &ctx, 0x00100110u, _mm_set_epi32(4, 3, 2, 1));
+            t.Equals(static_cast<uint32_t>(ps2x_abi::Load8(rt, rdram, &ctx, 0x00100100u)), 0x5Au, "8-bit");
+            t.Equals(static_cast<uint32_t>(ps2x_abi::Load16(rt, rdram, &ctx, 0x00100102u)), 0x1234u, "16-bit");
+            t.Equals(ps2x_abi::Load32(rt, rdram, &ctx, 0x00100104u), 0x89ABCDEFu, "32-bit");
+            t.Equals(ps2x_abi::Load64(rt, rdram, &ctx, 0x00100108u), 0x0011223344556677ull, "64-bit");
+            t.Equals(static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_srli_si128(ps2x_abi::Load128(rt, rdram, &ctx, 0x00100110u), 12))), 4u,
+                     "128-bit");
+            t.IsTrue(ps2x_abi::vu0Data(rt) == runtime.memory().getVU0Data(), "VU0 data memory");
+
+            ps2x_abi::Load32(rt, rdram, &ctx, 0x00100101u);
+            t.Equals(excCode(ctx), static_cast<uint32_t>(EXCEPTION_ADDRESS_ERROR_LOAD), "an unaligned load raises AdEL");
+            R5900Context trap{};
+            trap.pc = 0x00102000u;
+            ps2x_abi::handleTrap(rt, rdram, &trap);
+            t.Equals(excCode(trap), static_cast<uint32_t>(EXCEPTION_TRAP), "handleTrap raises Tr");
+            R5900Context brk{};
+            ps2x_abi::handleBreak(rt, rdram, &brk);
+            t.Equals(excCode(brk), static_cast<uint32_t>(EXCEPTION_BREAKPOINT), "handleBreak raises Bp");
+            R5900Context sig{};
+            ps2x_abi::SignalException(rt, &sig, EXCEPTION_RESERVED_INSTRUCTION);
+            t.Equals(excCode(sig), static_cast<uint32_t>(EXCEPTION_RESERVED_INSTRUCTION), "SignalException raises RI");
         });
 
         tc.Run("loadELF rejects malformed images", [](TestCase &t)
@@ -576,6 +613,46 @@ void register_ps2_runtime_boot_tests()
             R5900Context bad{};
             ps2_stubs::printf(rdram.data(), &bad, &runtime);
             t.IsTrue(v0(bad) < 0, "printf(NULL) fails");
+        });
+    });
+
+    MiniTest::Case("PS2PadScript", [](TestCase &tc)
+    {
+        tc.Run("PS2X_PAD_SCRIPT syntax: name@frame[+dur[*period]], unknown and malformed entries dropped", [](TestCase &t)
+        {
+            using namespace ps2_stubs;
+            const auto script = parsePadScript("start@100+30,cross@200,l1@5+2*10,bogus@1+1,@7,triangle,select@0+0");
+            t.Equals(script.size(), size_t{4}, "four valid entries");
+            if (script.size() != 4u)
+                return;
+            t.IsTrue(script[0].mask == padButtonByName("start") && script[0].frame == 100u && script[0].duration == 30u && script[0].period == 0u,
+                     "start@100+30");
+            t.IsTrue(script[1].mask == padButtonByName("cross") && script[1].frame == 200u && script[1].duration == 1u,
+                     "cross@200: one frame");
+            t.IsTrue(script[2].mask == padButtonByName("l1") && script[2].period == 10u, "l1@5+2*10 repeats");
+            t.IsTrue(script[3].mask == padButtonByName("select") && script[3].duration == 1u, "a zero duration means one frame");
+            t.Equals(static_cast<uint32_t>(padButtonByName("nope")), 0u, "unknown names map to no button");
+            uint16_t all = 0u;
+            for (const char *name : {"select", "l3", "r3", "start", "up", "right", "down", "left", "l2", "r2", "l1", "r1",
+                                     "triangle", "circle", "cross", "square"})
+                all = static_cast<uint16_t>(all | padButtonByName(name));
+            t.Equals(static_cast<uint32_t>(all), 0xFFFFu, "the sixteen names cover the sixteen button bits");
+        });
+
+        tc.Run("PS2X_PAD_SCRIPT timing: held from frame for dur frames, every period", [](TestCase &t)
+        {
+            using namespace ps2_stubs;
+            const auto script = parsePadScript("start@100+30,l1@5+2*10");
+            const uint16_t start = padButtonByName("start"), l1 = padButtonByName("l1");
+            auto at = [&](uint32_t f) { return padScriptButtonsAt(script, f); };
+            t.Equals(static_cast<uint32_t>(at(99) & start), 0u, "not before its frame");
+            t.Equals(static_cast<uint32_t>(at(100) & start), static_cast<uint32_t>(start), "from its frame");
+            t.Equals(static_cast<uint32_t>(at(129) & start), static_cast<uint32_t>(start), "for dur frames");
+            t.Equals(static_cast<uint32_t>(at(130) & start), 0u, "and no longer");
+            t.Equals(static_cast<uint32_t>(at(4) & l1), 0u, "l1 not before 5");
+            t.IsTrue((at(5) & l1) && (at(6) & l1) && !(at(7) & l1) && (at(15) & l1) && (at(16) & l1) && !(at(17) & l1) && (at(1005) & l1),
+                     "l1 held 2 of every 10 frames from frame 5, forever");
+            t.Equals(static_cast<uint32_t>(at(115)), static_cast<uint32_t>(start | l1), "overlapping presses combine");
         });
     });
 }

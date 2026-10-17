@@ -85,69 +85,12 @@ namespace ps2_stubs
         // PS2X_PAD_LOG=1 traces port setup and pad reads (first reads, then every 600th and on change).
         const bool g_padLog = std::getenv("PS2X_PAD_LOG") != nullptr;
 
-        // PS2X_PAD_SCRIPT="name@frame+dur[*period],..." holds a port-0 button from host frame
-        // `frame` for `dur` frames, repeating every `period` frames if given. Names: start select
-        // cross circle square triangle up down left right l1 r1 l2 r2 l3 r3.
-        struct PadScriptPress
-        {
-            uint16_t mask = 0u;
-            uint32_t frame = 0u;
-            uint32_t duration = 1u;
-            uint32_t period = 0u;
-        };
-
-        uint16_t padButtonByName(const std::string &name)
-        {
-            static const std::pair<const char *, uint16_t> kNames[] = {
-                {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
-                {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
-                {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
-                {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
-                {"square", kPadBtnSquare}};
-            for (const auto &[key, mask] : kNames)
-            {
-                if (name == key)
-                {
-                    return mask;
-                }
-            }
-            return 0u;
-        }
-
         const std::vector<PadScriptPress> &padScript()
         {
             static const std::vector<PadScriptPress> script = []
             {
-                std::vector<PadScriptPress> out;
                 const char *env = std::getenv("PS2X_PAD_SCRIPT");
-                if (!env)
-                {
-                    return out;
-                }
-                const std::string spec(env);
-                size_t start = 0u;
-                while (start < spec.size())
-                {
-                    const size_t end = std::min(spec.find(',', start), spec.size());
-                    const std::string item = spec.substr(start, end - start);
-                    start = end + 1u;
-                    char name[16]{};
-                    unsigned frame = 0u, duration = 1u, period = 0u;
-                    if (std::sscanf(item.c_str(), "%15[a-z0-9]@%u+%u*%u", name, &frame, &duration, &period) < 2)
-                    {
-                        std::fprintf(stderr, "[pad-script] ignoring malformed entry '%s'\n", item.c_str());
-                        continue;
-                    }
-                    PadScriptPress press{padButtonByName(name), frame, duration ? duration : 1u, period};
-                    if (press.mask == 0u)
-                    {
-                        std::fprintf(stderr, "[pad-script] unknown button '%s'\n", name);
-                        continue;
-                    }
-                    std::printf("[pad-script] %s from frame %u for %u frames, period %u\n", name, frame, press.duration, period);
-                    out.push_back(press);
-                }
-                return out;
+                return env ? parsePadScript(env) : std::vector<PadScriptPress>{};
             }();
             return script;
         }
@@ -155,20 +98,7 @@ namespace ps2_stubs
         // Active-low mask of scripted buttons held at host frame `frame`.
         uint16_t scriptedButtonsAt(uint32_t frame)
         {
-            uint16_t held = 0u;
-            for (const PadScriptPress &press : padScript())
-            {
-                if (frame < press.frame)
-                {
-                    continue;
-                }
-                const uint32_t offset = press.period ? (frame - press.frame) % press.period : frame - press.frame;
-                if (offset < press.duration)
-                {
-                    held = static_cast<uint16_t>(held | press.mask);
-                }
-            }
-            return held;
+            return padScriptButtonsAt(padScript(), frame);
         }
 
         uint8_t axisToByte(float axis)
@@ -448,6 +378,70 @@ namespace ps2_stubs
 
             return true;
         }
+    }
+
+    uint16_t padButtonByName(const std::string &name)
+    {
+        static const std::pair<const char *, uint16_t> kNames[] = {
+            {"select", kPadBtnSelect}, {"l3", kPadBtnL3}, {"r3", kPadBtnR3}, {"start", kPadBtnStart},
+            {"up", kPadBtnUp}, {"right", kPadBtnRight}, {"down", kPadBtnDown}, {"left", kPadBtnLeft},
+            {"l2", kPadBtnL2}, {"r2", kPadBtnR2}, {"l1", kPadBtnL1}, {"r1", kPadBtnR1},
+            {"triangle", kPadBtnTriangle}, {"circle", kPadBtnCircle}, {"cross", kPadBtnCross},
+            {"square", kPadBtnSquare}};
+        for (const auto &[key, mask] : kNames)
+        {
+            if (name == key)
+            {
+                return mask;
+            }
+        }
+        return 0u;
+    }
+
+    std::vector<PadScriptPress> parsePadScript(const std::string &spec)
+    {
+        std::vector<PadScriptPress> out;
+        size_t start = 0u;
+        while (start < spec.size())
+        {
+            const size_t end = std::min(spec.find(',', start), spec.size());
+            const std::string item = spec.substr(start, end - start);
+            start = end + 1u;
+            char name[16]{};
+            unsigned frame = 0u, duration = 1u, period = 0u;
+            if (std::sscanf(item.c_str(), "%15[a-z0-9]@%u+%u*%u", name, &frame, &duration, &period) < 2)
+            {
+                std::fprintf(stderr, "[pad-script] ignoring malformed entry '%s'\n", item.c_str());
+                continue;
+            }
+            PadScriptPress press{padButtonByName(name), frame, duration ? duration : 1u, period};
+            if (press.mask == 0u)
+            {
+                std::fprintf(stderr, "[pad-script] unknown button '%s'\n", name);
+                continue;
+            }
+            std::printf("[pad-script] %s from frame %u for %u frames, period %u\n", name, frame, press.duration, period);
+            out.push_back(press);
+        }
+        return out;
+    }
+
+    uint16_t padScriptButtonsAt(const std::vector<PadScriptPress> &script, uint32_t frame)
+    {
+        uint16_t held = 0u;
+        for (const PadScriptPress &press : script)
+        {
+            if (frame < press.frame)
+            {
+                continue;
+            }
+            const uint32_t offset = press.period ? (frame - press.frame) % press.period : frame - press.frame;
+            if (offset < press.duration)
+            {
+                held = static_cast<uint16_t>(held | press.mask);
+            }
+        }
+        return held;
     }
 
     // Called by the host loop once per presented frame, after raylib polls input events.
