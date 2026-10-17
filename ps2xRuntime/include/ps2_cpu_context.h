@@ -218,6 +218,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// PS2X_GUEST_WATCH=<addr>[:<len>] (ps2_host_write_trace.cpp): log guest stores overlapping
+// [addr, addr + len) (physical) with the writing generated function. Off, the check is one
+// unsigned compare per store.
+extern uint32_t g_ps2GuestWatchLo;   // off: above the physical space, so nothing matches
+extern uint32_t g_ps2GuestWatchSpan;
+void ps2GuestWatchHit(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx);
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -227,13 +234,11 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
     (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    // RAM and its mirrors (0x2xxxxxxx uncached, 0x3xxxxxxx uncached accelerated, kseg).
+    const uint32_t phys = guestAddr & 0x0FFFFFFFu;
+    if (phys + size - 1u - g_ps2GuestWatchLo < g_ps2GuestWatchSpan + size - 1u) [[unlikely]]
+        ps2GuestWatchHit(phys, size, valueLo, valueHi, ctx);
 }
 
 // Host-side writes into EE RAM (SIF/IOP transfers, file reads, libc stubs, ...). Logged only when

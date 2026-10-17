@@ -1406,10 +1406,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
-            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u) && ps2xGifTraceOn())
-                std::fprintf(stderr, "[gif] start %s chcr=%08x madr=%08x qwc=%u tadr=%08x path3Masked=%d\n",
-                             channelBase == 0x1000A000u ? "GIF " : "VIF1", value, madr, qwc,
-                             m_ioRegisters[channelBase + 0x30], int(m_path3Masked));
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x1000D000u ||
+                 channelBase == 0x1000D400u) &&
+                ps2xGifTraceOn())
+                std::fprintf(stderr, "[gif] start %s chcr=%08x mode=%u madr=%08x qwc=%u tadr=%08x sadr=%08x path3Masked=%d\n",
+                             channelBase == 0x1000A000u ? "GIF " : channelBase == 0x10009000u ? "VIF1"
+                                                               : channelBase == 0x1000D000u ? "fSPR" : "tSPR",
+                             value, (value >> 2) & 3u, madr, qwc, m_ioRegisters[channelBase + 0x30],
+                             m_ioRegisters[channelBase + 0x80], int(m_path3Masked));
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -1441,6 +1445,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 if (mode == 0 && qwc > 0)
                 {
                     enqueueTransfer(madr, qwc);
+                    // The transfer completes at once here: MADR ends after the data (QWC is
+                    // cleared on completion), as the DMAC leaves it.
+                    m_ioRegisters[channelBase + 0x10] = (madr + qwc * 16u) & 0x7FFFFFF0u;
                 }
                 else if (mode == 1)
                 {
@@ -1460,6 +1467,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const uint32_t asp = cursor.asp;
                     const uint32_t lastTagUpper = cursor.lastTagUpper;
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
+                    if (cursor.madrValid)
+                        m_ioRegisters[channelBase + 0x10] = cursor.madr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
@@ -1786,6 +1795,11 @@ void PS2Memory::walkDmaChain(uint32_t channelBase, uint32_t chcr, DmaChainCursor
 
         if (transferTagData)
             appendVifTagData(currentTagAddr);
+        if (id <= 7u)
+        {
+            cursor.madr = (dataAddr + static_cast<uint32_t>(tagQwc) * 16u) & 0x7FFFFFF0u;
+            cursor.madrValid = true;
+        }
 
         if (hasPayload)
             appendData(dataAddr, tagQwc);

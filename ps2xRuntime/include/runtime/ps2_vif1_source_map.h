@@ -37,6 +37,9 @@ struct DmaChainCursor
     uint32_t lastTagUpper = 0u;
     int tags = 0;
     bool ended = false;
+    // MADR as the DMAC leaves it: the end of the last tag's payload (PCSX2 hwDmacSrcChain).
+    uint32_t madr = 0u;
+    bool madrValid = false;
 };
 
 // Walker state after a tag: the bytes of that tag end at endOffset in the buffer.

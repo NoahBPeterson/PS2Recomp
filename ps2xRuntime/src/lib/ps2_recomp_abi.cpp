@@ -1,5 +1,16 @@
 #include "ps2_recomp_abi.h"
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define PS2X_ABI_RETURN_ADDRESS() _ReturnAddress()
+#else
+#define PS2X_ABI_RETURN_ADDRESS() __builtin_return_address(0)
+#endif
+// ps2_host_write_trace.cpp
+void ps2GuestWatchSpecial(uint32_t vaddr, uint32_t size, uint64_t valueLo, uint64_t valueHi, const R5900Context *ctx,
+                          const void *hostPc);
 
 namespace ps2x_abi
 {
@@ -11,8 +22,21 @@ namespace ps2x_abi
     void Store8(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value) { runtime->Store8(rdram, ctx, vaddr, value); }
     void Store16(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value) { runtime->Store16(rdram, ctx, vaddr, value); }
     void Store32(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value) { runtime->Store32(rdram, ctx, vaddr, value); }
-    void Store64(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value) { runtime->Store64(rdram, ctx, vaddr, value); }
-    void Store128(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value) { runtime->Store128(rdram, ctx, vaddr, value); }
+    // Special-address stores (scratchpad, hardware) bypass ps2TraceGuestWrite; PS2X_GUEST_WATCH
+    // covers them here when it spans the address (scratchpad: 0x70000000 + offset).
+    void Store64(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
+    {
+        if (g_ps2GuestWatchSpan != 0u) [[unlikely]]
+            ps2GuestWatchSpecial(vaddr, 8u, value, 0u, ctx, PS2X_ABI_RETURN_ADDRESS());
+        runtime->Store64(rdram, ctx, vaddr, value);
+    }
+    void Store128(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m128i value)
+    {
+        if (g_ps2GuestWatchSpan != 0u) [[unlikely]]
+            ps2GuestWatchSpecial(vaddr, 16u, static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(value)),
+                                 static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(value)), ctx, PS2X_ABI_RETURN_ADDRESS());
+        runtime->Store128(rdram, ctx, vaddr, value);
+    }
 
     bool dispatchGuestBranch(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t targetPc,
                              uint32_t sourcePc, uint32_t fallthroughPc, Ps2GuestBranchKind kind,
