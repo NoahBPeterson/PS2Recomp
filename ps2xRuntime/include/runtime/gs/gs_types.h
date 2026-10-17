@@ -291,6 +291,9 @@ struct GSPresentationRequest
     GSFrameReg preferredSource{};
     uint32_t preferredDestFbp = 0;
     bool hasPreferredSource = false;
+    // Show the whole framebuffer of an interlaced FFMD=0 display instead of the current field
+    // line-doubled: what PCSX2 writes with SaveFrame, for comparing against its frames.
+    bool fullFrame = false;
 };
 
 struct PresentationFrame

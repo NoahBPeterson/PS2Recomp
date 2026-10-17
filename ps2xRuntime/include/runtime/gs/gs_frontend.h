@@ -133,6 +133,8 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // Present whole framebuffers rather than single fields (GSPresentationRequest::fullFrame).
+    void setPresentFullFrames(bool on) { m_presentFullFrames = on; }
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -225,6 +227,7 @@ private:
     GSFrameReg m_preferredDisplaySourceFrame{};
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
+    bool m_presentFullFrames = false;
     std::vector<uint8_t> m_hostPresentationFrame;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;

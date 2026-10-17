@@ -3,7 +3,10 @@
 // Format: tickets/notes/gs-dump-format.md.
 //
 //   ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet]
-//                  [--ref <dir> [--tol T] [--max-bad N]]
+//                  [--full-frame] [--ref <dir> [--tol T] [--max-bad N]]
+// --full-frame presents whole framebuffers of interlaced FFMD=0 displays rather than the current
+// field line-doubled: PCSX2's SaveFrame output, for comparing with its frames (paraLLEl-GS:
+// force_progressive).
 // --ref compares every frame_NNNN.png with the same file in <dir>: a pixel is bad when any RGB
 // channel differs by more than T (default 0); a frame fails with more than N bad pixels
 // (default 0). Exit status: 0 ok, 1 replay error, 2 usage, 3 reference mismatch.
@@ -326,7 +329,7 @@ namespace
 
     void usage()
     {
-        std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet]\n"
+        std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet] [--full-frame]\n"
                              "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n"
                              "                      [--hash-out <file>] [--hash-ref <file>] [--hash-every <packets>]\n");
     }
@@ -339,6 +342,7 @@ int main(int argc, char **argv)
     int tol = 0;
     int64_t maxBad = 0;
     bool quiet = false;
+    bool fullFrame = false;
     uint64_t vramAtPacket = UINT64_MAX; // --vram-at N file: raw 4 MiB VRAM before packet N
     std::string vramAtPath;
     uint32_t vramFrame = UINT32_MAX; // --vram-frame N file: VRAM (any backend) at vsync N, before presenting it
@@ -378,6 +382,8 @@ int main(int argc, char **argv)
             hashEvery = std::strtoull(argv[++i], nullptr, 10);
         else if (arg == "--quiet")
             quiet = true;
+        else if (arg == "--full-frame")
+            fullFrame = true;
         else if (!arg.empty() && arg[0] != '-' && dumpPath.empty())
             dumpPath = arg;
         else
@@ -413,6 +419,7 @@ int main(int argc, char **argv)
     GSRegisters priv{};
     applyPrivRegs(priv, dump.privRegs);
     gs.init(vram.data(), kVramSize, &priv);
+    gs.setPresentFullFrames(fullFrame);
     GSRasterBackend *backend = nullptr; // owned by gs; used for the state hashes
     if (backendName == "parallel")
     {

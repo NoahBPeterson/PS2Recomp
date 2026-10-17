@@ -1055,12 +1055,160 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, kUvRow1);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, kUvRow1);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, kUvRow1 + ((16ull << 0) | (16ull << 16)));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             const uint32_t dstPixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
             t.Equals(dstPixel, static_cast<uint32_t>(kSourceColor),
                      "CT32 primitives should land in the same local-memory layout that later CT32 texture sampling expects");
+        });
+
+        tc.Run("GS sprites cover [ceil(min), ceil(max)) and sample at integer pixel positions", [](TestCase &t)
+        {
+            // GS rasterization (PCSX2 GSRasterizer::DrawSprite): pixel centres sit on integer
+            // coordinates, a sprite covers the pixels in [ceil(x0), ceil(x1)) x [ceil(y0), ceil(y1)),
+            // and the texture coordinate is interpolated to each pixel's integer position.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTexTbp = 64u;
+            constexpr uint32_t kTexels[4] = {0x800000FFu, 0x8000FF00u, 0x80FF0000u, 0x80FFFFFFu};
+            for (uint32_t y = 0u; y < 4u; ++y)
+                for (uint32_t x = 0u; x < 4u; ++x)
+                    writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, kTexels[x]);
+
+            gs.writeRegister(GS_REG_FRAME_1, (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            // 4x4 CT32, TCC=1, DECAL; CLAMP.
+            gs.writeRegister(GS_REG_TEX0_1, (static_cast<uint64_t>(kTexTbp) << 0) | (1ull << 14) |
+                                                (static_cast<uint64_t>(GS_PSM_CT32) << 20) | (2ull << 26) | (2ull << 30) |
+                                                (1ull << 34) | (1ull << 35));
+            gs.writeRegister(GS_REG_TEX1_1, 0ull);
+            gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+
+            // (0.5, 0.5)-(2.5, 2.5) covers pixels 1..2 on each axis; UV 0.5..2.5 texels puts
+            // pixel 1 at texel 1.0 and pixel 2 at texel 2.0.
+            gs.writeRegister(GS_REG_UV, 8ull | (8ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 8ull | (8ull << 16));
+            gs.writeRegister(GS_REG_UV, 40ull | (40ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, 40ull | (40ull << 16));
+            // A zero-size sprite covers nothing.
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 80ull | (80ull << 16));
+            gs.writeRegister(GS_REG_UV, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 80ull | (80ull << 16));
+
+            for (uint32_t y = 0u; y < 6u; ++y)
+                for (uint32_t x = 0u; x < 6u; ++x)
+                {
+                    const bool inside = x >= 1u && x <= 2u && y >= 1u && y <= 2u;
+                    t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, y), inside ? kTexels[x] : 0u,
+                             "the sprite should write exactly pixels 1..2, each with the texel at its integer position");
+                }
+        });
+
+        tc.Run("GS bilinear sampling uses the texel centres and 4-bit flooring weights", [](TestCase &t)
+        {
+            // One FST sprite pixel at U = 1.25 texels. Bilinear steps back half a texel (0.75), so
+            // texels 0 and 1 blend with weight 12/16, each step a + ((b - a) * f >> 4) (PCSX2
+            // GSDrawScanline lerp16_4). TEX1 decides magnification or minification by the LOD.
+            auto sample = [](uint64_t tex1) -> uint32_t
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                constexpr uint32_t kTexTbp = 64u;
+                constexpr uint32_t kTexels[4] = {0x800000FFu, 0x8000FF00u, 0x80FF0000u, 0x80FFFFFFu};
+                for (uint32_t y = 0u; y < 4u; ++y)
+                    for (uint32_t x = 0u; x < 4u; ++x)
+                        writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, x, y, kTexels[x]);
+                gs.writeRegister(GS_REG_FRAME_1, (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+                gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+                gs.writeRegister(GS_REG_SCISSOR_1, (3ull << 16) | (3ull << 48));
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+                gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+                gs.writeRegister(GS_REG_TEX0_1, (static_cast<uint64_t>(kTexTbp) << 0) | (1ull << 14) |
+                                                    (static_cast<uint64_t>(GS_PSM_CT32) << 20) | (2ull << 26) | (2ull << 30) |
+                                                    (1ull << 34) | (1ull << 35));
+                gs.writeRegister(GS_REG_TEX1_1, tex1);
+                gs.writeRegister(GS_REG_CLAMP_1, 1ull | (1ull << 2));
+                gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 4) | (1ull << 8));
+                gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
+                // U 1.25 texels (20 in 12.4), V 0.5 texels (row weight 0).
+                gs.writeRegister(GS_REG_UV, 20ull | (8ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_UV, 36ull | (24ull << 16));
+                gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+                return readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u);
+            };
+            constexpr uint64_t kMmagLinear = 1ull << 5;
+            constexpr uint64_t kMminLinear = 1ull << 6;
+            constexpr uint64_t kLcm = 1ull;
+            constexpr uint64_t kMxl1 = 1ull << 2;
+            auto k = [](int lod16) -> uint64_t { return static_cast<uint64_t>(static_cast<uint32_t>(lod16) & 0xFFFu) << 32; };
+            // R 255 + ((0 - 255) * 12 >> 4) = 63, G 0 + (255 * 12 >> 4) = 191.
+            constexpr uint32_t kBlended = 0x8000BF3Fu;
+            constexpr uint32_t kNearest = 0x8000FF00u; // texel 1
+            t.Equals(sample(kMmagLinear), kBlended, "MMAG=LINEAR blends texels 0 and 1 at 12/16");
+            t.Equals(sample(0ull), kNearest, "MMAG=NEAREST takes the texel under U = 1.25");
+            t.Equals(sample(kMminLinear), kNearest, "MXL=0 always magnifies, so MMIN is ignored");
+            t.Equals(sample(kMminLinear | kLcm | kMxl1 | k(16)), kBlended, "LCM=1, K=+1: LOD > 0 minifies with MMIN");
+            t.Equals(sample(kMminLinear | kLcm | kMxl1 | k(-16)), kNearest, "LCM=1, K=-1: LOD <= 0 magnifies with MMAG");
+            t.Equals(sample(kMminLinear | kMxl1 | k(16)), kBlended, "FST uses LOD = K like LCM=1");
+        });
+
+        tc.Run("GS dithers 16-bit framebuffer writes by DIMX and wraps colours without COLCLAMP", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+
+            // CT16 at page 150 with DTHE: DIMX row 0 = (-4, +3, 0, -1) is added to RGB before the
+            // 5-bit truncation (PCSX2 GSDrawScanline WriteFrame). 101 -> 97, 104, 101, 100.
+            gs.writeRegister(GS_REG_FRAME_1, (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT16) << 24));
+            gs.writeRegister(GS_REG_DIMX, 4ull | (3ull << 4) | (0ull << 8) | (7ull << 12));
+            gs.writeRegister(GS_REG_DTHE, 1ull);
+            gs.writeRegister(GS_REG_COLCLAMP, 1ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80656565ull); // RGB 101
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_XYZ2, 64ull | (16ull << 16));
+            const uint32_t expected[4] = {97u >> 3, 104u >> 3, 101u >> 3, 100u >> 3};
+            for (uint32_t x = 0u; x < 4u; ++x)
+            {
+                const uint32_t c = expected[x];
+                t.Equals(gs.ReadVram(GS_PSM_CT16, 150u * 32u, 1u, x, 0u), 0x8000u | c | (c << 5) | (c << 10),
+                         "a dithered CT16 pixel should hold (101 + DIMX[0][x]) >> 3 in each channel");
+            }
+
+            // CT32, no dithering: Cs + Cd = 200 + 100 overflows. COLCLAMP=1 clamps to 255,
+            // COLCLAMP=0 keeps the low 8 bits (44).
+            gs.writeRegister(GS_REG_DTHE, 0ull);
+            gs.writeRegister(GS_REG_FRAME_1, (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ALPHA_1, (0ull << 0) | (2ull << 2) | (2ull << 4) | (1ull << 6) | (128ull << 32));
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_SPRITE) | (1ull << 6));
+            gs.writeRegister(GS_REG_RGBAQ, 0x80C8C8C8ull);
+            for (const bool clamp : {true, false})
+            {
+                writeReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u, 0x80646464u);
+                gs.writeRegister(GS_REG_COLCLAMP, clamp ? 1ull : 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 0ull);
+                gs.writeRegister(GS_REG_XYZ2, 16ull | (16ull << 16));
+                t.Equals(readReferenceFramePSMCT32Pixel(vram, 150u, 1u, 0u, 0u) & 0xFFFFFFu, clamp ? 0xFFFFFFu : 0x2C2C2Cu,
+                         clamp ? "COLCLAMP=1 clamps a blend overflow" : "COLCLAMP=0 wraps a blend overflow");
+            }
         });
 
         tc.Run("FST sprite 1:1 CT32 copies preserve source texels at the right and bottom edges", [](TestCase &t)
@@ -2740,8 +2888,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2885,8 +3033,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -2947,8 +3095,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3013,8 +3161,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixel = 0u;
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
@@ -3775,7 +3923,8 @@ void register_ps2_gs_tests()
                      "negative infinity saturates to zero");
             t.Equals(renderConstantSt(kClamp, kTex1Point, kNaN, kInRange, kByColumn), 0x800000FFu,
                      "NaN samples texel 0 instead of converting NaN to int");
-            t.Equals(renderConstantSt(kRepeat, kTex1Linear, kNaN, kInRange, kByColumn), 0x808080FFu,
+            // Weight 8/16 with the GS's flooring 4-bit lerp: 255 + ((0 - 255) * 8 >> 4) = 127.
+            t.Equals(renderConstantSt(kRepeat, kTex1Linear, kNaN, kInRange, kByColumn), 0x807F7FFFu,
                      "NaN under the linear filter blends texels 3 and 0 at -0.5 instead of using NaN weights");
 
             // T takes the same path with the texture height.
@@ -4728,8 +4877,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_RGBAQ, 0x80808080ull);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixelHL = 0u;
             std::memcpy(&pixelHL, vram.data(), sizeof(pixelHL));
@@ -4751,8 +4900,8 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_TEX0_1, kTex0HH);
             gs.writeRegister(GS_REG_UV, 0ull);
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_UV, 0ull);
-            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_UV, (16ull << 0) | (16ull << 16));
+            gs.writeRegister(GS_REG_XYZ2, (16ull << 0) | (16ull << 16)); // a 1x1 sprite: pixel (0,0)
 
             uint32_t pixelHH = 0u;
             std::memcpy(&pixelHH, vram.data(), sizeof(pixelHH));

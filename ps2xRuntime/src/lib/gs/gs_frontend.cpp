@@ -15,6 +15,7 @@ std::atomic<uint64_t> g_ps2xDebugGsDumpVsync{0};
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 
 // GS FINISH register writes (games write one per frame); read by the host loop's [fps] readout.
@@ -536,6 +537,7 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.preferredSource = m_preferredDisplaySourceFrame;
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
+    request.fullFrame = m_presentFullFrames;
     return request;
 }
 
@@ -1815,10 +1817,42 @@ GSPrimitiveBatch GS::buildDrawBatch(int vertexCount) const
     batch.state.fogB = m_fogB;
     batch.state.textureWidth = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.tw, 10u));
     batch.state.textureHeight = static_cast<uint16_t>(1u << std::min<uint32_t>(batch.state.context.tex0.th, 10u));
+    // Magnification or minification filter by the LOD (GS manual 3.4.11; PCSX2 GSVertexTrace):
+    // MXL = 0 always magnifies. Otherwise LOD = K when LCM = 1 or with FST (no Q), else
+    // log2(1/|Q|) * 2^L + K at each vertex (a sprite has one Q, its second vertex's); LOD <= 0
+    // magnifies, LOD > 0 minifies, and a primitive spanning both takes linear if either is.
     const uint64_t tex1 = batch.state.context.tex1;
-    const uint8_t mmag = static_cast<uint8_t>((tex1 >> 5u) & 0x1u);
-    const uint8_t mmin = static_cast<uint8_t>((tex1 >> 6u) & 0x7u);
-    batch.state.linearFilter = mmag != 0u || mmin == 1u || (mmin & 0x4u) != 0u;
+    const bool lcm = (tex1 & 0x1u) != 0u;
+    const uint32_t mxl = static_cast<uint32_t>((tex1 >> 2u) & 0x7u);
+    const bool magLinear = ((tex1 >> 5u) & 0x1u) != 0u;
+    const uint32_t mmin = static_cast<uint32_t>((tex1 >> 6u) & 0x7u);
+    const bool minLinear = mmin == 1u || (mmin & 0x4u) != 0u;
+    const uint32_t l = static_cast<uint32_t>((tex1 >> 19u) & 0x3u);
+    const float k = static_cast<float>(static_cast<int32_t>(static_cast<uint32_t>(tex1 >> 32u) << 20) >> 20) / 16.0f;
+    bool linear = magLinear;
+    if (mxl != 0u)
+    {
+        float lodMin = k, lodMax = k;
+        if (!lcm && !batch.state.prim.fst)
+        {
+            const int first = batch.state.prim.type == GS_PRIM_SPRITE ? batch.vertexCount - 1 : 0;
+            lodMin = std::numeric_limits<float>::infinity();
+            lodMax = -lodMin;
+            for (int i = std::max(first, 0); i < batch.vertexCount; ++i)
+            {
+                const float lod = -std::log2(std::fabs(batch.vertices[static_cast<size_t>(i)].q)) * static_cast<float>(1u << l) + k;
+                lodMin = std::min(lodMin, lod);
+                lodMax = std::max(lodMax, lod);
+            }
+        }
+        if (!(lodMax > 0.0f))
+            linear = magLinear;
+        else if (lodMin > 0.0f)
+            linear = minLinear;
+        else
+            linear = magLinear || minLinear;
+    }
+    batch.state.linearFilter = linear;
     return batch;
 }
 

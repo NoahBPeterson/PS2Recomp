@@ -645,6 +645,7 @@ namespace
             info.dst_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             info.dst_access = VK_ACCESS_2_TRANSFER_READ_BIT;
             info.crtc_offsets = true;
+            info.force_progressive = request.fullFrame;
             return interop.present(gs.vsync(info));
         }
 
