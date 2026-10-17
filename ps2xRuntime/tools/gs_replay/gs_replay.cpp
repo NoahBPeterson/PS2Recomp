@@ -260,6 +260,46 @@ namespace
         gs.processGIFPacket(reinterpret_cast<const uint8_t *>(packet.data()), static_cast<uint32_t>(packet.size() * 8u), 3u);
     }
 
+    bool writePng(const std::string &path, std::vector<uint8_t> &rgba, uint32_t width, uint32_t height);
+
+    // A texture as TEX0 describes it, decoded from GS local memory (indexed formats through a
+    // CSM1 CLUT read straight from CBP), alpha forced opaque: a view to compare with PCSX2's
+    // per-draw itex0 dumps (tools/conformance/pcsx2_drawdump.py).
+    void writeTexture(GS &gs, uint64_t tex0, const std::string &path)
+    {
+        const uint32_t tbp = tex0 & 0x3FFFu, tbw = (tex0 >> 14) & 0x3Fu, psm = (tex0 >> 20) & 0x3Fu;
+        const uint32_t w = 1u << std::min<uint32_t>((tex0 >> 26) & 0xFu, 10u);
+        const uint32_t h = 1u << std::min<uint32_t>((tex0 >> 30) & 0xFu, 10u);
+        const uint32_t cbp = (tex0 >> 37) & 0x3FFFu, cpsm = (tex0 >> 51) & 0xFu;
+        const bool indexed = psm == GS_PSM_T8 || psm == GS_PSM_T4 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+        std::vector<uint8_t> rgba(size_t(w) * h * 4u);
+        auto expand = [](uint32_t c, uint32_t p) -> uint32_t
+        {
+            if (p == GS_PSM_CT16 || p == GS_PSM_CT16S)
+                return ((c & 0x1Fu) << 3) | (((c >> 5) & 0x1Fu) << 11) | (((c >> 10) & 0x1Fu) << 19);
+            return c;
+        };
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                uint32_t c = gs.ReadVram(psm, tbp, std::max(tbw, 1u), x, y);
+                if (indexed)
+                {
+                    uint32_t e = c & 0xFFu;
+                    if (psm == GS_PSM_T8 || psm == GS_PSM_T8H)
+                        e = (e & ~0x18u) | ((e & 0x08u) << 1) | ((e & 0x10u) >> 1); // CSM1 layout
+                    c = gs.ReadVram(cpsm, cbp, 1u, e & 0xFu, e >> 4);
+                    c = expand(c, cpsm);
+                }
+                else
+                    c = expand(c, psm);
+                uint8_t *o = &rgba[(size_t(y) * w + x) * 4u];
+                o[0] = uint8_t(c), o[1] = uint8_t(c >> 8), o[2] = uint8_t(c >> 16), o[3] = 255u;
+            }
+        std::printf("%s texture tbp=0x%x tbw=%u psm=0x%x %ux%u cbp=0x%x -> %s\n",
+                    writePng(path, rgba, w, h) ? "wrote" : "FAILED", tbp, tbw, psm, w, h, cbp, path.c_str());
+    }
+
     bool writePng(const std::string &path, std::vector<uint8_t> &rgba, uint32_t width, uint32_t height)
     {
         for (size_t i = 3; i < rgba.size(); i += 4)
@@ -331,6 +371,7 @@ namespace
     {
         std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet] [--full-frame]\n"
                              "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n"
+                             "                      [--tex-at <packet> <TEX0 hex> <file.png>]...\n"
                              "                      [--hash-out <file>] [--hash-ref <file>] [--hash-every <packets>]\n");
     }
 }
@@ -344,6 +385,13 @@ int main(int argc, char **argv)
     bool quiet = false;
     bool fullFrame = false;
     uint64_t vramAtPacket = UINT64_MAX; // --vram-at N file: raw 4 MiB VRAM before packet N
+    struct TexAt
+    {
+        uint64_t packet;
+        uint64_t tex0;
+        std::string path;
+    };
+    std::vector<TexAt> texAts; // --tex-at N TEX0 file: a texture decoded before packet N
     std::string vramAtPath;
     uint32_t vramFrame = UINT32_MAX; // --vram-frame N file: VRAM (any backend) at vsync N, before presenting it
     std::string vramFramePath;
@@ -364,6 +412,13 @@ int main(int argc, char **argv)
             tol = std::atoi(argv[++i]);
         else if (arg == "--max-bad" && i + 1 < argc)
             maxBad = std::atoll(argv[++i]);
+        else if (arg == "--tex-at" && i + 3 < argc)
+        {
+            const uint64_t packet = std::strtoull(argv[i + 1], nullptr, 10);
+            const uint64_t tex0 = std::strtoull(argv[i + 2], nullptr, 16);
+            texAts.push_back({packet, tex0, argv[i + 3]});
+            i += 3;
+        }
         else if (arg == "--vram-at" && i + 2 < argc)
         {
             vramAtPacket = std::strtoull(argv[++i], nullptr, 10);
@@ -508,6 +563,9 @@ int main(int argc, char **argv)
     uint64_t packetIndex = 0u;
     while (r.pos < r.size && frames < maxFrames)
     {
+        for (const TexAt &t : texAts)
+            if (t.packet == packetIndex)
+                writeTexture(gs, t.tex0, t.path);
         if (packetIndex++ == vramAtPacket)
         {
             gs.shutdownBackend();

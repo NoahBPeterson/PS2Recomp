@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 
+bool ps2xGifTraceOn(); // ps2_memory.cpp: PS2X_GIF_TRACE
+
 namespace
 {
     // Recent VIF1 UNPACKs, printed by ps2xDumpRecentVif1Unpacks() when a VU1 XGKICK
@@ -471,6 +473,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
             const bool wasMasked = m_path3Masked;
             m_path3Masked = (imm & 0x8000u) != 0u;
+            if (wasMasked != m_path3Masked && ps2xGifTraceOn())
+                std::fprintf(stderr, "[gif] MSKPATH3 %s\n", m_path3Masked ? "mask" : "unmask");
             if (wasMasked && !m_path3Masked)
                 flushMaskedPath3Packets();
             continue;

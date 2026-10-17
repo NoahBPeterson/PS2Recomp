@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+bool ps2xGifTraceOn();
+
 std::atomic<uint32_t> g_ps2xGsFlips[2]{}; // DISPFB1/DISPFB2 flip counts (see countGsDisplayFlip)
 
 namespace
@@ -1404,6 +1406,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            if ((channelBase == 0x1000A000u || channelBase == 0x10009000u) && ps2xGifTraceOn())
+                std::fprintf(stderr, "[gif] start %s chcr=%08x madr=%08x qwc=%u tadr=%08x path3Masked=%d\n",
+                             channelBase == 0x1000A000u ? "GIF " : "VIF1", value, madr, qwc,
+                             m_ioRegisters[channelBase + 0x30], int(m_path3Masked));
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -2124,10 +2130,25 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
     return causes;
 }
 
+// PS2X_GIF_TRACE=N: the first N GIF/VIF1 DMA starts, PATH3 submissions and MSKPATH3 changes
+// on stderr, to study how a game orders texture uploads against VU1 drawing.
+bool ps2xGifTraceOn()
+{
+    static const long limit = []
+    {
+        const char *v = std::getenv("PS2X_GIF_TRACE");
+        return v ? std::atol(v) : 0L;
+    }();
+    static std::atomic<long> used{0};
+    return limit > 0 && used.fetch_add(1, std::memory_order_relaxed) < limit;
+}
+
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 {
     if (m_path3Masked || m_path3MaskedFifo.empty())
         return;
+    if (ps2xGifTraceOn())
+        std::fprintf(stderr, "[gif] flush %zu masked PATH3 packet(s)\n", m_path3MaskedFifo.size());
 
     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
     {
@@ -2153,6 +2174,13 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
     if (!data || sizeBytes < 16)
         return;
 
+    if (pathId == GifPathId::Path3 && ps2xGifTraceOn())
+    {
+        uint64_t tag = 0;
+        std::memcpy(&tag, data, sizeof(tag));
+        std::fprintf(stderr, "[gif] PATH3 %u B flg=%u nloop=%u %s\n", sizeBytes, unsigned((tag >> 58) & 3u),
+                     unsigned(tag & 0x7FFFu), m_path3Masked ? "MASKED (held)" : "sent");
+    }
     if (pathId == GifPathId::Path3)
     {
         if (m_path3Masked)
