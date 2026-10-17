@@ -22,16 +22,13 @@ namespace
 
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
-    constexpr int KE_ILLEGAL_THID = -406;
-    constexpr int KE_UNKNOWN_THID = -407;
-    constexpr int KE_UNKNOWN_SEMID = -408;
-    constexpr int KE_DORMANT = -413;
-    constexpr int KE_SEMA_ZERO = -419;
-    constexpr int KE_SEMA_OVF = -420;
-    constexpr int KE_WAIT_DELETE = -425;
-    constexpr int KE_RELEASE_WAIT = -418;
+    // A blocked EE call ended by deleting its object or by ReleaseWaitThread returns -1 on the
+    // EE kernel (measured against the BIOS kernel on PCSX2).
+    constexpr int KE_WAIT_DELETE = -1;
+    constexpr int KE_RELEASE_WAIT = -1;
     constexpr uint32_t K_SEMA_WAIT_READY_ADDR = 0x1900u;
 
+    constexpr int THS_RUN = 0x01;
     constexpr int THS_WAIT = 0x04;
     constexpr int THS_SUSPEND = 0x08;
     constexpr int THS_WAITSUSPEND = 0x0C;
@@ -622,7 +619,7 @@ void register_ps2_runtime_kernel_tests()
             CreateSema(env.rdram.data(), &env.ctx, &env.runtime);
             const int semaId = getRegS32(env.ctx, 2);
             const EeSemaphore *semaphore = env.runtime.eeScheduler().semaphore(semaId);
-            t.IsTrue(semaId > 0 && semaphore != nullptr, "the EE semaphore descriptor should create an object");
+            t.IsTrue(semaId >= 0 && semaphore != nullptr, "the EE semaphore descriptor should create an object");
             t.Equals(semaphore->count, semaParam.init_count,
                      "CreateSema must use init_count at offset 0x08, not the status count field");
             t.Equals(semaphore->maxCount, semaParam.max_count, "max_count must be decoded from offset 0x04");
@@ -668,7 +665,7 @@ void register_ps2_runtime_kernel_tests()
                       "the scheduler must publish guest execution only around the active guest call");
         });
 
-        tc.Run("thread lifecycle, nested suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
+        tc.Run("thread lifecycle, non-nesting suspend, WAIT-SUSPEND, and wakeup count are centralized", [](TestCase &t)
         {
             TestEnv env;
             EeScheduler &ee = env.runtime.eeScheduler();
@@ -680,13 +677,11 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(ee.startThread(id, 0xCAFEu, env.ctx, false), KE_OK, "StartThread should make a dormant thread ready");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Ready, "started thread should be in one ready queue");
             t.Equals(ee.suspendThread(id, false), KE_OK, "first suspend should remove the ready thread");
-            t.Equals(ee.suspendThread(id, false), KE_OK, "nested suspend should increment suspendCount");
-            t.IsTrue(ee.thread(id)->status == EeThreadStatus::Suspended && ee.thread(id)->suspendCount == 2,
-                     "nested suspension should have one suspended membership and count two");
-            t.Equals(ee.resumeThread(id, false), KE_OK, "first resume should only decrement the nested count");
+            // The real kernel does not nest suspensions: suspending a suspended thread fails (measured with eek).
+            t.Equals(ee.suspendThread(id, false), KE_ERROR, "suspending a suspended thread should fail");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Suspended && ee.thread(id)->suspendCount == 1,
-                     "one outstanding suspend keeps the thread suspended");
-            t.Equals(ee.resumeThread(id, false), KE_OK, "final resume should restore readiness");
+                     "a rejected suspend should leave one suspended membership");
+            t.Equals(ee.resumeThread(id, false), KE_OK, "one resume should restore readiness");
             t.IsTrue(ee.thread(id)->status == EeThreadStatus::Ready && ee.thread(id)->suspendCount == 0,
                      "final resume should enqueue the thread exactly once");
 
@@ -1012,7 +1007,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 6, 0u);
             SetAlarm(env.rdram.data(), &env.ctx, &env.runtime);
             const int32_t alarmId = getRegS32(env.ctx, 2);
-            t.IsTrue(alarmId > 0, "SetAlarm should create a cancellable alarm");
+            t.IsTrue(alarmId >= 0, "SetAlarm should create a cancellable alarm (the kernel hands out ID 0 first)");
 
             setRegU32(env.ctx, 4, static_cast<uint32_t>(alarmId));
             ReleaseAlarm(env.rdram.data(), &env.ctx, &env.runtime);
@@ -1047,19 +1042,19 @@ void register_ps2_runtime_kernel_tests()
 
             setRegU32(env.ctx, 4, 0u);
             DeleteThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_ILLEGAL_THID, "DeleteThread(0) should be KE_ILLEGAL_THID");
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "DeleteThread(0) should fail with -1");
 
             setRegU32(env.ctx, 4, 0x7FFFu);
             StartThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_THID, "StartThread should reject unknown thread ids");
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "StartThread should reject unknown thread ids");
 
             setRegU32(env.ctx, 4, 0x7FFFu);
             WakeupThread(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_THID, "WakeupThread should reject unknown thread ids");
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "WakeupThread should reject unknown thread ids");
 
             setRegU32(env.ctx, 4, 0x7FFFu);
             PollSema(env.rdram.data(), &env.ctx, &env.runtime);
-            t.Equals(getRegS32(env.ctx, 2), KE_UNKNOWN_SEMID, "PollSema should reject unknown semaphore ids");
+            t.Equals(getRegS32(env.ctx, 2), KE_ERROR, "PollSema should reject unknown semaphore ids");
 
             setRegU32(env.ctx, 4, 0xFFFFFFFFu);
             t.IsTrue(callSyscall(0x3Du, env.rdram.data(), &env.ctx, &env.runtime), "SetupHeap syscall should dispatch");
@@ -1105,7 +1100,7 @@ void register_ps2_runtime_kernel_tests()
             setRegU32(env.ctx, 5, K_STATUS_ADDR);
             t.IsTrue(callSyscall(0x30u, env.rdram.data(), &env.ctx, &env.runtime),
                      "ReferThreadStatus syscall should dispatch");
-            t.Equals(getRegS32(env.ctx, 2), KE_OK, "ReferThreadStatus should accept the current-thread id alias");
+            t.Equals(getRegS32(env.ctx, 2), THS_RUN, "ReferThreadStatus(0) should return the running thread's status");
 
             EeThreadStatusAbi status{};
             std::memcpy(&status, env.rdram.data() + K_STATUS_ADDR, sizeof(status));

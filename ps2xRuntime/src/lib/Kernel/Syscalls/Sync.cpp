@@ -19,6 +19,13 @@ namespace ps2_syscalls
             return result;
         }
 
+        // EE kernel semaphore calls return the semaphore's ID on success and -1 on any failure
+        // (measured against the BIOS kernel on PCSX2).
+        int semaResult(int result)
+        {
+            return result < 0 ? KE_ERROR : result;
+        }
+
         void deleteSemaphoreImpl(uint8_t *rdram,
                                  R5900Context *ctx,
                                  PS2Runtime *runtime,
@@ -26,7 +33,7 @@ namespace ps2_syscalls
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int result = ee.deleteSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
-            setReturnS32(ctx, result);
+            setReturnS32(ctx, semaResult(result));
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -37,7 +44,7 @@ namespace ps2_syscalls
         {
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int result = ee.signalSemaphore(static_cast<int>(getRegU32(ctx, 4)), interruptSafe);
-            setReturnS32(ctx, result);
+            setReturnS32(ctx, semaResult(result));
             ee.transferIfRequested(interruptSafe);
         }
 
@@ -79,11 +86,11 @@ namespace ps2_syscalls
         // ee_sema_t from ps2sdk. The IOP attr/option/init/max ordering is not
         // accepted by the EE runtime.
         setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime)
-                         .createSemaphore(param->init_count,
-                                          param->max_count,
-                                          param->attr,
-                                          param->option));
+                     semaResult(scheduler(rdram, ctx, runtime)
+                                    .createSemaphore(param->init_count,
+                                                     param->max_count,
+                                                     param->attr,
+                                                     param->option)));
     }
 
     void DeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -114,7 +121,7 @@ namespace ps2_syscalls
     void PollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         setReturnS32(ctx,
-                     scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4))));
+                     semaResult(scheduler(rdram, ctx, runtime).pollSemaphore(static_cast<int>(getRegU32(ctx, 4)))));
     }
 
     void iPollSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -125,10 +132,11 @@ namespace ps2_syscalls
     void ReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         EeScheduler &ee = scheduler(rdram, ctx, runtime);
-        const EeSemaphore *semaphore = ee.semaphore(static_cast<int>(getRegU32(ctx, 4)));
+        const int id = static_cast<int>(getRegU32(ctx, 4));
+        const EeSemaphore *semaphore = ee.semaphore(id);
         if (!semaphore)
         {
-            setReturnS32(ctx, KE_UNKNOWN_SEMID);
+            setReturnS32(ctx, KE_ERROR);
             return;
         }
         auto *status = getEeGuestStruct<ee_sema_t>(rdram, getRegU32(ctx, 5));
@@ -139,11 +147,11 @@ namespace ps2_syscalls
         }
         status->count = semaphore->count;
         status->max_count = semaphore->maxCount;
-        status->init_count = semaphore->initCount;
+        // init_count is left as the caller had it: the EE kernel does not write it (measured with eek).
         status->wait_threads = static_cast<int>(semaphore->waiters.size());
         status->attr = semaphore->attr;
         status->option = semaphore->option;
-        setReturnS32(ctx, KE_OK);
+        setReturnS32(ctx, id);
     }
 
     void iReferSemaStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

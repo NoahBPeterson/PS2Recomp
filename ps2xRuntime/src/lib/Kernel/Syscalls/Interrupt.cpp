@@ -60,6 +60,7 @@ namespace ps2_syscalls
             setReturnS32(ctx,
                          scheduler(rdram, ctx, runtime)
                              .setIrqHandlerEnabled(dmac,
+                                                   getRegU32(ctx, 4),
                                                    static_cast<int>(getRegU32(ctx, 5)),
                                                    enabled));
         }

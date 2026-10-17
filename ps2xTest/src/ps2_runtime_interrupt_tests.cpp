@@ -187,6 +187,7 @@ namespace
         g_dispatchTrace.push_back(1);
         EeScheduler &scheduler = runtime->eeScheduler();
         scheduler.addIrqHandler(false, 2u, kIntcHandlerPc, true, 0xCAFEu, 0u, 0u);
+        scheduler.setIrqCauseEnabled(false, 2u, true); // the BIOS boots with VBlank start masked
         ctx->pc = kIrqResumePc;
         scheduler.waitVSync(scheduler.currentVSyncTick());
     }
@@ -216,6 +217,7 @@ namespace
                                 0u,
                                 0u,
                                 kIrqRegistrationSp);
+        scheduler.setIrqCauseEnabled(false, 2u, true);
         ctx->pc = kIrqStackResumePc;
         scheduler.waitVSync(scheduler.currentVSyncTick());
     }
@@ -247,6 +249,7 @@ namespace
         EeScheduler &scheduler = runtime->eeScheduler();
         g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
         scheduler.addIrqHandler(true, 5u, kISemaHandlerPc, true, 0u, 0u, 0u);
+        scheduler.setIrqCauseEnabled(true, 5u, true);
 
         EeThreadCreateParams driver{};
         driver.entry = kISemaDriverPc;
@@ -317,6 +320,7 @@ namespace
         EeScheduler &scheduler = runtime->eeScheduler();
         g_testSemaphoreId = scheduler.createSemaphore(0, 1, 0u, 0u);
         scheduler.addIrqHandler(false, 11u, kTimer2HandlerPc, true, 0u, 0u, 0u);
+        scheduler.setIrqCauseEnabled(false, 11u, true);
 
         PS2Memory &memory = runtime->memory();
         memory.writeIORegister(kTimer2Count, 0u);
@@ -403,25 +407,26 @@ void register_ps2_runtime_interrupt_tests()
             setRegU32(disableIntcCtx, 4, 2u);
             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1B), env.rdram.data(), &disableIntcCtx, &env.runtime),
                      "negative iDisableIntc syscall id should dispatch");
-            t.Equals(getRegS32(disableIntcCtx, 2), KE_OK, "negative iDisableIntc should return KE_OK");
+            // The BIOS boots with INTC 2 and DMAC 5 masked; these calls return 1 only when they change the mask (measured with eek).
+            t.Equals(getRegS32(disableIntcCtx, 2), 0, "negative iDisableIntc of a masked cause should return 0");
 
             R5900Context enableIntcCtx{};
             setRegU32(enableIntcCtx, 4, 2u);
             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1A), env.rdram.data(), &enableIntcCtx, &env.runtime),
                      "negative iEnableIntc syscall id should dispatch");
-            t.Equals(getRegS32(enableIntcCtx, 2), KE_OK, "negative iEnableIntc should return KE_OK");
+            t.Equals(getRegS32(enableIntcCtx, 2), 1, "negative iEnableIntc should return 1 when it unmasks the cause");
 
             R5900Context disableDmacCtx{};
             setRegU32(disableDmacCtx, 4, 5u);
             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1D), env.rdram.data(), &disableDmacCtx, &env.runtime),
                      "negative iDisableDmac syscall id should dispatch");
-            t.Equals(getRegS32(disableDmacCtx, 2), KE_OK, "negative iDisableDmac should return KE_OK");
+            t.Equals(getRegS32(disableDmacCtx, 2), 0, "negative iDisableDmac of a masked channel should return 0");
 
             R5900Context enableDmacCtx{};
             setRegU32(enableDmacCtx, 4, 5u);
             t.IsTrue(callSyscall(static_cast<uint32_t>(-0x1C), env.rdram.data(), &enableDmacCtx, &env.runtime),
                      "negative iEnableDmac syscall id should dispatch");
-            t.Equals(getRegS32(enableDmacCtx, 2), KE_OK, "negative iEnableDmac should return KE_OK");
+            t.Equals(getRegS32(enableDmacCtx, 2), 1, "negative iEnableDmac should return 1 when it unmasks the channel");
 
             R5900Context setEventFlagCtx{};
             setRegU32(setEventFlagCtx, 4, static_cast<uint32_t>(eid));
