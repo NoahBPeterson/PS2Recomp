@@ -38,6 +38,9 @@ namespace ps2x::iop::detail
         constexpr uint32_t kCallStackSize = 0x2000u;
         constexpr uint32_t kCallStackCapacity = (kCallStackLimit - kCallStackBase) / kCallStackSize;
         constexpr uint64_t kCdvdCompletionCycles = 128u;
+        // sceSifSetDmaIntr's callback: the copy itself is immediate, the callback runs a little later
+        // from the scheduler, as the SIF DMA interrupt would.
+        constexpr uint64_t kSifDmaCompletionCycles = 128u;
 
         uint32_t physicalAddress(uint32_t address)
         {
@@ -307,6 +310,9 @@ namespace ps2x::iop::detail
                     secrMcDevIdHandler = {a0, cpu.gpr[28]};
                     setV0(0);
                     return ImportDisposition::Handled;
+                case 6: // SecrAuthCard(port, slot, cnum): no MagicGate here, every card authenticates
+                    setV0(1);
+                    return ImportDisposition::Handled;
                 default:
                     break;
                 }
@@ -319,6 +325,17 @@ namespace ps2x::iop::detail
             }
             if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
                 return ImportDisposition::Handled;
+            if (iequals(call.library, "sifman") && call.ordinal == 32u)
+            {
+                // sceSifSetDmaIntr(transfers, count, func, data): sceSifSetDma, then func(data) once the
+                // transfer completes (SIFMAN runs it from the DMA interrupt).
+                const uint32_t function = cpu.gpr[6], argument = cpu.gpr[7];
+                (void)rpc.dispatchSifManImport(7u, cpu);
+                if (cpu.gpr[2] != 0u && function != 0u)
+                    pendingGuestCallbacks.emplace(totalCycles + kSifDmaCompletionCycles,
+                                                  ScheduledGuestCallback{function, cpu.gpr[28], argument});
+                return ImportDisposition::Handled;
+            }
             if (iequals(call.library, "sifman"))
             {
                 return rpc.dispatchSifManImport(call.ordinal, cpu)

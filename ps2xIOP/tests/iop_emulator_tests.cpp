@@ -628,6 +628,78 @@ namespace
         std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
     }
 
+    // MCMAN's and PADMAN's other SIFMAN/SECRMAN imports: sceSifSetDmaIntr (sifman:32) copies like
+    // sceSifSetDma and later calls func(data); SecrAuthCard (secrman:6) authenticates every card.
+    // Results: 0x10290 = sceSifSetDmaIntr's v0, 0x10294 = SecrAuthCard's v0, 0x10298 = the callback's a0.
+    void writeSifDmaIntrIrx(TestHost &host, uint32_t address)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t sifmanTable = loadAddress + 0x100u;
+        constexpr uint32_t setDmaIntrStub = sifmanTable + 20u;
+        constexpr uint32_t secrmanTable = loadAddress + 0x1C0u;
+        constexpr uint32_t authCardStub = secrmanTable + 20u;
+        constexpr uint32_t descriptorAddress = loadAddress + 0x180u;
+        constexpr uint32_t payloadAddress = loadAddress + 0x1A0u;
+        constexpr uint32_t eeDestination = 0xC40u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu; header.ident[1] = 'E'; header.ident[2] = 'L'; header.ident[3] = 'F';
+        header.ident[4] = 1u; header.ident[5] = 1u; header.ident[6] = 1u;
+        header.type = 2u; header.machine = 8u; header.version = 1u;
+        header.entry = loadAddress; header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader); header.phentsize = sizeof(ProgramHeader); header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u; program.offset = codeOffset; program.vaddr = loadAddress; program.paddr = loadAddress;
+        program.filesz = 0x300u; program.memsz = 0x300u; program.flags = 7u; program.align = 4u;
+
+        const auto jal = [](uint32_t target) { return 0x0C000000u | ((target >> 2u) & 0x03FFFFFFu); };
+        const uint32_t entry[] = {
+            0x27BDFFF0u, 0xAFBF000Cu,             // addiu sp, -16; sw ra, 12(sp)
+            0x3C040001u, 0x34840180u,             // a0 = descriptor
+            0x24050001u,                          // a1 = 1 transfer
+            0x3C060001u, 0x34C60140u,             // a2 = callback
+            0x34075A5Au,                          // a3 = 0x5A5A
+            jal(setDmaIntrStub), 0x00000000u,
+            0x3C080001u, 0xAD020290u,             // sw v0, 0x290(0x10000)
+            0x24040000u, 0x24050000u, 0x24060000u, // port 0, slot 0, cnum 0
+            jal(authCardStub), 0x00000000u,
+            0x3C080001u, 0xAD020294u,             // sw v0, 0x294(0x10000)
+            0x8FBF000Cu, 0x27BD0010u, 0x03E00008u, 0x00001021u,
+        };
+        const uint32_t callback[] = {
+            0x3C080001u, 0xAD040298u, // sw a0, 0x298(0x10000)
+            0x03E00008u, 0x00001021u,
+        };
+        const uint32_t sifmanImports[] = {
+            0x41E00000u, 0u, 0x00000101u,
+            0x6D666973u, 0x00006E61u, // "sifman"
+            0x03E00008u, 0x24000020u, // sceSifSetDmaIntr
+            0u, 0u,
+        };
+        const uint32_t secrmanImports[] = {
+            0x41E00000u, 0u, 0x00000104u,
+            0x72636573u, 0x006E616Du, // "secrman"
+            0x03E00008u, 0x24000006u, // SecrAuthCard
+            0u, 0u,
+        };
+        const uint32_t descriptor[] = {payloadAddress, eeDestination, sizeof(uint32_t), 0u};
+        constexpr uint32_t payload = 0x494E5452u; // "RTNI"
+
+        std::vector<uint8_t> segment(program.filesz, 0u);
+        std::memcpy(segment.data(), entry, sizeof(entry));
+        std::memcpy(segment.data() + 0x100u, sifmanImports, sizeof(sifmanImports));
+        std::memcpy(segment.data() + 0x140u, callback, sizeof(callback));
+        std::memcpy(segment.data() + 0x180u, descriptor, sizeof(descriptor));
+        std::memcpy(segment.data() + 0x1A0u, &payload, sizeof(payload));
+        std::memcpy(segment.data() + 0x1C0u, secrmanImports, sizeof(secrmanImports));
+        std::memset(host.guest.data() + address, 0, codeOffset + program.filesz);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, segment.data(), segment.size());
+    }
+
     void writeMcmanRegistrationIrx(TestHost &host, uint32_t address)
     {
         constexpr uint32_t codeOffset = 0x100u;
@@ -1090,6 +1162,25 @@ int main()
                 "sceSifDmaStat did not report the synchronous transfer as complete")) return 1;
     if (!expect(sifDmaPayload == 0x53494621u,
                 "IOP sceSifSetDma did not copy the payload into EE memory")) return 1;
+
+    iop.reset();
+    writeSifDmaIntrIrx(host, 0x100u);
+    const ModuleLoadResult sifDmaIntrModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(sifDmaIntrModule.handled && sifDmaIntrModule.startResult == 0,
+                "Synthetic sceSifSetDmaIntr IRX did not start")) return 1;
+    uint32_t intrPayload = 0u;
+    std::memcpy(&intrPayload, host.guest.data() + 0xC40u, sizeof(intrPayload));
+    uint32_t dmaIntrId = 0u, authResult = 0u, callbackArg = 0u;
+    if (!expect(iop.readMemory(0x00010290u, &dmaIntrId, 4u) && iop.readMemory(0x00010294u, &authResult, 4u) &&
+                    iop.readMemory(0x00010298u, &callbackArg, 4u),
+                "Could not read the sceSifSetDmaIntr markers")) return 1;
+    if (!expect(intrPayload == 0x494E5452u, "sceSifSetDmaIntr did not copy the payload into EE memory") ||
+        !expect(dmaIntrId != 0u, "sceSifSetDmaIntr did not return a transfer id") ||
+        !expect(authResult == 1u, "SecrAuthCard did not report success") ||
+        !expect(callbackArg == 0u, "sceSifSetDmaIntr ran its callback before the transfer completed")) return 1;
+    iop.runEeCycles(8u * 4096u);
+    if (!expect(iop.readMemory(0x00010298u, &callbackArg, 4u) && callbackArg == 0x5A5Au,
+                "sceSifSetDmaIntr did not call func(data) after the transfer")) return 1;
 
     iop.reset();
     writeVblankSchedulingIrx(host, 0x100u);
