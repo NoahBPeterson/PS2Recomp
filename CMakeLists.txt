@@ -116,14 +116,14 @@ option(PS2X_COVERAGE "Instrument ps2_runtime, ps2_iop and the test/tool executab
 if(PS2X_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(_ps2x_cov_flags -fprofile-instr-generate -fcoverage-mapping)
     foreach(_t ps2_runtime ps2_iop ps2_test_lib ps2x_tests ps2x_gs_replay ps2x_vu1_replay ps2x_vu1_rec_gen
-               ps2x_vu1_pcsx2_diff)
+               ps2x_vu1_pcsx2_diff ps2x_vif1_pcsx2_diff)
         if(TARGET ${_t})
             target_compile_options(${_t} PRIVATE ${_ps2x_cov_flags})
             target_compile_definitions(${_t} PRIVATE PS2X_COVERAGE=1)
         endif()
     endforeach()
     # Every executable that links an instrumented library needs the profile runtime.
-    foreach(_t ps2x_tests ps2x_gs_replay ps2x_vu1_replay ps2x_vu1_rec_gen ps2x_vu1_pcsx2_diff ps2EntryRunner
+    foreach(_t ps2x_tests ps2x_gs_replay ps2x_vu1_replay ps2x_vu1_rec_gen ps2x_vu1_pcsx2_diff ps2x_vif1_pcsx2_diff ps2EntryRunner
                ps2x_ee_oracle_wide ps2_gs_clut_cache_tests ps2_gs_depth_test_tests ps2_gs_memory_cache_tests
                ps2_gs_texture_cache_tests)
         if(TARGET ${_t})

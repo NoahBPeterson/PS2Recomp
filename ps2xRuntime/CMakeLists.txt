@@ -585,6 +585,29 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
         add_executable(ps2x_vu1_pcsx2_diff tools/vu1_pcsx2_diff/vu1_pcsx2_diff.cpp)
         target_link_libraries(ps2x_vu1_pcsx2_diff PRIVATE ps2_runtime ps2x_vu1_pcsx2_ref)
     endif()
+    # VIF1 command interpreter vs PCSX2's VIF1 interpreter on random VIF1 packets
+    # (tools/vif1_pcsx2_diff), with PCSX2's Vif_Codes/Vif_Transfer/Vif_Unpack compiled from the same
+    # PCSX2 tree the same way (stand-ins in tools/vif1_pcsx2_diff/shim).
+    if(PS2X_PCSX2_SRC AND EXISTS "${PS2X_PCSX2_SRC}/pcsx2/Vif_Codes.cpp")
+        set(_vifref ${CMAKE_CURRENT_BINARY_DIR}/pcsx2_ref_vif1)
+        foreach(f Vif_Codes.cpp Vif_Transfer.cpp Vif_Unpack.cpp)
+            configure_file(${PS2X_PCSX2_SRC}/pcsx2/${f} ${_vifref}/${f} COPYONLY)
+        endforeach()
+        foreach(f Vif.h Vif_Dma.h Vif_Unpack.h)
+            configure_file(${PS2X_PCSX2_SRC}/pcsx2/${f} ${_vifref}/include/${f} COPYONLY)
+        endforeach()
+        add_library(ps2x_vif1_pcsx2_ref STATIC tools/vif1_pcsx2_diff/pcsx2_vif_ref.cpp
+            ${_vifref}/Vif_Codes.cpp ${_vifref}/Vif_Transfer.cpp ${_vifref}/Vif_Unpack.cpp)
+        target_include_directories(ps2x_vif1_pcsx2_ref PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/vif1_pcsx2_diff/shim ${_vifref}/include)
+        if(MSVC)
+            target_compile_options(ps2x_vif1_pcsx2_ref PRIVATE /w)
+        else()
+            target_compile_options(ps2x_vif1_pcsx2_ref PRIVATE -w)
+        endif()
+        add_executable(ps2x_vif1_pcsx2_diff tools/vif1_pcsx2_diff/vif1_pcsx2_diff.cpp)
+        target_link_libraries(ps2x_vif1_pcsx2_diff PRIVATE ps2_runtime ps2x_vif1_pcsx2_ref)
+    endif()
 endif()
 
 set(PS2X_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list for ps2_runtime/ps2_iop (e.g. address,undefined or thread)")

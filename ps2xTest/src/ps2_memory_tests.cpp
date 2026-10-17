@@ -428,7 +428,8 @@ void register_ps2_memory_tests()
 
             // UNPACK V4_32: opcode 0x6C (vn=3, vl=0), num=0 => 256 vectors, 16 bytes each.
             std::vector<uint8_t> packet;
-            packet.reserve(4u + 4096u);
+            packet.reserve(8u + 4096u);
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1 (CYCLE=0 means WL=256)
             appendU32(packet, makeVifCmd(0x6Cu, 0u, 0u));
             for (uint32_t i = 0; i < 4096u; ++i)
             {
@@ -725,6 +726,7 @@ void register_ps2_memory_tests()
             std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
 
             std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
             appendU32(packet, makeVifCmd(0x30u, 0u, 0u)); // STROW
             appendU32(packet, 10u);
             appendU32(packet, 20u);
