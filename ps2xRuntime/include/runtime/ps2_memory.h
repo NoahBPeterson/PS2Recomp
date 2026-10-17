@@ -275,6 +275,9 @@ public:
     void resumeVIF1AfterStall();
     void walkDmaChain(uint32_t channelBase, uint32_t chcr, DmaChainCursor &cursor, std::vector<uint8_t> &chainBuf,
                       Vif1ChainSources *sources);
+    // Bytes the last chain on each channel gathered (VIF0, VIF1, GIF): the next chain buffer
+    // reserves that much instead of growing by repeated reallocation.
+    std::array<size_t, 3> m_chainBytesHint{};
     // VIF1 i-bit stall: data behind the stall, and whether the VIF1 DMA
     // completion is held until the stall is released.
     bool m_vif1IrqStallPending = false;

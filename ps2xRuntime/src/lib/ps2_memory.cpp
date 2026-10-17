@@ -1458,9 +1458,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     cursor.asp = (chcr >> 4) & 0x3u;
                     cursor.lastTagUpper = (chcr >> 16) & 0xFFFFu;
                     std::vector<uint8_t> chainBuf;
+                    size_t &chainHint = m_chainBytesHint[(channelBase >> 12u) - 0x10008u]; // 0x10008000..0x1000A000
+                    chainBuf.reserve(chainHint);
                     Vif1ChainSources chainSources;
                     chainSources.chcr = chcr;
                     walkDmaChain(channelBase, chcr, cursor, chainBuf, channelBase == 0x10009000u ? &chainSources : nullptr);
+                    chainHint = chainBuf.size();
                     const uint32_t tagAddr = cursor.tagAddr;
                     const uint32_t asr0 = cursor.asr0;
                     const uint32_t asr1 = cursor.asr1;
