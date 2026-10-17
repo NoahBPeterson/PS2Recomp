@@ -1603,12 +1603,19 @@ namespace
     template <int FP, int ZP>
     struct PixelWriter
     {
-        static inline void write(RasterCtx &rc, const PixelSetup &ps, int x, int y, uint32_t z,
+        [[gnu::always_inline]] static inline void write(RasterCtx &rc, const PixelSetup &ps, int x, int y, uint32_t z,
                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
         {
             if (x < ps.sx0 || x > ps.sx1 || y < ps.sy0 || y > ps.sy1)
                 return;
+            writeInScissor(rc, ps, x, y, z, r, g, b, a, fog);
+        }
 
+        // write() for a pixel the caller has already clipped to the scissor (sprite and
+        // triangle spans are cut to it).
+        [[gnu::always_inline]] static inline void writeInScissor(RasterCtx &rc, const PixelSetup &ps, int x, int y, uint32_t z,
+                                                                 uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
+        {
             if (ps.fge)
             {
                 const uint32_t inverseFog = 255u - fog;
@@ -2100,7 +2107,7 @@ namespace
                     uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
                     const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                    W::write(rc, ps, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                    W::writeInScissor(rc, ps, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
                 }
             }
         }
@@ -2111,7 +2118,7 @@ namespace
                 if (!rc.owns(y))
                     continue;
                 for (int x = left; x < right; ++x)
-                    W::write(rc, ps, x, y, z1, r, g, b, a, v1.fog);
+                    W::writeInScissor(rc, ps, x, y, z1, r, g, b, a, v1.fog);
             }
         }
     }
@@ -2276,7 +2283,7 @@ namespace
 
                 // Fog is only consumed when FGE is set.
                 const uint8_t fog = fge ? clampU8(static_cast<int>(pf.at(rx, ry))) : uint8_t{0};
-                W::write(rc, ps, x, y, static_cast<u32>(zv), r, g, b, a, fog);
+                W::writeInScissor(rc, ps, x, y, static_cast<u32>(zv), r, g, b, a, fog);
             }
         }
     }

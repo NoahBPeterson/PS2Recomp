@@ -3,7 +3,8 @@
 // Format: tickets/notes/gs-dump-format.md.
 //
 //   ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet]
-//                  [--full-frame] [--ref <dir> [--tol T] [--max-bad N]]
+//                  [--full-frame] [--ref <dir> [--tol T] [--max-bad N]] [--repeat N]
+// --repeat N replays the whole dump N times, each from the dump's saved state (for profiling).
 // --full-frame presents whole framebuffers of interlaced FFMD=0 displays rather than the current
 // field line-doubled: PCSX2's SaveFrame output, for comparing with its frames (paraLLEl-GS:
 // force_progressive).
@@ -32,6 +33,7 @@
 
 #include "raylib.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -379,11 +381,11 @@ namespace
         std::fprintf(stderr, "usage: ps2x_gs_replay <dump.gs> [--backend cpu|parallel] [--out <dir>] [--frames N] [--quiet] [--full-frame]\n"
                              "                      [--ref <dir> [--tol T] [--max-bad N]] [--vram-at <packet> <file>] [--vram-frame <N> <file>]\n"
                              "                      [--tex-at <packet> <TEX0 hex> <file.png>]...\n"
-                             "                      [--hash-out <file>] [--hash-ref <file>] [--hash-every <packets>]\n");
+                             "                      [--hash-out <file>] [--hash-ref <file>] [--hash-every <packets>] [--repeat N]\n");
     }
 }
 
-int main(int argc, char **argv)
+static int replayOnce(int argc, char **argv)
 {
     std::string dumpPath, outDir = ".", backendName = "cpu", refDir;
     uint32_t maxFrames = UINT32_MAX;
@@ -703,5 +705,22 @@ int main(int argc, char **argv)
         std::printf("%s: %u/%u frame(s) match %s\n", mismatches ? "FAIL" : "PASS", frames - mismatches, frames, refDir.c_str());
         return mismatches ? 3 : 0;
     }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    std::vector<char *> args(argv, argv + argc);
+    uint32_t repeat = 1u;
+    for (size_t i = 1; i + 1 < args.size(); ++i)
+        if (std::string(args[i]) == "--repeat")
+        {
+            repeat = std::max<uint32_t>(1u, static_cast<uint32_t>(std::strtoul(args[i + 1], nullptr, 10)));
+            args.erase(args.begin() + static_cast<std::ptrdiff_t>(i), args.begin() + static_cast<std::ptrdiff_t>(i) + 2);
+            break;
+        }
+    for (uint32_t run = 0; run < repeat; ++run)
+        if (const int rc = replayOnce(static_cast<int>(args.size()), args.data()))
+            return rc;
     return 0;
 }
