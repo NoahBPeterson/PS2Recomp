@@ -426,6 +426,33 @@ namespace ps2x::iop::detail
         return m_heapCursor < HeapLimit ? HeapLimit - m_heapCursor : 0u;
     }
 
+    IopMemory::FreeBlockStats IopMemory::freeBlockStats() const
+    {
+        constexpr uint32_t kUnit = 256u;
+        std::vector<Allocation> blocks = m_allocations;
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        FreeBlockStats stats;
+        uint32_t cursor = alignUp(HeapBase, kUnit);
+        auto gap = [&](uint32_t end)
+        {
+            end &= ~(kUnit - 1u);
+            if (end > cursor)
+            {
+                stats.largest = std::max(stats.largest, end - cursor);
+                stats.total += end - cursor;
+            }
+        };
+        for (const Allocation &block : blocks)
+        {
+            if (block.address + block.size <= HeapBase || block.address >= HeapLimit)
+                continue;
+            gap(block.address);
+            cursor = std::max(cursor, alignUp(block.address + block.size, kUnit));
+        }
+        gap(HeapLimit);
+        return stats;
+    }
+
     std::optional<IopMemory::Allocation> IopMemory::allocationContaining(uint32_t address) const
     {
         const auto block = std::find_if(m_allocations.begin(), m_allocations.end(),

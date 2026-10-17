@@ -942,7 +942,8 @@ namespace ps2x::iop::detail
 
     void IopKernel::endTimeslice(IopThread &thread, uint32_t returnSentinel)
     {
-        if (thread.cpu.pc == returnSentinel || thread.cpu.stopped)
+        // ExitDeleteThread has already marked the thread Dead: keep that, so it is removed below.
+        if (thread.state != IopThreadState::Dead && (thread.cpu.pc == returnSentinel || thread.cpu.stopped))
             thread.state = IopThreadState::Dormant;
         else if (thread.state == IopThreadState::Running)
             thread.state = IopThreadState::Ready;

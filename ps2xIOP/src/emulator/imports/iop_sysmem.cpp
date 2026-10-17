@@ -38,9 +38,11 @@ namespace ps2x::iop::detail
         case 6: // QueryMemSize
             setV0(IopMemory::RamSize);
             return true;
-        case 7: // QueryMaxFreeMemSize
-        case 8: // QueryTotalFreeMemSize
-            setV0(m_memory.maxFreeMemory());
+        case 7: // QueryMaxFreeMemSize: the largest free block
+            setV0(m_memory.freeBlockStats().largest);
+            return true;
+        case 8: // QueryTotalFreeMemSize: all free blocks together
+            setV0(m_memory.freeBlockStats().total);
             return true;
         case 9:  // QueryBlockTopAddress
         case 10: // QueryBlockSize
@@ -59,7 +61,9 @@ namespace ps2x::iop::detail
         {
             const std::string format = m_memory.readString(a0, 512u);
             m_host.log(LogLevel::Info, std::string("[IOP Kprintf] ") + format);
-            setV0(static_cast<uint32_t>(format.size()));
+            // SYSMEM's Kprintf returns what the handler installed with KprintfSet returns; a retail
+            // boot installs none, and then it returns 0.
+            setV0(0u);
             return true;
         }
         case 15:

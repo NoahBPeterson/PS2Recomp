@@ -64,6 +64,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t allocateSysmemBlock(uint32_t size, BlockPlacement placement, uint32_t address = 0u);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
+        // SYSMEM's view of the heap: free blocks are the 256-byte-aligned gaps between allocations.
+        struct FreeBlockStats
+        {
+            uint32_t largest = 0, total = 0;
+        };
+        [[nodiscard]] FreeBlockStats freeBlockStats() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
         // The unallocated heap range around `address` (between its neighbouring allocations).
         [[nodiscard]] std::optional<Allocation> freeGapContaining(uint32_t address) const;

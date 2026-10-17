@@ -255,6 +255,9 @@ namespace gt
             bool ignoreV0 = false; // void function: v0 is leftover
             // Run by the program's helper thread rather than the step thread (see Program::helperParam).
             bool helper = false;
+            // v0 is compared as its difference from the program's first step with the same import
+            // (free-memory sizes: each world's kernel occupies a different amount of RAM).
+            bool relative = false;
         };
         // A case: steps plus its data area (inputs and out-buffers). Several cases share one IRX.
         struct Program
@@ -1233,7 +1236,22 @@ namespace gt
             const uint32_t ops = r.range(2, 16);
             for (uint32_t i = 0; i < ops; ++i)
             {
-                const uint32_t ord = r.chance(40) ? focus : r.pick(std::vector<uint32_t>{4, 4, 5, 9, 10, 6});
+                const uint32_t ord = r.chance(40) ? focus : r.pick(std::vector<uint32_t>{4, 4, 5, 9, 10, 6, 7, 8});
+                if (ord == 7 || ord == 8)
+                {
+                    p.steps.push_back({"sysmem", static_cast<uint16_t>(ord), {}, false,
+                                       ord == 7 ? "QueryMaxFreeMemSize()" : "QueryTotalFreeMemSize()"});
+                    p.steps.back().relative = true;
+                    continue;
+                }
+                if (ord == 14)
+                {
+                    const uint32_t fmt = garbageBlock(r, p.data, 4);
+                    const char text[16] = "gt %d\n";
+                    std::memcpy(p.data.data() + fmt, text, sizeof(text));
+                    p.steps.push_back({"sysmem", 14, {D(fmt), C(r.u32())}, false, "Kprintf(\"gt %d\\n\", ...)"});
+                    continue;
+                }
                 if (ord == 4 || blocks.empty())
                 {
                     const uint32_t mode = r.chance(70) ? 0u : 1u; // ALLOC_FIRST, ALLOC_LAST
@@ -1274,6 +1292,59 @@ namespace gt
             for (const Block &b : blocks)
                 if (b.live)
                     p.steps.push_back({"sysmem", 5, {R(static_cast<uint32_t>(b.step))}, false, "FreeSysMemory(block" + std::to_string(b.step) + ") cleanup"});
+            p.note = std::to_string(p.steps.size()) + " calls";
+            return p;
+        }
+
+        // Thread exit (ExitThread, ExitDeleteThread) and GetSystemTime. The step thread blocks on a
+        // semaphore; the helper (lower priority) takes its ID, maybe reads the system time, signals,
+        // and exits. Its step after the exit must never run: it would signal the semaphore again,
+        // which PollSema shows. Then the exited helper is inspected and deleted (ExitDeleteThread has
+        // already deleted it). GetSystemTime's clock differs between the worlds: only v0 is compared.
+        Program exitProgram(Rng &r, uint32_t focus)
+        {
+            Program p;
+            auto helper = [&](Step st)
+            {
+                st.helper = true;
+                st.text = "[helper] " + st.text;
+                p.steps.push_back(std::move(st));
+            };
+            p.helperParam = garbageBlock(r, p.data, 5);
+            putWords(p.data, p.helperParam, {0x02000000u /* TH_C */, 0u, 0u, 0x800u, 40u});
+            p.wordKinds[p.helperParam + 8u] = 2; // the entry, stored at run time: an address in the probe
+            const uint32_t semaParam = garbageBlock(r, p.data, 4);
+            putWords(p.data, semaParam, {0u, r.u32(), 0u, 2u});
+            p.steps.push_back({"thsemap", 4, {D(semaParam)}, true, "CreateSema(done, 0/2)"});
+            const uint32_t done = 0;
+            p.steps.push_back({"thsemap", 8, {R(done)}, false, "WaitSema(done) blocks"});
+            helper({"thbase", 20, {}, true, "GetThreadId()"});
+            const uint32_t helperId = static_cast<uint32_t>(p.steps.size() - 1);
+            const uint32_t times = focus == 34 ? r.range(1, 3) : r.range(0, 1);
+            for (uint32_t i = 0; i < times; ++i)
+            {
+                const uint32_t clk = garbageBlock(r, p.data, 2);
+                helper({"thbase", 34, {D(clk)}, false, "GetSystemTime(&clk)"});
+                p.wordKinds[clk] = 0;
+                p.wordKinds[clk + 4u] = 0;
+            }
+            helper({"thsemap", 6, {R(done)}, false, "SignalSema(done)"});
+            const bool deletes = focus == 9 || (focus != 8 && r.chance(30));
+            helper({"thbase", static_cast<uint16_t>(deletes ? 9 : 8), {}, false, deletes ? "ExitDeleteThread()" : "ExitThread()"});
+            p.steps.back().ignoreV0 = true; // never returns
+            helper({"thsemap", 6, {R(done)}, false, "SignalSema(done) after the exit: must not run"});
+            p.steps.back().ignoreV0 = true;
+            p.steps.push_back({"thbase", 33, {C(r.range(100, 400))}, false, "DelayThread: the helper exits"});
+            p.steps.push_back({"thsemap", 9, {R(done)}, false, "PollSema(done): nothing signalled after the exit"});
+            const uint32_t info = garbageBlock(r, p.data, 17);
+            p.steps.push_back({"thbase", 22, {R(helperId), D(info)}, false, "ReferThreadStatus(helper)"});
+            p.wordKinds[info + 3 * 4] = 2;  // entry
+            p.wordKinds[info + 4 * 4] = 0;  // stack
+            p.wordKinds[info + 6 * 4] = 0;  // gp
+            p.wordKinds[info + 10 * 4] = 1; // waitId
+            p.wordKinds[info + 12 * 4] = 0; // register context
+            p.steps.push_back({"thbase", 5, {R(helperId)}, false, "DeleteThread(helper)"});
+            p.steps.push_back({"thsemap", 5, {R(done)}, false, "DeleteSema(done)"});
             p.note = std::to_string(p.steps.size()) + " calls";
             return p;
         }
@@ -1332,6 +1403,12 @@ namespace gt
                 {"sysmem", 5, "FreeSysMemory", sysmemProgram},
                 {"sysmem", 9, "QueryBlockTopAddress", sysmemProgram},
                 {"sysmem", 10, "QueryBlockSize", sysmemProgram},
+                {"sysmem", 7, "QueryMaxFreeMemSize", sysmemProgram},
+                {"sysmem", 8, "QueryTotalFreeMemSize", sysmemProgram},
+                {"sysmem", 14, "Kprintf", sysmemProgram},
+                {"thbase", 8, "ExitThread", exitProgram, true},
+                {"thbase", 9, "ExitDeleteThread", exitProgram, true},
+                {"thbase", 34, "GetSystemTime", exitProgram, true},
                 {"intrman", 4, "RegisterIntrHandler", intrProgram},
                 {"intrman", 5, "ReleaseIntrHandler", intrProgram},
                 {"intrman", 6, "EnableIntr", intrProgram},
@@ -1350,6 +1427,7 @@ namespace gt
             // One bijection per object kind (the HLE numbers threads, semaphores and event flags
             // separately; Sony's IDs are unique across kinds).
             std::map<std::string, std::map<uint32_t, uint32_t>> fwdByKind, backByKind;
+            std::map<std::string, std::pair<uint32_t, uint32_t>> relativeBase; // Step::relative: first v0 per import
             std::string diff;
             for (size_t k = 0; k < p.steps.size(); ++k)
             {
@@ -1358,6 +1436,14 @@ namespace gt
                 std::string bad;
                 if (st.ignoreV0)
                 {
+                }
+                else if (st.relative)
+                {
+                    const std::string key = st.lib + ":" + std::to_string(st.ord);
+                    const auto base = relativeBase.try_emplace(key, a, b).first->second;
+                    if (a - base.first != b - base.second)
+                        bad = "v0 relative to the first " + key + ": Sony " + std::to_string(static_cast<int32_t>(a - base.first)) +
+                              " HLE " + std::to_string(static_cast<int32_t>(b - base.second));
                 }
                 else if (st.returnsId && static_cast<int32_t>(a) > 0 && static_cast<int32_t>(b) > 0)
                 {
