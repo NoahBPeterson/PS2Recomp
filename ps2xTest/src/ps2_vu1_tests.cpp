@@ -1,4 +1,5 @@
 #include "MiniTest.h"
+#include "ps2_runtime.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -217,6 +218,48 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("runtime: VIF1 MPG + UNPACK + MSCAL run VU1 through the runtime's hook; D-bit stop sets VPU_STAT", [](TestCase &t)
+        {
+            constexpr uint32_t kEBit = 1u << 30, kDBit = 1u << 28;
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize() && runtime.syncCoreSubsystems(), "runtime core binds");
+            PS2Memory &mem = runtime.memory();
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+            // program at 0: vi1 = 3; vf1 = data[0]; data[vi1] = vf1 (E)
+            uploadVu1Mpg(mem, 0u, makeVuIaddiu(1u, 0u, 3), kVuUpperNop);
+            uploadVu1Mpg(mem, 1u, makeVuLq(0xFu, 1u, 0u, 0), kVuUpperNop);
+            uploadVu1Mpg(mem, 2u, makeVuSq(0xFu, 1u, 1u, 0), kVuUpperNop | kEBit);
+            uploadVu1Mpg(mem, 3u, 0x8000033Cu /* lower NOP */, kVuUpperNop);
+            // program at 4: stops on its D bit
+            uploadVu1Mpg(mem, 4u, 0x8000033Cu, kVuUpperNop | kDBit);
+            uploadVu1Mpg(mem, 5u, 0x8000033Cu, kVuUpperNop);
+            uploadVu1Mpg(mem, 6u, 0x8000033Cu, kVuUpperNop | kEBit);
+            uploadVu1Mpg(mem, 7u, 0x8000033Cu, kVuUpperNop);
+
+            // UNPACK V4-32 one qword to address 0, then MSCAL 0
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
+            appendU32(packet, makeVifCmd(0x6Cu, 1u, 0x0000u)); // UNPACK V4-32, num 1, addr 0
+            const float in[4] = {1.5f, -2.0f, 3.25f, 8.0f};
+            for (float f : in)
+            {
+                uint32_t bits;
+                std::memcpy(&bits, &f, 4);
+                appendU32(packet, bits);
+            }
+            appendU32(packet, makeVifCmd(0x14u, 0u, 0x0000u)); // MSCAL 0
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            float out[4] = {};
+            readVuQword(mem.getVU1Data(), 3u, out);
+            t.IsTrue(out[0] == 1.5f && out[1] == -2.0f && out[2] == 3.25f && out[3] == 8.0f,
+                     "the microprogram ran on the unpacked data and stored it at qword 3");
+            t.Equals(runtime.cpu().vu0_vpu_stat & 0x0600u, 0u, "an E-bit end leaves the D/T stop bits clear");
+
+            runtime.cpu().vu0_fbrst = 1u << 10; // DE: D bits stop the program
+            const uint32_t mscal4 = makeVifCmd(0x14u, 0u, 0x0004u);
+            mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscal4), sizeof(mscal4));
+            t.Equals(runtime.cpu().vu0_vpu_stat & 0x0600u, 0x0200u, "a D-bit stop sets VPU_STAT.DBS");
+        });
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;

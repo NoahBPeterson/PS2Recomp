@@ -183,6 +183,70 @@ namespace
         std::memcpy(&value, rdram + addr, sizeof(value));
         return value;
     }
+
+    // SifCallRpc with an end function, run on the EE scheduler: the end function is a scheduler
+    // invocation, and the caller resumes after it.
+    constexpr uint32_t kRpcCbMainPc = 0x00127000u;
+    constexpr uint32_t kRpcCbResumePc = 0x00127004u;
+    constexpr uint32_t kRpcCbEndFuncPc = 0x00127100u;
+    constexpr uint32_t kRpcCbClient = 0x00037000u;
+    constexpr uint32_t kRpcCbRecv = 0x00037100u;
+    constexpr uint32_t kRpcCbEndParam = 0x00ABCDE0u;
+    constexpr uint32_t kRpcCbDbcmanSid = 0x80001300u;
+    constexpr uint32_t kRpcCbCheckVersion = 0x80001363u;
+    struct RpcCallbackProbe
+    {
+        int32_t bindResult = -999, callResult = -999;
+        uint32_t callbacks = 0u, callbackParam = 0u;
+        int32_t busyInCallback = -999, busyAfter = -999;
+        uint32_t recvWord = 0u;
+    };
+    RpcCallbackProbe *gRpcCb = nullptr;
+
+    void testRpcCbMain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        SifInitRpc(rdram, ctx, runtime);
+        setRegU32(*ctx, 4, kRpcCbClient);
+        setRegU32(*ctx, 5, kRpcCbDbcmanSid);
+        setRegU32(*ctx, 6, 0u);
+        SifBindRpc(rdram, ctx, runtime);
+        gRpcCb->bindResult = getRegS32(*ctx, 2);
+
+        setRegU32(*ctx, 4, kRpcCbClient);
+        setRegU32(*ctx, 5, kRpcCbCheckVersion);
+        setRegU32(*ctx, 6, K_SIF_RPC_MODE_NOWAIT);
+        setRegU32(*ctx, 7, 0u);           // send
+        setRegU32(*ctx, 8, 0u);           // ssize
+        setRegU32(*ctx, 9, kRpcCbRecv);   // receive
+        setRegU32(*ctx, 10, 16u);         // rsize
+        setRegU32(*ctx, 11, kRpcCbEndFuncPc);
+        setRegU32(*ctx, 29, K_STACK_ADDR);
+        writeGuestU32(rdram, K_STACK_ADDR, kRpcCbEndParam);
+        ctx->pc = kRpcCbResumePc;
+        SifCallRpc(rdram, ctx, runtime);
+    }
+
+    void testRpcCbEndFunc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ++gRpcCb->callbacks;
+        gRpcCb->callbackParam = ::getRegU32(ctx, 4);
+        R5900Context probe = *ctx;
+        setRegU32(probe, 4, kRpcCbClient);
+        SifCheckStatRpc(rdram, &probe, runtime);
+        gRpcCb->busyInCallback = getRegS32(probe, 2);
+        ctx->pc = 0u;
+    }
+
+    void testRpcCbResume(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        gRpcCb->callResult = getRegS32(*ctx, 2);
+        setRegU32(*ctx, 4, kRpcCbClient);
+        SifCheckStatRpc(rdram, ctx, runtime);
+        gRpcCb->busyAfter = getRegS32(*ctx, 2);
+        std::memcpy(&gRpcCb->recvWord, rdram + kRpcCbRecv, 4u);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
 }
 
 void register_ps2_sif_rpc_tests()
@@ -256,6 +320,35 @@ void register_ps2_sif_rpc_tests()
             const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kClientAddr);
             t.Equals(client.server, 0u,
                      "client server pointer must stay null until the emulated IRX registers its SID");
+        });
+
+        tc.Run("SifCallRpc nowait with an end function: bound to an IOP service, callback runs, caller resumes", [](TestCase &t)
+        {
+            TestEnv env;
+            t.IsTrue(env.runtime.loadIopModule("rom0:DBCMAN").moduleId > 0, "DBCMAN loads");
+            RpcCallbackProbe probe;
+            gRpcCb = &probe;
+            env.runtime.registerFunction(kRpcCbMainPc, testRpcCbMain);
+            env.runtime.registerFunction(kRpcCbResumePc, testRpcCbResume);
+            env.runtime.registerFunction(kRpcCbEndFuncPc, testRpcCbEndFunc);
+            std::memset(env.rdram.data() + kRpcCbRecv, 0xCC, 16u);
+            env.ctx.pc = kRpcCbMainPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), env.ctx);
+            env.runtime.eeScheduler().run();
+            gRpcCb = nullptr;
+
+            const SifRpcClientData client = readGuestStruct<SifRpcClientData>(env.rdram.data(), kRpcCbClient);
+            t.Equals(probe.bindResult, KE_OK, "binding to the IOP service succeeds");
+            t.IsTrue(client.server != 0u, "the client gets a server descriptor for the IOP-side server");
+            if (client.server != 0u)
+                t.Equals(readGuestStruct<uint32_t>(env.rdram.data(), client.server), kRpcCbDbcmanSid,
+                         "the descriptor carries the SID");
+            t.Equals(probe.callbacks, 1u, "the end function runs once");
+            t.Equals(probe.callbackParam, kRpcCbEndParam, "with the end parameter in a0");
+            t.Equals(probe.busyInCallback, 1, "the client is still busy while its end function runs");
+            t.Equals(probe.callResult, 0, "SifCallRpc returns 0 to the resumed caller");
+            t.Equals(probe.busyAfter, 0, "the client is idle afterwards");
+            t.Equals(probe.recvWord, 0x0310u, "the reply is in the receive buffer");
         });
 
         tc.Run("register bind call updates descriptors and payload", [](TestCase &t)
