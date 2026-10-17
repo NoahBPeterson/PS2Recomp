@@ -763,6 +763,10 @@ int main(int argc, char **argv)
             for (auto [a, v] : outside)
                 if ((a >> 28) != 7)
                     ram[a & PS2_RAM_MASK] = pristine[a & PS2_RAM_MASK];
+            // A runaway case may have written anywhere for as long as the watchdog let it, which depends
+            // on timing: restore all of RAM so no later case sees it (the case itself already failed).
+            if (timedOut)
+                std::memcpy(ram.data(), pristine.data(), kRamSize);
             // the scratchpad starts zeroed for every case, as in the oracle; a write there the oracle did
             // not make counts as a difference
             if (uint8_t *spr = runtime->memory().getScratchpad())
