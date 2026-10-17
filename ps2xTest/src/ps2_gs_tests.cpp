@@ -455,11 +455,12 @@ void register_ps2_gs_tests()
                                                 static_cast<uint8_t>(c01 >> shift), static_cast<uint8_t>(c11 >> shift), fx, fy))
                                             << shift;
                             mismatches += GSBilerp::bilerpTexels(c00, c10, c01, c11, fx, fy) != expected;
+                            mismatches += GSBilerp::bilerpTexelsPortable(c00, c10, c01, c11, fx, fy) != expected;
                             ++checked;
                         }
                 }
             t.Equals(checked, uint64_t{1} << 24, "every corner pair and weight pair checked");
-            t.Equals(mismatches, uint64_t{0}, "packed and per-channel filters agree");
+            t.Equals(mismatches, uint64_t{0}, "packed (NEON where built, and portable) and per-channel filters agree");
             t.Equals(GSBilerp::bilerpTexels(0xFFFFFFFFu, 0u, 0u, 0u, 15, 15), 0x00000000u, "weights 15/15 favour the far corner");
             t.Equals(GSBilerp::bilerpTexels(0xFF00FF00u, 0x00FF00FFu, 0xFF00FF00u, 0x00FF00FFu, 8, 0), 0x7F7F7F7Fu, "half way, floored");
         });
