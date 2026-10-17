@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <chrono>
+#include <ctime>
 #include <cstring>
 #include <iostream>
 #include <fstream>
@@ -230,6 +231,59 @@ namespace
                expect(cpu.gpr[2] == 2u, "sceCdSC(-1) did not preserve the stream state");
     }
 
+    // sceCdReadClock (cdvdman:24, imported by MCMAN for save timestamps): sceCdCLOCK {stat, sec, min,
+    // hour, pad, day, month, year} in BCD, from the host clock.
+    bool testCdvdReadClock()
+    {
+        NullHost host;
+        IopMemory memory;
+        IopKernel kernel(memory);
+        kernel.reset();
+        IopCdvd cdvd(host, memory, kernel);
+        cdvd.reset();
+
+        constexpr uint32_t clock = 0x3000u;
+        for (uint32_t i = 0; i < 8u; ++i)
+            memory.write8(clock + i, 0xEEu);
+        const std::time_t before = std::time(nullptr);
+        IopCpuState cpu{};
+        cpu.gpr[4] = clock;
+        if (!expect(cdvd.dispatchImport(24u, cpu), "sceCdReadClock was not handled") ||
+            !expect(cpu.gpr[2] == 1u, "sceCdReadClock did not return 1"))
+            return false;
+        const std::time_t after = std::time(nullptr);
+        const auto fromBcd = [&](uint32_t offset, int lo, int hi, int &out)
+        {
+            const uint8_t b = memory.read8(clock + offset);
+            out = (b >> 4) * 10 + (b & 0xF);
+            return (b & 0xF) < 10 && (b >> 4) < 10 && out >= lo && out <= hi;
+        };
+        int sec = 0, min = 0, hour = 0, day = 0, month = 0, year = 0;
+        if (!expect(memory.read8(clock) == 0u && memory.read8(clock + 4u) == 0u, "sceCdReadClock stat/pad not zero") ||
+            !expect(fromBcd(1, 0, 59, sec) && fromBcd(2, 0, 59, min) && fromBcd(3, 0, 23, hour) &&
+                        fromBcd(5, 1, 31, day) && fromBcd(6, 1, 12, month) && fromBcd(7, 0, 99, year),
+                    "sceCdReadClock wrote a field that is not valid BCD in range"))
+            return false;
+        // the fields are the host's local time at the call (either side of it)
+        bool matches = false;
+        for (std::time_t t : {before, after})
+        {
+            std::tm local{};
+#ifdef _WIN32
+            localtime_s(&local, &t);
+#else
+            localtime_r(&t, &local);
+#endif
+            matches |= local.tm_sec == sec && local.tm_min == min && local.tm_hour == hour && local.tm_mday == day &&
+                       local.tm_mon + 1 == month && local.tm_year % 100 == year;
+        }
+        if (!expect(matches, "sceCdReadClock is not the host's local time"))
+            return false;
+        cpu = {};
+        return expect(cdvd.dispatchImport(24u, cpu), "sceCdReadClock(NULL) was not handled") &&
+               expect(cpu.gpr[2] == 0u, "sceCdReadClock(NULL) did not fail");
+    }
+
     bool testCdvdSearchFile()
     {
         const auto suffix = std::to_string(
@@ -388,7 +442,7 @@ namespace
 
 int main()
 {
-    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
+    if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdReadClock() || !testCdvdSearchFile() ||
         !testTimrmanPeriodicCallback() || !testIntrmanReturnCodes())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";

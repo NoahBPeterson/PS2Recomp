@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <ctime>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -279,6 +280,24 @@ namespace ps2x::iop::detail
             case 13: // sceCdDiskReady
                 cpu.gpr[2] = kCdvdReadyComplete;
                 return true;
+
+            case 24: // sceCdReadClock(sceCdCLOCK *): the RTC as BCD, from the host's local time
+            {
+                const std::time_t now = std::time(nullptr);
+                std::tm local{};
+#ifdef _WIN32
+                localtime_s(&local, &now);
+#else
+                localtime_r(&now, &local);
+#endif
+                const auto bcd = [](int v) { return static_cast<uint8_t>(((v / 10) % 10) << 4 | (v % 10)); };
+                const uint8_t rtc[8] = {0u /* stat */, bcd(local.tm_sec), bcd(local.tm_min), bcd(local.tm_hour), 0u,
+                                        bcd(local.tm_mday), bcd(local.tm_mon + 1), bcd(local.tm_year % 100)};
+                for (uint32_t i = 0; i < 8u && a0 != 0u; ++i)
+                    memory.write8(a0 + i, rtc[i]);
+                cpu.gpr[2] = a0 != 0u ? 1u : 0u;
+                return true;
+            }
 
             case 28: // sceCdStatus
                 cpu.gpr[2] = kCdvdStatusPause;
