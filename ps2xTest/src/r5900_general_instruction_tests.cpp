@@ -37,7 +37,7 @@ namespace
 
     constexpr uint32_t kCop0CauseExcCodeMask = 0x0000007Cu;
     constexpr uint32_t kCop0StatusExl = 0x00000002u;
-    constexpr uint32_t kGeneralExceptionVector = 0x80000080u;
+    constexpr uint32_t kGeneralExceptionVector = 0x80000180u;
     constexpr uint32_t kResetStatus = 0x00010001u; // EIE | IE, as R5900Context leaves it
 
     // ---------------------------------------------------------------- encoding helpers
