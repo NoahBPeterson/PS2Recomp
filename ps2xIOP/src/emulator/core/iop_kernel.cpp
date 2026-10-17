@@ -257,8 +257,8 @@ namespace ps2x::iop::detail
         case 33: // DelayThread
             if (m_currentThread != nullptr)
             {
-                const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz + 999'999ull) / 1'000'000ull;
-                delayCurrentUntil(currentCycle + std::max<uint64_t>(delayCycles, 1u), cpu);
+                const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz) / 1'000'000ull;
+                delayCurrentUntil(currentCycle + std::max(delayCycles, kMinAlarmCycles), cpu);
             }
             setV0(0);
             return true;

@@ -3,6 +3,7 @@
 #include "emulator/core/iop_memory.h"
 #include "emulator/imports/iop_cdvd.h"
 #include "emulator/imports/iop_imports.h"
+#include "emulator/imports/iop_intrman.h"
 #include "emulator/imports/iop_loadcore.h"
 #include "emulator/imports/iop_timrman.h"
 #include "emulator/services/iop_rpc.h"
@@ -326,12 +327,69 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    // Return codes as Sony's INTRMAN gives them (ps2sdk kerr.h), measured by running the firmware module.
+    bool testIntrmanReturnCodes()
+    {
+        constexpr int32_t kIllegalIntrcode = -101, kCpuDi = -102, kIntrDisable = -103;
+        constexpr int32_t kFoundHandler = -104, kNotFoundHandler = -105;
+        IopMemory memory;
+        IopIntrman intrman(memory);
+        intrman.reset();
+        RecordingExecutor executor;
+        IopCpuState cpu{};
+        auto call = [&](uint16_t ordinal, uint32_t a0, uint32_t a1 = 0u, uint32_t a2 = 0u, uint32_t a3 = 0u)
+        {
+            cpu = {};
+            cpu.gpr[4] = a0;
+            cpu.gpr[5] = a1;
+            cpu.gpr[6] = a2;
+            cpu.gpr[7] = a3;
+            if (!intrman.dispatchImport(ordinal, cpu, executor))
+                return 0x7FFFFFFF;
+            return static_cast<int32_t>(cpu.gpr[2]);
+        };
+
+        if (!expect(call(4u, 9u, 0u, 0x1000u, 0u) == 0, "RegisterIntrHandler on a free line") ||
+            !expect(call(4u, 9u, 0u, 0x1000u, 0u) == kFoundHandler, "RegisterIntrHandler twice") ||
+            !expect(call(4u, 50u, 0u, 0x1000u, 0u) == kIllegalIntrcode, "RegisterIntrHandler on line 50") ||
+            !expect(call(5u, 10u) == kNotFoundHandler, "ReleaseIntrHandler with no handler") ||
+            !expect(call(5u, 9u) == 0, "ReleaseIntrHandler"))
+            return false;
+
+        constexpr uint32_t kRes = 0x1000u;
+        if (!expect(call(6u, 9u) == 0, "EnableIntr(9)") ||
+            !expect(call(7u, 9u, kRes) == 0, "DisableIntr(9) when enabled") ||
+            !expect(memory.read32(kRes) == 9u, "DisableIntr stores the line in *res") ||
+            !expect(call(7u, 9u, kRes) == kIntrDisable, "DisableIntr(9) when already disabled") ||
+            !expect(static_cast<int32_t>(memory.read32(kRes)) == kIntrDisable, "*res when already disabled") ||
+            !expect(call(6u, 39u) == kIllegalIntrcode, "EnableIntr on DMA line 39 (no such channel)"))
+            return false;
+
+        // DMA line 33 (channel 1) with its DICR (0x100) and DICR2 (0x200) completion-mode bits.
+        if (!expect(call(6u, 33u | 0x300u) == 0, "EnableIntr(DMA line 33)") ||
+            !expect(call(7u, 33u, kRes) == 0, "DisableIntr(DMA line 33)") ||
+            !expect(memory.read32(kRes) == (33u | 0x300u), "DisableIntr keeps the DMA mode bits in *res"))
+            return false;
+
+        // CpuSuspendIntr reports KE_CPUDI when interrupts were already off.
+        memory.setInterruptControl(1u);
+        if (!expect(call(17u, kRes) == 0, "CpuSuspendIntr with interrupts on") ||
+            !expect(memory.read32(kRes) == 1u, "CpuSuspendIntr stores the previous I_CTRL") ||
+            !expect(call(17u, kRes) == kCpuDi, "CpuSuspendIntr with interrupts off") ||
+            !expect(call(18u, 1u) == 0 && memory.interruptControl() == 1u, "CpuResumeIntr restores I_CTRL"))
+            return false;
+
+        // Reading I_CTRL returns it and clears it (PCSX2 IopHwRead).
+        return expect(memory.read32(0x1F801078u) == 1u, "I_CTRL reads 1") &&
+               expect(memory.read32(0x1F801078u) == 0u, "the read cleared I_CTRL");
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testTimrmanPeriodicCallback() || !testIntrmanReturnCodes())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;
