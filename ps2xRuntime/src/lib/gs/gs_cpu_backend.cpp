@@ -2835,9 +2835,13 @@ uint32_t GSCpuBackend::DefaultRasterThreads()
     }
     // Workers pay off only with asynchronous commands: in the default synchronous mode every GIF
     // packet waits for them, which costs more than it saves (and starves under CPU contention).
-    // With asynchronous commands (the default), 3 workers measured best in game on an 8P+2E M1 Pro (the EE, VU1,
-    // IOP, dispatcher and host threads need cores too).
-    return DefaultAsyncCommands() ? 3u : 1u;
+    // With asynchronous commands (the default): the cores left after the EE (with VU1), the GS
+    // command thread, the IOP and the host threads, 3 to 6. On a 10-core M1 Pro that is 6: GS dump
+    // replays run 25-35% faster than with 3, now that TC's full-screen blur passes really draw.
+    if (!DefaultAsyncCommands())
+        return 1u;
+    const unsigned cores = std::thread::hardware_concurrency();
+    return std::clamp<uint32_t>(cores > 4u ? cores - 4u : 3u, 3u, 6u);
 }
 
 void GSCpuBackend::StartWorkers(uint32_t rasterThreads)
@@ -2867,6 +2871,17 @@ void GSCpuBackend::StartWorkers(uint32_t rasterThreads)
     }
 }
 
+void GSCpuBackend::PrintParallelStats() const
+{
+    const Parallel &p = *m_parallel;
+    std::fprintf(stderr, "[gs:parallel] producer waited %.1f ms, drew %.1f ms serially\n", p.statWaitMs, p.statSerialMs);
+    std::fprintf(stderr, "[gs:parallel] queued=%llu serial=%llu drains=%llu conflicts raw=%llu war=%llu layout=%llu stale=%llu cachedirty=%llu ineligible direct=%llu range=%llu alias=%llu\n",
+                 (unsigned long long)p.statQueued, (unsigned long long)p.statSerial, (unsigned long long)p.statDrains,
+                 (unsigned long long)p.statConflict[0], (unsigned long long)p.statConflict[1], (unsigned long long)p.statConflict[2],
+                 (unsigned long long)p.statConflict[3], (unsigned long long)p.statConflict[4],
+                 (unsigned long long)p.statIneligible[0], (unsigned long long)p.statIneligible[1], (unsigned long long)p.statIneligible[2]);
+}
+
 GSCpuBackend::~GSCpuBackend()
 {
     if (m_async)
@@ -2883,15 +2898,7 @@ GSCpuBackend::~GSCpuBackend()
     {
         DrainUnlocked();
         if (m_parallel->stats)
-        {
-            const Parallel &p = *m_parallel;
-            std::fprintf(stderr, "[gs:parallel] producer waited %.1f ms, drew %.1f ms serially\n", p.statWaitMs, p.statSerialMs);
-            std::fprintf(stderr, "[gs:parallel] queued=%llu serial=%llu drains=%llu conflicts raw=%llu war=%llu layout=%llu stale=%llu cachedirty=%llu ineligible direct=%llu range=%llu alias=%llu\n",
-                         (unsigned long long)p.statQueued, (unsigned long long)p.statSerial, (unsigned long long)p.statDrains,
-                         (unsigned long long)p.statConflict[0], (unsigned long long)p.statConflict[1], (unsigned long long)p.statConflict[2],
-                         (unsigned long long)p.statConflict[3], (unsigned long long)p.statConflict[4],
-                         (unsigned long long)p.statIneligible[0], (unsigned long long)p.statIneligible[1], (unsigned long long)p.statIneligible[2]);
-        }
+            PrintParallelStats();
         m_parallel->stop.store(true, std::memory_order_seq_cst);
         m_parallel->published.fetch_add(1u, std::memory_order_seq_cst); // wakes sleeping workers
         m_parallel->published.notify_all();
@@ -3245,6 +3252,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         if (!queue)
             DrainUnlocked();
         ++(queue ? par.statQueued : par.statSerial);
+        if (par.stats && ((par.statQueued + par.statSerial) & 0x3FFFFu) == 0u)
+            PrintParallelStats(); // runs ended by a signal never reach the destructor
     }
 
     DecodedTexture *activeTexture = PrepareDecodedTexture(state);

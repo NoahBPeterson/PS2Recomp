@@ -72,6 +72,7 @@ private:
     // page cache state) back into the backend. Every path that touches VRAM or the texture
     // caches outside the rasterizer calls this first.
     void DrainUnlocked();
+    void PrintParallelStats() const; // PS2X_GS_STATS: why primitives went to the workers or not
     void DrainUnlocked() const { const_cast<GSCpuBackend *>(this)->DrainUnlocked(); }
     void RetireTexture(std::unique_ptr<DecodedTexture> texture);
     // Producer-side VRAM access that may run while primitives are queued: drains first unless
