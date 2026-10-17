@@ -107,6 +107,12 @@ namespace ee_oracle
                 s.gpr[4 + k].lo = v % 64u;
             else if (c == 'u')
                 s.gpr[4 + k].lo = sx32((uint32_t)v);
+            else if (c == 'U') // a full 64-bit value (64-bit integer arguments)
+                s.gpr[4 + k].lo = v;
+            else if (c == 'n') // a byte count 0..1024 (the random part of a buffer)
+                s.gpr[4 + k].lo = v % 1025u;
+            else if (c == 'P') // a pointer into buffer 0 (equal or overlapping data, e.g. memcmp)
+                s.gpr[4 + k].lo = sx32(kBufBase + (uint32_t)(v % 4u) * 4u);
             else if (c == 'v')
             {
                 // a 128-bit vector of four floats: x,y from this draw, z,w from the next

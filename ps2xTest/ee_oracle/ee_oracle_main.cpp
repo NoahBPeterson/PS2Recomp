@@ -362,6 +362,25 @@ namespace
         d.word("q", -1, want.q, got.q);
     }
 
+    // Manifest kind "stub": the runtime runs an HLE stub in place of the game's own code, so only what the
+    // EE calling convention makes visible to the caller is compared: v0 (64-bit), the callee-saved GPRs
+    // s0-s7/gp/sp/fp/ra, f0 and the callee-saved f20-f31, and memory outside the stack frame. Temporaries,
+    // HI/LO and VU0 registers are the callee's to clobber.
+    // Kinds: "stub" returns in v0, "stub-void" returns nothing (v0 is leftover), "stub-float" returns in f0.
+    void compareAbi(const State &want, const State &got, const std::string &kind, Diffs &d)
+    {
+        static const int kGprs[] = {2, 16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31};
+        for (int i : kGprs)
+            if (i == 2 && kind != "stub")
+                continue;
+            else if (want.gpr[i].lo != got.gpr[i].lo)
+                d.note(false, "gpr%d: oracle %016" PRIx64 "  stub %016" PRIx64, i, want.gpr[i].lo, got.gpr[i].lo);
+        if (kind == "stub-float")
+            d.word("f", 0, want.fpr[0], got.fpr[0]);
+        for (int i = 20; i < 32; ++i)
+            d.word("f", i, want.fpr[i], got.fpr[i]);
+    }
+
     void compareBytes(uint32_t base, const uint8_t *want, const uint8_t *got, size_t n, Diffs &d)
     {
         if (std::memcmp(want, got, n) == 0)
@@ -681,6 +700,7 @@ int main(int argc, char **argv)
             volatile bool returned = false;
             volatile uint32_t lostAt = 0;
             volatile bool timedOut = false;
+            std::string threw;
 #ifdef EE_ORACLE_WATCHDOG
             if (sigsetjmp(g_caseEscape, 1) != 0)
             {
@@ -705,7 +725,16 @@ int main(int argc, char **argv)
                     fn = runtime->lookupFunction(ctx->pc);
                 }
 #endif
-                fn(ram.data(), ctx.get(), runtime.get());
+                try
+                {
+                    fn(ram.data(), ctx.get(), runtime.get());
+                }
+                catch (const std::exception &e)
+                {
+                    // an HLE stub that refuses the call (unimplemented): the case fails, the run goes on
+                    threw = e.what();
+                    break;
+                }
                 if (((verbose && onlyCase >= 0) || (long)c.idx == traceCase) && iter < 64)
                     std::printf("    re-entry %d: pc %08x sp %08x ra %08x\n", iter, ctx->pc,
                                 (uint32_t)_mm_cvtsi128_si32(ctx->r[29]), (uint32_t)_mm_cvtsi128_si32(ctx->r[31]));
@@ -724,13 +753,19 @@ int main(int argc, char **argv)
             Diffs d;
             d.tol = tol;
             d.verbose = verbose;
-            if (timedOut)
+            if (!threw.empty())
+                d.note(false, "threw: %s", threw.substr(0, 160).c_str());
+            else if (timedOut)
                 d.note(false, "did not return within %ld ms (pc %08x): a runaway loop", caseTimeoutMs, ctx->pc);
             else if (lostAt)
                 d.note(false, "no recompiled function at pc %08x (missing from the function map?)", (uint32_t)lostAt);
             else if (!returned)
                 d.note(false, "did not return to ra (pc %08x after 1e6 re-entries)", ctx->pc);
-            compareStates(expect, fromContext(*ctx), d);
+            const bool abi = fv.kind.rfind("stub", 0) == 0;
+            if (abi)
+                compareAbi(expect, fromContext(*ctx), fv.kind, d);
+            else
+                compareStates(expect, fromContext(*ctx), d);
             // expected memory = ELF image + input words + the oracle's writes. The input words are checked
             // in full, every byte the oracle wrote is checked, and a write the oracle did not make anywhere
             // else shows up in the per-function RAM check below.
@@ -751,6 +786,8 @@ int main(int argc, char **argv)
                              ram.data() + kBufBase + b * kBufStride, kBufWords * 4, d);
             for (auto [a, v] : outside)
             {
+                if (abi && (a & 0x1fffffffu) >= kStackLo && (a & 0x1fffffffu) < kStackTop)
+                    continue; // the original's stack frame
                 const uint8_t got = (a >> 28) == 7 ? runtime->Load8(ram.data(), ctx.get(), a)
                                                    : ram[a & PS2_RAM_MASK];
                 if (got != v)
