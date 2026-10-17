@@ -72,7 +72,19 @@ namespace
         bool hasGuestFunction(uint32_t) const override { return false; }
         bool invokeGuestFunction(uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t *) override { return false; }
         void log(LogLevel, std::string_view message) override { logs.emplace_back(message); }
+        bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override
+        {
+            const auto *bytes = static_cast<const uint8_t *>(packet);
+            sifCommands.push_back({commandId, std::vector<uint8_t>(bytes, bytes + packetSize)});
+            return true;
+        }
 
+        struct SifCommand
+        {
+            uint32_t id;
+            std::vector<uint8_t> packet;
+        };
+        std::vector<SifCommand> sifCommands;
         std::vector<uint8_t> guest;
         std::vector<std::string> logs;
         std::string cdRoot;
@@ -134,6 +146,52 @@ namespace
     static_assert(sizeof(ProgramHeader) == 32u);
     static_assert(sizeof(SectionHeader) == 40u);
     static_assert(sizeof(Relocation) == 8u);
+
+    // A one-segment IRX whose code starts at its entry and whose data follows 0x40 bytes later.
+    void writeCodeIrx(TestHost &host,
+                      uint32_t address,
+                      const uint32_t *code,
+                      size_t codeWords,
+                      const uint8_t *data,
+                      size_t dataBytes)
+    {
+        constexpr uint32_t codeOffset = 0x100u;
+        constexpr uint32_t loadAddress = 0x00010000u;
+        constexpr uint32_t dataOffset = 0x40u;
+
+        ElfHeader header{};
+        header.ident[0] = 0x7Fu;
+        header.ident[1] = 'E';
+        header.ident[2] = 'L';
+        header.ident[3] = 'F';
+        header.ident[4] = 1u;
+        header.ident[5] = 1u;
+        header.ident[6] = 1u;
+        header.type = 2u;
+        header.machine = 8u;
+        header.version = 1u;
+        header.entry = loadAddress;
+        header.phoff = sizeof(ElfHeader);
+        header.ehsize = sizeof(ElfHeader);
+        header.phentsize = sizeof(ProgramHeader);
+        header.phnum = 1u;
+
+        ProgramHeader program{};
+        program.type = 1u;
+        program.offset = codeOffset;
+        program.vaddr = loadAddress;
+        program.paddr = loadAddress;
+        program.filesz = dataOffset + static_cast<uint32_t>(dataBytes);
+        program.memsz = program.filesz;
+        program.flags = 7u;
+        program.align = 4u;
+
+        std::fill(host.guest.begin() + address, host.guest.begin() + address + codeOffset + program.filesz, 0u);
+        std::memcpy(host.guest.data() + address, &header, sizeof(header));
+        std::memcpy(host.guest.data() + address + sizeof(header), &program, sizeof(program));
+        std::memcpy(host.guest.data() + address + codeOffset, code, codeWords * sizeof(uint32_t));
+        std::memcpy(host.guest.data() + address + codeOffset + dataOffset, data, dataBytes);
+    }
 
     void writeMinimalIrx(TestHost &host, uint32_t address)
     {
@@ -1232,6 +1290,56 @@ int main()
         { return message.find("unhandled import cdvdman:7") != std::string::npos; });
     if (!expect(!emittedUnhandledSeek,
                 "sceCdSeek still emitted an unhandled IOP import")) return 1;
+
+    // IOP -> EE sceSifSendCmd(cid, packet, 32, extra, dest, 16): the extra data lands at the EE
+    // destination first, then the packet goes out with its header filled in (ps2sdk sifcmd.h:
+    // size word = psize | extra size << 8, then the EE destination, then the command ID).
+    iop.reset();
+    host.sifCommands.clear();
+    const uint32_t sendCmd[] = {
+        0x27BDFFE0u, // addiu sp, sp, -32
+        0xAFBF001Cu, // sw    ra, 28(sp)
+        0x3C048000u, // lui   a0, 0x8000
+        0x34840012u, // ori   a0, a0, 0x12      cid 0x80000012
+        0x3C050001u, // lui   a1, 1
+        0x34A50040u, // ori   a1, a1, 0x40      packet (data +0x00)
+        0x24060020u, // addiu a2, zero, 32
+        0x24A70020u, // addiu a3, a1, 0x20      extra (data +0x20)
+        0x24081000u, // addiu t0, zero, 0x1000  EE destination
+        0xAFA80010u, // sw    t0, 16(sp)
+        0x24080010u, // addiu t0, zero, 16      extra size
+        0x0C004025u, // jal   0x10094           sifcmd:12 stub (data +0x54)
+        0xAFA80014u, // sw    t0, 20(sp)
+        0x8FBF001Cu, // lw    ra, 28(sp)
+        0x03E00008u, // jr    ra
+        0x27BD0020u, // addiu sp, sp, 32
+    };
+    std::vector<uint8_t> sendData(0x70u, 0u);
+    for (uint32_t i = 0; i < 32u; ++i)
+        sendData[i] = static_cast<uint8_t>(0xA0u + i); // packet: header bytes are overwritten
+    for (uint32_t i = 0; i < 16u; ++i)
+        sendData[0x20u + i] = static_cast<uint8_t>(0x10u + i); // extra
+    const uint32_t sifcmdImports[] = {0x41E00000u, 0u, 0x00000101u, 0x63666973u, 0x0000646Du, // "sifcmd"
+                                      0x03E00008u, 0x2400000Cu, 0u, 0u};
+    std::memcpy(sendData.data() + 0x40u, sifcmdImports, sizeof(sifcmdImports));
+    writeCodeIrx(host, 0x100u, sendCmd, std::size(sendCmd), sendData.data(), sendData.size());
+    std::fill(host.guest.begin() + 0x1000, host.guest.begin() + 0x1010, uint8_t{0xEE});
+    const ModuleLoadResult sendCmdModule = iop.loadModuleBuffer(0x100u);
+    if (!expect(sendCmdModule.handled && sendCmdModule.startResult > 0,
+                "sceSifSendCmd did not return a DMA ID")) return 1;
+    if (!expect(host.sifCommands.size() == 1u && host.sifCommands[0].id == 0x80000012u &&
+                    host.sifCommands[0].packet.size() == 32u,
+                "sceSifSendCmd did not deliver one 32-byte packet with its command ID")) return 1;
+    uint32_t header[3] = {};
+    std::memcpy(header, host.sifCommands[0].packet.data(), sizeof(header));
+    if (!expect(header[0] == (32u | (16u << 8)) && header[1] == 0x1000u && header[2] == 0x80000012u,
+                "sceSifSendCmd header: size word, EE destination, command ID")) return 1;
+    if (!expect(host.sifCommands[0].packet[12] == 0xACu && host.sifCommands[0].packet[31] == 0xBFu,
+                "sceSifSendCmd changed the packet body")) return 1;
+    bool extraCopied = true;
+    for (uint32_t i = 0; i < 16u; ++i)
+        extraCopied = extraCopied && host.guest[0x1000u + i] == static_cast<uint8_t>(0x10u + i);
+    if (!expect(extraCopied, "sceSifSendCmd did not copy the extra data to the EE destination")) return 1;
 
     std::cout << "ps2xIOP emulator smoke tests passed\n";
     return 0;
