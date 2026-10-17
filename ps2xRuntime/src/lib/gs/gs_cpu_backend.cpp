@@ -2118,78 +2118,132 @@ namespace
     template <class W>
     void drawTriangle(RasterCtx &rc, const GSPrimitiveBatch &batch, const PixelSetup &ps, const TexSetup &ts)
     {
+        // GS triangle rules, as PCSX2's GSRasterizer::DrawTriangle: vertices in 12.4 window
+        // coordinates; the rows with integer y in [ceil(ytop), ceil(ybottom)); on each row the
+        // pixels with integer x in [ceil(xleft), ceil(xright)) between the long edge and the
+        // short edge of that half; every attribute evaluated from its plane equation at the
+        // pixel's integer position. Pixel centres are integers, so a 0..16 square covers 0..15.
         const GSDrawState &state = batch.state;
-        const GSVertex &v0 = batch.vertices[0];
-        const GSVertex &v1 = batch.vertices[1];
-        const GSVertex &v2 = batch.vertices[2];
         const auto &ctx = state.context;
+        const GSVertex *in[3] = {&batch.vertices[0], &batch.vertices[1], &batch.vertices[2]};
 
-        int ofx = ctx.xyoffset.ofx >> 4;
-        int ofy = ctx.xyoffset.ofy >> 4;
-
-        float fx0 = v0.x - static_cast<float>(ofx);
-        float fy0 = v0.y - static_cast<float>(ofy);
-        float fx1 = v1.x - static_cast<float>(ofx);
-        float fy1 = v1.y - static_cast<float>(ofy);
-        float fx2 = v2.x - static_cast<float>(ofx);
-        float fy2 = v2.y - static_cast<float>(ofy);
-
-        int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
-        int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));
-        int minY = static_cast<int>(std::floor(std::min({fy0, fy1, fy2})));
-        int maxY = static_cast<int>(std::ceil(std::max({fy0, fy1, fy2})));
-
-        minX = clampInt(minX, ctx.scissor.x0, ctx.scissor.x1);
-        maxX = clampInt(maxX, ctx.scissor.x0, ctx.scissor.x1);
-        minY = clampInt(minY, ctx.scissor.y0, ctx.scissor.y1);
-        maxY = clampInt(maxY, ctx.scissor.y0, ctx.scissor.y1);
-
-        float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
-        if (std::fabs(denom) < 0.001f)
+        struct P
+        {
+            float x, y;
+            const GSVertex *v;
+        };
+        auto window = [&](const GSVertex *v) -> P
+        {
+            return {static_cast<float>(static_cast<int>(v->x * 16.0f) - static_cast<int>(ctx.xyoffset.ofx)) / 16.0f,
+                    static_cast<float>(static_cast<int>(v->y * 16.0f) - static_cast<int>(ctx.xyoffset.ofy)) / 16.0f, v};
+        };
+        P p[3] = {window(in[0]), window(in[1]), window(in[2])};
+        // Sort by y, keeping kick order among equal y (PCSX2 s_ysort).
+        if (p[1].y < p[0].y)
+            std::swap(p[0], p[1]);
+        if (p[2].y < p[1].y)
+        {
+            std::swap(p[1], p[2]);
+            if (p[1].y < p[0].y)
+                std::swap(p[0], p[1]);
+        }
+        if (p[0].y == p[2].y)
             return;
 
-        const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
-        const float invAbsDenom = 1.0f / std::fabs(denom);
-        constexpr float kEdgeEpsilon = 1.0e-4f;
+        const float dx1 = p[1].x - p[0].x, dy1 = p[1].y - p[0].y;
+        const float dx2 = p[2].x - p[0].x, dy2 = p[2].y - p[0].y;
+        const float cross = dx1 * dy2 - dx2 * dy1;
+        if (cross == 0.0f)
+            return;
+
+        // Plane gradients of an attribute with values a0, a1, a2 at the sorted vertices.
+        struct Plane
+        {
+            double a0 = 0.0, dx = 0.0, dy = 0.0;
+            [[gnu::always_inline]] double at(double fx, double fy) const { return a0 + dx * fx + dy * fy; }
+        };
+        auto plane = [&](double a0, double a1, double a2) -> Plane
+        {
+            // A constant attribute stays exactly constant (also an infinite S or T, which would turn into
+            // NaN through the differences).
+            if (a1 == a0 && a2 == a0)
+                return {a0, 0.0, 0.0};
+            const double d1 = a1 - a0, d2 = a2 - a0;
+            return {a0, (d1 * dy2 - d2 * dy1) / cross, (d2 * dx1 - d1 * dx2) / cross};
+        };
+        auto attr = [&](auto get) -> Plane { return plane(get(*p[0].v), get(*p[1].v), get(*p[2].v)); };
 
         const bool iip = state.prim.iip;
         const bool tme = state.prim.tme;
         const bool fst = state.prim.fst;
         const bool fge = state.prim.fge;
         const auto &tex = ctx.tex0;
+        const GSVertex &flat = batch.vertices[2]; // IIP=0: the last vertex's colour
 
-        for (int y = minY; y <= maxY; ++y)
+        const Plane pz = attr([](const GSVertex &v) { return v.z; });
+        Plane pr, pg, pb, pa, pf, ps_, pt, pq, pu, pv;
+        if (iip)
+        {
+            pr = attr([](const GSVertex &v) { return double(v.r); });
+            pg = attr([](const GSVertex &v) { return double(v.g); });
+            pb = attr([](const GSVertex &v) { return double(v.b); });
+            pa = attr([](const GSVertex &v) { return double(v.a); });
+        }
+        if (fge)
+            pf = attr([](const GSVertex &v) { return double(v.fog); });
+        if (tme)
+        {
+            if (fst)
+            {
+                pu = attr([](const GSVertex &v) { return double(v.u); }); // 12.4
+                pv = attr([](const GSVertex &v) { return double(v.v); });
+            }
+            else
+            {
+                ps_ = attr([](const GSVertex &v) { return double(v.s); });
+                pt = attr([](const GSVertex &v) { return double(v.t); });
+                pq = attr([](const GSVertex &v) { return double(v.q); });
+            }
+        }
+
+        const int top = std::max(static_cast<int>(std::ceil(p[0].y)), static_cast<int>(ctx.scissor.y0));
+        const int bottom = std::min(static_cast<int>(std::ceil(p[2].y)), static_cast<int>(ctx.scissor.y1) + 1);
+        const int scLeft = ctx.scissor.x0, scRight = ctx.scissor.x1 + 1;
+        const float longSlope = dx2 / dy2;
+
+        for (int y = top; y < bottom; ++y)
         {
             if (!rc.owns(y))
                 continue;
-            float py = static_cast<float>(y) + 0.5f;
-            for (int x = minX; x <= maxX; ++x)
+            const float fy = static_cast<float>(y);
+            const float xLong = p[0].x + (fy - p[0].y) * longSlope;
+            float xShort;
+            if (fy < p[1].y)
+                xShort = p[0].x + (fy - p[0].y) * (dx1 / dy1);
+            else
+                xShort = p[1].x + (fy - p[1].y) * ((p[2].x - p[1].x) / (p[2].y - p[1].y));
+            const int left = std::max(static_cast<int>(std::ceil(std::min(xLong, xShort))), scLeft);
+            const int right = std::min(static_cast<int>(std::ceil(std::max(xLong, xShort))), scRight);
+            const double ry = static_cast<double>(fy - p[0].y);
+
+            for (int x = left; x < right; ++x)
             {
-                float px = static_cast<float>(x) + 0.5f;
-
-                float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
-                float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
-                float w2 = 1.0f - w0 - w1;
-
-                if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
-                    continue;
-
-                double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
-
+                const double rx = static_cast<double>(static_cast<float>(x) - p[0].x);
+                const double zv = std::clamp(pz.at(rx, ry), 0.0, 4294967295.0);
                 uint8_t r, g, b, a;
                 if (iip)
                 {
-                    r = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-                    g = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-                    b = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-                    a = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                    r = clampU8(static_cast<int>(pr.at(rx, ry)));
+                    g = clampU8(static_cast<int>(pg.at(rx, ry)));
+                    b = clampU8(static_cast<int>(pb.at(rx, ry)));
+                    a = clampU8(static_cast<int>(pa.at(rx, ry)));
                 }
                 else
                 {
-                    r = v2.r;
-                    g = v2.g;
-                    b = v2.b;
-                    a = v2.a;
+                    r = flat.r;
+                    g = flat.g;
+                    b = flat.b;
+                    a = flat.a;
                 }
 
                 if (tme)
@@ -2199,26 +2253,20 @@ namespace
                     if (fst)
                     {
                         // UV is 12.4: shift to the sampler's 16.16.
-                        texU = static_cast<int>((v0.u * w0 + v1.u * w1 + v2.u * w2) * 4096.0f);
-                        texV = static_cast<int>((v0.v * w0 + v1.v * w1 + v2.v * w2) * 4096.0f);
+                        texU = static_cast<int>(pu.at(rx, ry) * 4096.0);
+                        texV = static_cast<int>(pv.at(rx, ry) * 4096.0);
                     }
                     else
                     {
-                        // The GS DDA interpolates the homogeneous S, T and Q values. Texel
-                        // coordinates are calculated from S/Q and T/Q only after interpolation.
-                        const float is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                        const float it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                        const float invQ = 1.0f / fabsQ(v0.q * w0 + v1.q * w1 + v2.q * w2);
-                        texU = texCoordFixed(is * invQ * static_cast<float>(ts.texW));
-                        texV = texCoordFixed(it * invQ * static_cast<float>(ts.texH));
+                        // The GS interpolates S, T and Q; the texel coordinate is S/Q, T/Q.
+                        const float q = fabsQ(static_cast<float>(pq.at(rx, ry)));
+                        texU = texCoordFixed(static_cast<float>(ps_.at(rx, ry)) / q * static_cast<float>(ts.texW));
+                        texV = texCoordFixed(static_cast<float>(pt.at(rx, ry)) / q * static_cast<float>(ts.texH));
                     }
-
                     const uint32_t texel = sampleTexture(rc, ts, texU, texV);
-                    const uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
-                    const uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-                    const uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
-                    const uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
-                    const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+                    const TextureCombineResult color =
+                        combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel), static_cast<uint8_t>(texel >> 8),
+                                       static_cast<uint8_t>(texel >> 16), static_cast<uint8_t>(texel >> 24));
                     r = color.r;
                     g = color.g;
                     b = color.b;
@@ -2226,8 +2274,8 @@ namespace
                 }
 
                 // Fog is only consumed when FGE is set.
-                const uint8_t fog = fge ? clampU8(static_cast<int>(v0.fog * w0 + v1.fog * w1 + v2.fog * w2)) : uint8_t{0};
-                W::write(rc, ps, x, y, static_cast<u32>(z + 0.5), r, g, b, a, fog);
+                const uint8_t fog = fge ? clampU8(static_cast<int>(pf.at(rx, ry))) : uint8_t{0};
+                W::write(rc, ps, x, y, static_cast<u32>(zv), r, g, b, a, fog);
             }
         }
     }

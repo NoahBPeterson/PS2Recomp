@@ -273,6 +273,7 @@ namespace
         const uint32_t cbp = (tex0 >> 37) & 0x3FFFu, cpsm = (tex0 >> 51) & 0xFu;
         const bool indexed = psm == GS_PSM_T8 || psm == GS_PSM_T4 || psm == GS_PSM_T8H || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
         std::vector<uint8_t> rgba(size_t(w) * h * 4u);
+        static const bool alphaView = std::getenv("PS2X_TEX_ALPHA") != nullptr;
         auto expand = [](uint32_t c, uint32_t p) -> uint32_t
         {
             if (p == GS_PSM_CT16 || p == GS_PSM_CT16S)
@@ -294,7 +295,13 @@ namespace
                 else
                     c = expand(c, psm);
                 uint8_t *o = &rgba[(size_t(y) * w + x) * 4u];
-                o[0] = uint8_t(c), o[1] = uint8_t(c >> 8), o[2] = uint8_t(c >> 16), o[3] = 255u;
+                if (alphaView) // PS2X_TEX_ALPHA=1: alpha as grey (0x80 = 1.0 shows as 255)
+                {
+                    const uint8_t a = uint8_t(std::min<uint32_t>(255u, (c >> 24) * 2u));
+                    o[0] = o[1] = o[2] = a, o[3] = 255u;
+                }
+                else
+                    o[0] = uint8_t(c), o[1] = uint8_t(c >> 8), o[2] = uint8_t(c >> 16), o[3] = 255u;
             }
         std::printf("%s texture tbp=0x%x tbw=%u psm=0x%x %ux%u cbp=0x%x -> %s\n",
                     writePng(path, rgba, w, h) ? "wrote" : "FAILED", tbp, tbw, psm, w, h, cbp, path.c_str());

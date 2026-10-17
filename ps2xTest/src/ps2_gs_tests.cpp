@@ -1063,6 +1063,39 @@ void register_ps2_gs_tests()
                      "CT32 primitives should land in the same local-memory layout that later CT32 texture sampling expects");
         });
 
+        tc.Run("GS triangles cover [ceil(left), ceil(right)) rows [ceil(top), ceil(bottom)) and shade at integer positions", [](TestCase &t)
+        {
+            // PCSX2 GSRasterizer::DrawTriangle: pixel centres are integer coordinates; a row y is
+            // drawn when ceil(ytop) <= y < ceil(ybottom), its pixels x with ceil(xl) <= x < ceil(xr);
+            // attributes come from the plane through the vertices at (x, y).
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+            gs.writeRegister(GS_REG_FRAME_1, (150ull << 0) | (1ull << 16) | (static_cast<uint64_t>(GS_PSM_CT32) << 24));
+            gs.writeRegister(GS_REG_ZBUF_1, 1ull << 32);
+            gs.writeRegister(GS_REG_SCISSOR_1, (7ull << 16) | (7ull << 48));
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, 0x30000ull);
+            gs.writeRegister(GS_REG_ALPHA_1, 0ull);
+            gs.writeRegister(GS_REG_PRIM, static_cast<uint64_t>(GS_PRIM_TRIANGLE) | (1ull << 3)); // IIP
+            // (0,0) R=0, (4,0) R=128, (0,4) R=0: R(x, y) = 32 * x.
+            gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull);
+            gs.writeRegister(GS_REG_XYZ2, 0ull);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80000080ull);
+            gs.writeRegister(GS_REG_XYZ2, 64ull);
+            gs.writeRegister(GS_REG_RGBAQ, 0x80000000ull);
+            gs.writeRegister(GS_REG_XYZ2, 64ull << 16);
+            for (uint32_t y = 0u; y < 6u; ++y)
+                for (uint32_t x = 0u; x < 6u; ++x)
+                {
+                    const bool covered = y < 4u && x < 4u - y; // ceil(4 - y) pixels on row y
+                    const uint32_t pixel = readReferenceFramePSMCT32Pixel(vram, 150u, 1u, x, y);
+                    t.Equals(pixel != 0u, covered, "coverage should follow the ceil rules");
+                    if (covered)
+                        t.Equals(pixel & 0xFFu, 32u * x, "R should be the plane's value at the integer pixel position");
+                }
+        });
+
         tc.Run("GS sprites cover [ceil(min), ceil(max)) and sample at integer pixel positions", [](TestCase &t)
         {
             // GS rasterization (PCSX2 GSRasterizer::DrawSprite): pixel centres sit on integer
@@ -3707,7 +3740,9 @@ void register_ps2_gs_tests()
                 gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, 0ull);
-                gs.writeRegister(GS_REG_ST, packSt(1.0f, 0.0f));
+                // S = 1.5 at x = 4: pixel (1,1) samples S = 0.375, 0.75 texels, a quarter of the way to texel 1
+                // after the half-texel step back (255 * 4 >> 4 = 63).
+                gs.writeRegister(GS_REG_ST, packSt(1.5f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (64ull << 0) | (0ull << 16));
                 gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
                 gs.writeRegister(GS_REG_XYZ2, (0ull << 0) | (64ull << 16));
@@ -3975,8 +4010,8 @@ void register_ps2_gs_tests()
                        (static_cast<uint64_t>(packFloat(q)) << 32);
             };
 
-            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 1u, 0u, kAffineTexel);
-            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kHomogeneousTexel);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 2u, 0u, kAffineTexel);
+            writeReferencePSMCT32Pixel(vram, kTexTbp, 1u, 3u, 0u, kHomogeneousTexel);
 
             gs.writeRegister(GS_REG_FRAME_1, kFrame);
             gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
@@ -3990,17 +4025,19 @@ void register_ps2_gs_tests()
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, 0ull);
-            gs.writeRegister(GS_REG_ST, packSt(2.0f, 0.0f));
-            gs.writeRegister(GS_REG_RGBAQ, packRgbaq(2.0f));
+            gs.writeRegister(GS_REG_ST, packSt(4.0f, 0.0f));
+            gs.writeRegister(GS_REG_RGBAQ, packRgbaq(4.0f));
             gs.writeRegister(GS_REG_XYZ2, 64ull);
             gs.writeRegister(GS_REG_ST, packSt(0.0f, 0.0f));
             gs.writeRegister(GS_REG_RGBAQ, packRgbaq(1.0f));
             gs.writeRegister(GS_REG_XYZ2, (64ull << 16));
 
+            // Pixel (2,0) is sampled at its integer position: S = 2, Q = 2.5, S/Q = 0.8 -> texel 3.2. Dividing
+            // the interpolated S/Q per vertex instead (0 and 1) would give 0.5 -> texel 2.
             const uint32_t pixel =
-                readReferencePSMCT32Pixel(vram, 0u, 1u, 1u, 1u);
+                readReferencePSMCT32Pixel(vram, 0u, 1u, 2u, 0u);
             t.Equals(pixel, kHomogeneousTexel,
-                     "the DDA should interpolate S=0.75 and Q=1.375, selecting texel 2 after S/Q");
+                     "the DDA should interpolate S=2 and Q=2.5 at pixel (2,0), selecting texel 3 after S/Q");
         });
 
         tc.Run("GS alpha-test AFAIL independently masks framebuffer and depth", [](TestCase &t)
@@ -4206,9 +4243,7 @@ void register_ps2_gs_tests()
                 int last = -1;
                 for (uint32_t x = 6u; x <= 26u; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
                     if ((pixel & 0x00FFFFFFu) != 0u)
                     {
                         if (first < 0)
@@ -4227,9 +4262,7 @@ void register_ps2_gs_tests()
                 sawFilledRow = true;
                 for (int x = first; x <= last; ++x)
                 {
-                    const size_t offset = (static_cast<size_t>(y) * 64u + static_cast<size_t>(x)) * 4u;
-                    uint32_t pixel = 0u;
-                    std::memcpy(&pixel, vram.data() + offset, sizeof(pixel));
+                    const uint32_t pixel = readReferencePSMCT32Pixel(vram, 0u, 1u, static_cast<uint32_t>(x), y);
                     if ((pixel & 0x00FFFFFFu) == 0u)
                     {
                         t.Fail("triangle fan quad should not leave interior holes within a covered row");
