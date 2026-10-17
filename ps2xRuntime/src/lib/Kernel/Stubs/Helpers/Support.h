@@ -1794,7 +1794,7 @@ namespace
     // (e.g. a DMA CALL into the sceGsLoadImage inside a VIF/GIF chain) or patch fields before calling sceGsExec*Image.
     // vram_addr is the BP in 64-word blocks, exactly as the dbp/sbp argument.
     //  load (6 qw): GIFtag A+D NLOOP 4 | BITBLTBUF (dest) | TRXPOS (DSAX/DSAY) | TRXREG | TRXDIR 0 | GIFtag IMAGE EOP
-    //  store (7 qw): VIF FLUSHA + DIRECT 6 | GIFtag A+D NLOOP 5 EOP | BITBLTBUF (source) | TRXPOS (SSAX/SSAY) | TRXREG | FINISH | TRXDIR 1
+    //  store (7 qw): VIF NOP, MSKPATH3, FLUSHA, DIRECT 6 | GIFtag A+D NLOOP 5 EOP | BITBLTBUF (source) | TRXPOS (SSAX/SSAY) | TRXREG | FINISH | TRXDIR 1
     static bool readGsImage(uint8_t *rdram, uint32_t addr, GsImageMem &out, bool store = false)
     {
         const uint8_t *ptr = getConstMemPtr(rdram, addr);
@@ -1829,8 +1829,9 @@ namespace
         uint64_t q[14];
         if (store)
         {
-            q[0] = 0x13000000ull | (0x50000006ull << 32);   // FLUSHA, DIRECT 6
-            q[1] = 0;
+            // VIF: NOP, MSKPATH3 (mask), FLUSHA, DIRECT 6 -- word for word what libgraph writes
+            q[0] = 0x06008000ull << 32;
+            q[1] = 0x13000000ull | (0x50000006ull << 32);
             q[2] = makeGiftagAplusD(5u);
             q[3] = 0xEull;
             q[4] = buf;

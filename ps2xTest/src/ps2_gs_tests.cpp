@@ -4444,7 +4444,10 @@ void register_ps2_gs_tests()
 
             uint64_t sq[14] = {};
             std::memcpy(sq, rdram + kStoreAddr, sizeof(sq));
-            t.Equals(sq[0], 0x5000000613000000ull, "store packet should start with VIF FLUSHA and DIRECT 6");
+            // libgraph's own packet (the game's sceGsSetDefStoreImage, ee tier stub oracle): VIF NOP,
+            // MSKPATH3 0x8000, FLUSHA, DIRECT 6
+            t.Equals(sq[0], 0x0600800000000000ull, "store packet should start with VIF NOP and MSKPATH3");
+            t.Equals(sq[1], 0x5000000613000000ull, "store packet should continue with VIF FLUSHA and DIRECT 6");
             t.Equals(sq[2] & 0x7FFFull, 5ull, "store packet A+D GIFtag should have NLOOP 5");
             t.Equals(sq[5], 0x50ull, "store packet should target BITBLTBUF at +0x20");
             t.Equals(sq[4] & 0x3FFFull, 0x1A40ull, "store BITBLTBUF.SBP should be the sbp argument, unscaled");

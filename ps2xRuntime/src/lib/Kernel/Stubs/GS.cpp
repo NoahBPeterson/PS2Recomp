@@ -1134,7 +1134,8 @@ namespace ps2_stubs
         img.psm = static_cast<uint8_t>(args.psm);
 
         writeGsImage(rdram, imgAddr, img, store);
-        setReturnS32(ctx, 0);
+        // sceGsSetDefStoreImage returns the packet size in qwords (7), as libgraph does.
+        setReturnS32(ctx, store ? 7 : 0);
     }
 
     void sceGsSetDefLoadImage(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
