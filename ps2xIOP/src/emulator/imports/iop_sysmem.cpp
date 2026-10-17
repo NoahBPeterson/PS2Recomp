@@ -25,12 +25,11 @@ namespace ps2x::iop::detail
 
         switch (ordinal)
         {
-        case 4: // AllocSysMemory
+        case 4: // AllocSysMemory(mode, size, address): ALLOC_FIRST 0, ALLOC_LAST 1, ALLOC_ADDRESS 2
         {
-            const uint32_t address = a0 == 2u
-                                         ? m_memory.allocate(a1, 16u, a2)
-                                         : m_memory.allocate(a1, 16u);
-            setV0(address);
+            using Placement = IopMemory::BlockPlacement;
+            const Placement placement = a0 == 2u ? Placement::At : (a0 == 1u ? Placement::High : Placement::Low);
+            setV0(m_memory.allocateSysmemBlock(a1, placement, a2));
             return true;
         }
         case 5: // FreeSysMemory
@@ -43,18 +42,19 @@ namespace ps2x::iop::detail
         case 8: // QueryTotalFreeMemSize
             setV0(m_memory.maxFreeMemory());
             return true;
-        case 9: // QueryBlockTopAddress
-            if (const auto block = m_memory.allocationContaining(a0))
-                setV0(block->address);
-            else
-                setV0(0u);
-            return true;
+        case 9:  // QueryBlockTopAddress
         case 10: // QueryBlockSize
+        {
+            // The block holding the address: a used one, or the free gap around it with bit 31 (FREE)
+            // set, as SYSMEM's block list covers all memory; -1 outside it.
             if (const auto block = m_memory.allocationContaining(a0))
-                setV0(block->size);
+                setV0(ordinal == 9u ? block->address : block->size);
+            else if (const auto gap = m_memory.freeGapContaining(a0))
+                setV0((ordinal == 9u ? gap->address : gap->size) | 0x80000000u);
             else
                 setV0(0xFFFFFFFFu);
             return true;
+        }
         case 14: // Kprintf
         {
             const std::string format = m_memory.readString(a0, 512u);

@@ -310,6 +310,62 @@ namespace ps2x::iop::detail
         return result;
     }
 
+    std::optional<IopMemory::Allocation> IopMemory::freeGapContaining(uint32_t address) const
+    {
+        if (address < HeapBase || address >= HeapLimit || allocationContaining(address))
+            return std::nullopt;
+        uint32_t start = HeapBase, end = HeapLimit;
+        for (const Allocation &block : m_allocations)
+        {
+            if (block.address + block.size <= address)
+                start = std::max(start, block.address + block.size);
+            else if (block.address > address)
+                end = std::min(end, block.address);
+        }
+        return Allocation{start, end - start};
+    }
+
+    uint32_t IopMemory::allocateSysmemBlock(uint32_t size, BlockPlacement placement, uint32_t address)
+    {
+        constexpr uint32_t kUnit = 256u;
+        if (size == 0u || size > HeapLimit - HeapBase)
+            return 0u;
+        size = alignUp(size, kUnit);
+        if (placement == BlockPlacement::At)
+            return allocate(size, kUnit, address & ~(kUnit - 1u));
+
+        std::vector<Allocation> blocks = m_allocations;
+        std::sort(blocks.begin(), blocks.end(), [](const Allocation &a, const Allocation &b) { return a.address < b.address; });
+        uint32_t chosen = 0u;
+        uint32_t cursor = alignUp(HeapBase, kUnit);
+        auto gap = [&](uint32_t end) // free [cursor, end)
+        {
+            if (end > cursor && end - cursor >= size)
+            {
+                const uint32_t at = placement == BlockPlacement::Low ? cursor : ((end - size) & ~(kUnit - 1u));
+                if (at >= cursor && (chosen == 0u || placement == BlockPlacement::High))
+                    chosen = at;
+            }
+        };
+        for (const Allocation &block : blocks)
+        {
+            if (block.address + block.size <= cursor)
+                continue;
+            gap(std::min(block.address, HeapLimit));
+            if (chosen != 0u && placement == BlockPlacement::Low)
+                break;
+            cursor = std::max(cursor, alignUp(block.address + block.size, kUnit));
+        }
+        if (chosen == 0u || placement == BlockPlacement::High)
+            gap(HeapLimit);
+        if (chosen == 0u)
+            return 0u;
+        m_allocations.push_back({chosen, size});
+        markOwned(chosen, size);
+        m_heapCursor = std::max(m_heapCursor, chosen + size);
+        return chosen;
+    }
+
     uint32_t IopMemory::allocate(uint32_t size, uint32_t alignment, std::optional<uint32_t> fixed)
     {
         size = alignUp(std::max(size, 1u), 16u);

@@ -58,9 +58,15 @@ namespace ps2x::iop::detail
         [[nodiscard]] std::string readString(uint32_t address, size_t limit = 1024u) const;
 
         [[nodiscard]] uint32_t allocate(uint32_t size, uint32_t alignment = 16u, std::optional<uint32_t> fixed = std::nullopt);
+        // SYSMEM's AllocSysMemory: 256-byte blocks, the lowest free gap that fits (Low), the highest
+        // (High) or at `address` (At); 0 for size 0 or when nothing fits.
+        enum class BlockPlacement : uint8_t { Low, High, At };
+        [[nodiscard]] uint32_t allocateSysmemBlock(uint32_t size, BlockPlacement placement, uint32_t address = 0u);
         [[nodiscard]] bool freeAllocation(uint32_t address);
         [[nodiscard]] uint32_t maxFreeMemory() const;
         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
+        // The unallocated heap range around `address` (between its neighbouring allocations).
+        [[nodiscard]] std::optional<Allocation> freeGapContaining(uint32_t address) const;
 
         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
         [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }

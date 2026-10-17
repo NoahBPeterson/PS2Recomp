@@ -280,7 +280,7 @@ namespace gt
             const char *name;
             uint16_t version;
         };
-        const Lib kLibs[] = {{"thbase", 0x101}, {"thevent", 0x101}, {"thsemap", 0x101}, {"intrman", 0x102}};
+        const Lib kLibs[] = {{"thbase", 0x101}, {"thevent", 0x101}, {"thsemap", 0x101}, {"intrman", 0x102}, {"sysmem", 0x101}};
 
         Arg C(uint32_t v) { return {Arg::Const, v}; }
         Arg D(uint32_t off) { return {Arg::Data, off}; }
@@ -1216,6 +1216,68 @@ namespace gt
             return p;
         }
 
+        // System memory: blocks allocated low or high, their top address and size (also through an
+        // interior pointer), frees of live, freed and bogus pointers, and the memory size. Block
+        // addresses differ between the worlds, so they are compared through the ID mapping.
+        Program sysmemProgram(Rng &r, uint32_t focus)
+        {
+            Program p;
+            struct Block
+            {
+                size_t step;
+                bool live;
+                uint32_t freedAt; // allocation count when it was freed
+            };
+            std::vector<Block> blocks;
+            uint32_t allocations = 0;
+            const uint32_t ops = r.range(2, 16);
+            for (uint32_t i = 0; i < ops; ++i)
+            {
+                const uint32_t ord = r.chance(40) ? focus : r.pick(std::vector<uint32_t>{4, 4, 5, 9, 10, 6});
+                if (ord == 4 || blocks.empty())
+                {
+                    const uint32_t mode = r.chance(70) ? 0u : 1u; // ALLOC_FIRST, ALLOC_LAST
+                    const uint32_t size = r.chance(90) ? r.range(1, 0x4000) : r.pick(std::vector<uint32_t>{0u, 0x100u, 0x1000u});
+                    p.steps.push_back({"sysmem", 4, {C(mode), C(size), C(0)}, size != 0u,
+                                       "AllocSysMemory(" + std::string(mode ? "last" : "first") + ", " + hex(size) + ")"});
+                    ++allocations;
+                    if (size != 0u) // size 0 gives NULL, whose queries would hit each world's own kernel block
+                        blocks.push_back({p.steps.size() - 1, true, 0u});
+                    continue;
+                }
+                Block &b = blocks[r.range(0, static_cast<uint32_t>(blocks.size() - 1))];
+                const std::string name = "block" + std::to_string(b.step);
+                // A freed block's queries answer with the free region around it, whose bounds depend on
+                // each world's other allocations, and once its space may have been reallocated a second
+                // free would free someone else's block: only live blocks are queried, and a block is
+                // freed again only if nothing was allocated since.
+                if (!b.live && (ord == 9 || ord == 10 || (ord == 5 && b.freedAt != allocations)))
+                    continue;
+                switch (ord)
+                {
+                case 5:
+                    p.steps.push_back({"sysmem", 5, {R(static_cast<uint32_t>(b.step))}, false, "FreeSysMemory(" + name + (b.live ? ")" : ") again")});
+                    b.live = false;
+                    b.freedAt = allocations;
+                    break;
+                case 9:
+                    p.steps.push_back({"sysmem", 9, {R(static_cast<uint32_t>(b.step))}, true, "QueryBlockTopAddress(" + name + ")"});
+                    break;
+                case 10:
+                    p.steps.push_back({"sysmem", 10, {R(static_cast<uint32_t>(b.step))}, false, "QueryBlockSize(" + name + ")"});
+                    break;
+                default:
+                    p.steps.push_back({"sysmem", 6, {}, false, "QueryMemSize()"});
+                    break;
+                }
+            }
+            for (const Block &b : blocks)
+                if (b.live)
+                    p.steps.push_back({"sysmem", 5, {R(static_cast<uint32_t>(b.step))}, false, "FreeSysMemory(block" + std::to_string(b.step) + ") cleanup"});
+            p.note = std::to_string(p.steps.size()) + " calls";
+            return p;
+        }
+
         struct KernelTest
         {
             const char *lib;
@@ -1266,6 +1328,10 @@ namespace gt
                 {"thbase", 37, "CancelAlarm", waitProgram, true},
                 {"thsemap", 8, "WaitSema (blocking)", waitProgram, true},
                 {"thevent", 10, "WaitEventFlag (blocking)", waitProgram, true},
+                {"sysmem", 4, "AllocSysMemory", sysmemProgram},
+                {"sysmem", 5, "FreeSysMemory", sysmemProgram},
+                {"sysmem", 9, "QueryBlockTopAddress", sysmemProgram},
+                {"sysmem", 10, "QueryBlockSize", sysmemProgram},
                 {"intrman", 4, "RegisterIntrHandler", intrProgram},
                 {"intrman", 5, "ReleaseIntrHandler", intrProgram},
                 {"intrman", 6, "EnableIntr", intrProgram},
