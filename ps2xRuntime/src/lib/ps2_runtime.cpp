@@ -96,9 +96,13 @@ namespace
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
     constexpr uint32_t COP0_STATUS_BEV = 0x00400000u;
-    constexpr uint32_t EXCEPTION_VECTOR_GENERAL = 0x80000080u;
-    constexpr uint32_t EXCEPTION_VECTOR_TLB_REFILL = 0x80000000u;
-    constexpr uint32_t EXCEPTION_VECTOR_BOOT = 0xBFC00200u;
+    // EE core exception vectors (EE Core User's Manual; PCSX2 cpuException): a base of 0x80000000, or
+    // 0xBFC00200 with Status.BEV, plus an offset per kind.
+    constexpr uint32_t EXCEPTION_BASE = 0x80000000u;
+    constexpr uint32_t EXCEPTION_BASE_BOOT = 0xBFC00200u;
+    constexpr uint32_t EXCEPTION_OFFSET_TLB_REFILL = 0x000u;
+    constexpr uint32_t EXCEPTION_OFFSET_COMMON = 0x180u;
+    constexpr uint32_t EXCEPTION_OFFSET_INTERRUPT = 0x200u;
 
     struct DispatchHistory
     {
@@ -186,15 +190,6 @@ namespace
         return oss.str();
     }
 
-    uint32_t selectExceptionVector(const R5900Context *ctx, bool tlbRefill)
-    {
-        if (ctx->cop0_status & COP0_STATUS_BEV)
-        {
-            return EXCEPTION_VECTOR_BOOT;
-        }
-        return tlbRefill ? EXCEPTION_VECTOR_TLB_REFILL : EXCEPTION_VECTOR_GENERAL;
-    }
-
     void seedVu0IdleSuccess(R5900Context *ctx)
     {
         if (!ctx)
@@ -279,22 +274,31 @@ namespace
 
     void raiseCop0Exception(R5900Context *ctx, uint32_t exceptionCode, bool tlbRefill = false)
     {
-        if (ctx->in_delay_slot)
+        // As the hardware: EPC and Cause.BD are written only when Status.EXL is clear; an exception
+        // taken with EXL already set keeps them and always goes to the common vector.
+        uint32_t offset = EXCEPTION_OFFSET_COMMON;
+        const uint32_t excCode = (exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK;
+        ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_EXCCODE_MASK) | excCode;
+        if ((ctx->cop0_status & COP0_STATUS_EXL) == 0u)
         {
-            ctx->cop0_epc = ctx->branch_pc;
-            ctx->cop0_cause = (ctx->cop0_cause & ~COP0_CAUSE_EXCCODE_MASK) |
-                              ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK) |
-                              COP0_CAUSE_BD;
-        }
-        else
-        {
-            ctx->cop0_epc = ctx->pc;
-            ctx->cop0_cause = (ctx->cop0_cause & ~(COP0_CAUSE_EXCCODE_MASK | COP0_CAUSE_BD)) |
-                              ((exceptionCode << 2) & COP0_CAUSE_EXCCODE_MASK);
+            if (tlbRefill)
+                offset = EXCEPTION_OFFSET_TLB_REFILL;
+            else if (excCode == 0u)
+                offset = EXCEPTION_OFFSET_INTERRUPT;
+            if (ctx->in_delay_slot)
+            {
+                ctx->cop0_epc = ctx->branch_pc;
+                ctx->cop0_cause |= COP0_CAUSE_BD;
+            }
+            else
+            {
+                ctx->cop0_epc = ctx->pc;
+                ctx->cop0_cause &= ~COP0_CAUSE_BD;
+            }
         }
 
         ctx->cop0_status |= COP0_STATUS_EXL;
-        ctx->pc = selectExceptionVector(ctx, tlbRefill);
+        ctx->pc = ((ctx->cop0_status & COP0_STATUS_BEV) ? EXCEPTION_BASE_BOOT : EXCEPTION_BASE) + offset;
         ctx->in_delay_slot = false;
     }
 
@@ -2021,6 +2025,7 @@ uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr; // the faulting address, as the hardware records it
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2034,6 +2039,7 @@ uint16_t PS2Runtime::Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2047,6 +2053,7 @@ uint32_t PS2Runtime::Load32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2060,6 +2067,7 @@ uint64_t PS2Runtime::Load64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return 0;
     }
@@ -2073,6 +2081,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_LOAD);
         return _mm_setzero_si128();
     }
@@ -2087,6 +2096,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2100,6 +2110,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2114,6 +2125,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2127,6 +2139,7 @@ void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
@@ -2142,6 +2155,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
     }
     catch (const std::exception &)
     {
+        ctx->cop0_badvaddr = vaddr;
         SignalException(ctx, EXCEPTION_ADDRESS_ERROR_STORE);
     }
 }
