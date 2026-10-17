@@ -20,10 +20,12 @@
 // (function + exact failing-case count) that do not fail the run while the count is unchanged.
 // A case that has not returned after --case-timeout-ms (default 2000; POSIX hosts) is stopped and counts
 // as LOGIC: a runaway loop the oracle did not take.
+// Vectors from `ee-oracle-gen arith` instead check every float helper op by op against the runtime model.
 // The last line of output is a one-line verdict.
 
 #include "ee_oracle_inputs.h"
 #include "ps2_runtime.h"
+#include "ps2_runtime_macros.h"
 #include "runtime/ps2_memory.h"
 
 #include <algorithm>
@@ -74,6 +76,96 @@ namespace
         setitimer(ITIMER_REAL, &tv, nullptr);
     }
 #endif
+
+    // Arithmetic vectors (ee-oracle-gen arith): op u8, a, b, runtime-model result, PS2-model result. Every
+    // FPU/VU0 helper must give the runtime model's bits; the PS2-model column only counts the gap.
+    uint32_t arithOp(uint8_t op, uint32_t a, uint32_t b)
+    {
+        float fa, fb;
+        std::memcpy(&fa, &a, 4);
+        std::memcpy(&fb, &b, 4);
+        auto bits = [](float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; };
+        auto lane0 = [&](__m128 v) { return bits(_mm_cvtss_f32(v)); };
+        const __m128 va = _mm_set_ps(0.0f, 0.0f, 0.0f, fa), vb = _mm_set_ps(0.0f, 0.0f, 0.0f, fb);
+        switch (op)
+        {
+        case 0: return bits(FPU_ADD_S(fa, fb));
+        case 1: return bits(FPU_SUB_S(fa, fb));
+        case 2: return bits(FPU_MUL_S(fa, fb));
+        case 3: return bits(FPU_DIV_S(fa, fb));
+        case 4: return bits(FPU_SQRT_S(fa));
+        case 5: return bits(FPU_RSQRT_S(fa, fb));
+        case 6: return bits(FPU_CVT_S_W((int32_t)a));
+        case 7: return (uint32_t)FPU_CVT_W_S(fa);
+        case 8: return lane0(PS2_VADD(va, vb));
+        case 9: return lane0(PS2_VSUB(va, vb));
+        case 10: return lane0(PS2_VMUL(va, vb));
+        case 11: return bits(PS2_VU_DIV_Q(fa, fb));
+        case 12: return bits(PS2_VU_SQRT_Q(fa));
+        default: return bits(PS2_VU_RSQRT_Q(fa, fb));
+        }
+    }
+
+    int runArith(const std::vector<uint8_t> &v, int examples)
+    {
+        static const char *names[] = {"add.s", "sub.s", "mul.s", "div.s", "sqrt.s", "rsqrt.s", "cvt.s.w", "cvt.w.s",
+                                      "vadd", "vsub", "vmul", "vdiv", "vsqrt", "vrsqrt"};
+        uint32_t n = 0;
+        std::memcpy(&n, v.data() + 8, 4);
+        if (v.size() < 12 + (size_t)n * 17)
+        {
+            std::printf("arith: truncated vectors\n");
+            return 2;
+        }
+        uint64_t bad[14] = {}, gap[14] = {}, count[14] = {}, plain = 0;
+        int shown = 0;
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            const uint8_t *r = v.data() + 12 + (size_t)i * 17;
+            uint32_t a, b, want, ps2;
+            std::memcpy(&a, r + 1, 4);
+            std::memcpy(&b, r + 5, 4);
+            std::memcpy(&want, r + 9, 4);
+            std::memcpy(&ps2, r + 13, 4);
+            const uint8_t op = r[0] < 14 ? r[0] : 13;
+            const uint32_t got = arithOp(op, a, b);
+            ++count[op];
+            if (want != ps2)
+            {
+                ++gap[op];
+                // The two models may only differ where exponent 255 is involved (the runtime keeps it as an
+                // ordinary exponent and saturates at +-0x7FFFFFFF, the PS2 model clamps to +-0x7F7FFFFF) or
+                // where a divisor has exponent 0 (+-0x7FFFFFFF against +-0x7F7FFFFF).
+                auto special = [](uint32_t x) { return (x & 0x7F800000u) == 0x7F800000u || (x & 0x7FFFFFFFu) == 0x7F7FFFFFu; };
+                const bool divides = op == 3 || op == 5 || op == 11 || op == 13;
+                const bool zeroDivisor = divides && (b & 0x7F800000u) == 0u;
+                if (!(special(a) || (special(b) && op != 4 && op != 12) || special(want) || special(ps2) || zeroDivisor))
+                {
+                    ++plain;
+                    if (shown++ < examples)
+                        std::printf("  %s %08x %08x: runtime model %08x, PS2 model %08x (no special value)\n", names[op], a, b, want, ps2);
+                }
+            }
+            if (got != want)
+            {
+                ++bad[op];
+                if (shown++ < examples)
+                    std::printf("  %s %08x %08x: runtime model %08x, runtime %08x\n", names[op], a, b, want, got);
+            }
+        }
+        uint64_t badTotal = 0, gapTotal = 0;
+        for (int op = 0; op < 14; ++op)
+        {
+            std::printf("  %-8s %8" PRIu64 " ops, %6" PRIu64 " differ from the runtime model, %6" PRIu64 " runtime/PS2 model differences (special values)\n",
+                        names[op], count[op], bad[op], gap[op]);
+            badTotal += bad[op];
+            gapTotal += gap[op];
+        }
+        std::printf("arith: %u ops, %" PRIu64 " differ from the runtime model, %" PRIu64 " PS2-model differences, %" PRIu64
+                    " of them without a special value -> %s\n",
+                    n, badTotal, gapTotal, plain, badTotal || plain ? "FAIL" : "PASS");
+        return badTotal || plain ? 1 : 0;
+    }
 
     using namespace ee_oracle;
 
@@ -476,6 +568,8 @@ int main(int argc, char **argv)
 #endif
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<uint8_t> vec = readFile(argv[1]);
+    if (vec.size() >= 12 && std::memcmp(vec.data(), "PS2ARITH", 8) == 0)
+        return runArith(vec, examples);
     const std::vector<uint8_t> elf = readFile(argv[2]);
     uint64_t elfHash = 0;
     std::vector<FuncVectors> funcs;
