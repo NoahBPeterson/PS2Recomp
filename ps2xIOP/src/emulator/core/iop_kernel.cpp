@@ -380,11 +380,11 @@ namespace ps2x::iop::detail
             // Not implemented by the IOPRP300 THREADMAN: all four just return KE_ERROR.
             setV0(KE_ERROR);
             return true;
-        case 33: // DelayThread
+        case 33: // DelayThread: an alarm of USec2SysClock(usec) cycles
             if (m_currentThread != nullptr)
             {
-                const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz + 999'999ull) / 1'000'000ull;
-                delayCurrentUntil(currentCycle + std::max<uint64_t>(delayCycles, 1u), cpu);
+                const uint64_t delayCycles = (static_cast<uint64_t>(cpu.gpr[4]) * kIopClockHz) / 1'000'000ull;
+                delayCurrentUntil(currentCycle + std::max(delayCycles, kMinAlarmCycles), cpu);
             }
             setV0(0);
             return true;
@@ -409,7 +409,13 @@ namespace ps2x::iop::detail
                 setV0(kErrorFoundHandler);
                 return true;
             }
-            m_alarms.push_back({currentCycle + std::max<uint64_t>(clock, 1u), handler, argument, cpu.gpr[28]});
+            uint64_t due = clock;
+            if (clock < kMinAlarmCycles) // the high word is 0 and the low word below the floor
+            {
+                due = kMinAlarmCycles;
+                m_memory.write32(clockAddress, static_cast<uint32_t>(kMinAlarmCycles));
+            }
+            m_alarms.push_back({currentCycle + due, handler, argument, cpu.gpr[28]});
             setV0(0);
             return true;
         }

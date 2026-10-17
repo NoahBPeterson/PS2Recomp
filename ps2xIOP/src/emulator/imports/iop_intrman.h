@@ -29,5 +29,9 @@ namespace ps2x::iop::detail
         IopMemory &m_memory;
         std::map<int, Handler> m_handlers;
         std::map<int, bool> m_enabled;
+        // DMA line state (DICR/DICR2 enable and completion-mode bits), bit n = line 32 + n.
+        uint32_t m_dmaEnabled = 0u;
+        uint32_t m_dmaMode1 = 0u;
+        uint32_t m_dmaMode2 = 0u;
     };
 }

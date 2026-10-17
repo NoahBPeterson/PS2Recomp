@@ -603,7 +603,7 @@ namespace ps2x::iop::detail
                     const uint32_t nextInterval = callFunction(alarm.handler, alarm.argument, 0u, 0u, 0u, alarm.gp, 100000u);
                     if (nextInterval != 0u)
                     {
-                        alarm.dueCycle = std::max(alarm.dueCycle + nextInterval, totalCycles + 1u);
+                        alarm.dueCycle = std::max(alarm.dueCycle + std::max<uint64_t>(nextInterval, kMinAlarmCycles), totalCycles + 1u);
                         kernel.rearmAlarm(alarm);
                     }
                 }

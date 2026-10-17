@@ -245,7 +245,13 @@ namespace ps2x::iop::detail
         case 0x1F801074u:
             return m_interruptMask;
         case 0x1F801078u:
-            return m_interruptControl;
+        {
+            // Reading I_CTRL returns it and clears it (PCSX2 IopHwRead; INTRMAN's CpuSuspendIntr
+            // relies on it to disable interrupts).
+            const uint32_t value = m_interruptControl;
+            m_interruptControl = 0u;
+            return value;
+        }
         default:
             return 0u;
         }

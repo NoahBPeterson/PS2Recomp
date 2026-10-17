@@ -4,6 +4,9 @@
 constexpr uint32_t kThreadReturnSentinel = 0x1FFFFF00u;
 constexpr uint32_t kCallReturnSentinel = 0x1FFFFF04u;
 constexpr uint64_t kIopClockHz = 36'864'000ull;
+// THREADMAN's shortest alarm, USec2SysClock(100): SetAlarm raises shorter clocks to it (and writes the
+// raised value back), alarm handlers' re-arm intervals and DelayThread get the same floor.
+constexpr uint64_t kMinAlarmCycles = 100ull * kIopClockHz / 1'000'000ull;
 // NTSC field cadence (approximately 59.94 Hz).  VBlank imports are
 // scheduler waits, not no-op timing hints: returning immediately lets
 // high-priority IRX threads busy-loop and starve RPC server threads.

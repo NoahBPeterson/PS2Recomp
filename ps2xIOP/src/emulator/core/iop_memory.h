@@ -90,7 +90,7 @@ namespace ps2x::iop::detail
         uint32_t m_heapCursor = HeapBase;
         uint32_t m_interruptStatus = 0;
         uint32_t m_interruptMask = 0;
-        uint32_t m_interruptControl = 1;
+        mutable uint32_t m_interruptControl = 1; // cleared by a guest read (readHardware32)
         std::optional<DmaStart> m_dmaStart;
         IopDevices *m_devices = nullptr;
     };

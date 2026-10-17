@@ -104,12 +104,13 @@ namespace gt
         std::string log;
 
         bool boot(const std::map<std::string, std::vector<uint8_t>> &bios, const std::map<std::string, std::vector<uint8_t>> &ioprp,
-                  const std::vector<std::string> &order, const std::vector<uint8_t> *testIrx, uint64_t budget)
+                  const std::vector<std::string> &order, const std::vector<uint8_t> *testIrx, uint64_t budget, bool devices = false)
         {
             m.deliverExceptions = true;
-            // GT_DEVICES=1: root counters, INTC and interrupt delivery (T-0115 step 1).
+            // Root counters, INTC and interrupt delivery (T-0115 step 1): for tests that need time to
+            // pass (delays, alarms), or for every test with GT_DEVICES=1.
             static const bool withDevices = std::getenv("GT_DEVICES") != nullptr;
-            if (withDevices)
+            if (withDevices || devices)
                 m.enableDevices();
             auto pick = [&](const std::string &name) -> const std::vector<uint8_t> *
             {
@@ -237,6 +238,7 @@ namespace gt
                 Const,
                 Data,
                 Result,
+                DataWord, // the word at a data-area offset (a value an earlier call stored there)
             } kind = Const;
             uint32_t value = 0;
         };
@@ -251,6 +253,8 @@ namespace gt
             // Used for pointers inside parameter blocks (CreateThread's entry address).
             std::vector<std::pair<uint32_t, Arg>> stores = {};
             bool ignoreV0 = false; // void function: v0 is leftover
+            // Run by the program's helper thread rather than the step thread (see Program::helperParam).
+            bool helper = false;
         };
         // A case: steps plus its data area (inputs and out-buffers). Several cases share one IRX.
         struct Program
@@ -262,6 +266,13 @@ namespace gt
             // pointers), 1 object ID (compared through the ID mapping), 2 an address in the probe
             // module (compared relative to the module base).
             std::map<uint32_t, uint8_t> wordKinds;
+            // Data offset of a CreateThread parameter block (5 words; the entry is filled in at run
+            // time) for a helper thread that runs the steps marked helper, or kNoHelper. The step
+            // thread creates and starts it before the program's first step. Give it a lower priority
+            // than the step thread (32): it then runs only while the step thread is blocked, which
+            // is how a program makes a blocking call and has it released.
+            uint32_t helperParam = kNoHelper;
+            static constexpr uint32_t kNoHelper = 0xFFFFFFFFu;
         };
 
         struct Lib
@@ -269,11 +280,12 @@ namespace gt
             const char *name;
             uint16_t version;
         };
-        const Lib kLibs[] = {{"thbase", 0x101}, {"thevent", 0x101}, {"thsemap", 0x101}};
+        const Lib kLibs[] = {{"thbase", 0x101}, {"thevent", 0x101}, {"thsemap", 0x101}, {"intrman", 0x102}};
 
         Arg C(uint32_t v) { return {Arg::Const, v}; }
         Arg D(uint32_t off) { return {Arg::Data, off}; }
         Arg R(uint32_t step) { return {Arg::Result, step}; }
+        Arg W(uint32_t off) { return {Arg::DataWord, off}; }
 
         // Encoders for the few instructions the test IRX needs.
         uint32_t iI(uint32_t op, uint32_t rs, uint32_t rt, uint32_t imm) { return (op << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFFu); }
@@ -322,6 +334,9 @@ namespace gt
                     ++libIndex;
                 return importsOff + libIndex * tableWords * 4 + 20 + 8 * ord;
             };
+            // Helper-thread entry offsets, taken from the previous (sizing) pass: code size does not
+            // depend on them.
+            std::vector<uint32_t> helperEntry(programs.size(), 0);
             auto emitCode = [&](uint32_t importsOff, uint32_t resultsOff, uint32_t threadParamOff, const std::vector<uint32_t> &dataOff,
                                 std::vector<uint32_t> &code, uint32_t &threadEntryOff)
             {
@@ -368,50 +383,56 @@ namespace gt
                 anchor = here();
                 code.push_back(move(16, 31));
                 code.push_back(addiu(17, 16, static_cast<int32_t>(resultsOff) - anchor));
-                uint32_t index = 0;
-                for (size_t pi = 0; pi < programs.size(); ++pi)
-                    for (const Step &st : programs[pi].steps)
+                // One import call; its v0 goes to result slot `index`.
+                auto emitStep = [&](size_t pi, const Step &st, uint32_t index)
+                {
+                    auto load = [&](const Arg &arg, uint32_t reg)
                     {
-                        auto load = [&](const Arg &arg, uint32_t reg)
+                        if (arg.kind == Arg::Const)
                         {
-                            if (arg.kind == Arg::Const)
-                            {
-                                code.push_back(lui(reg, arg.value >> 16));
-                                code.push_back(ori(reg, reg, arg.value & 0xFFFFu));
-                            }
-                            else if (arg.kind == Arg::Data)
-                                code.push_back(addiu(reg, 16, static_cast<int32_t>(dataOff[pi] + arg.value) - anchor));
-                            else
-                            {
-                                code.push_back(lw(reg, static_cast<int32_t>(4 * (irx.stepBase[pi] + arg.value)), 17));
-                                code.push_back(NOP);
-                            }
-                        };
-                        for (const auto &[off, arg] : st.stores)
-                        {
-                            load(arg, 8);
-                            code.push_back(sw(8, static_cast<int32_t>(dataOff[pi] + off) - anchor, 16));
+                            code.push_back(lui(reg, arg.value >> 16));
+                            code.push_back(ori(reg, reg, arg.value & 0xFFFFu));
                         }
-                        for (size_t a = 0; a < st.args.size() && a < 4; ++a)
+                        else if (arg.kind == Arg::Data)
+                            code.push_back(addiu(reg, 16, static_cast<int32_t>(dataOff[pi] + arg.value) - anchor));
+                        else if (arg.kind == Arg::DataWord)
                         {
-                            const Arg &arg = st.args[a];
-                            const uint32_t reg = 4 + static_cast<uint32_t>(a);
-                            if (arg.kind == Arg::Const)
-                            {
-                                code.push_back(lui(reg, arg.value >> 16));
-                                code.push_back(ori(reg, reg, arg.value & 0xFFFFu));
-                            }
-                            else if (arg.kind == Arg::Data)
-                                code.push_back(addiu(reg, 16, static_cast<int32_t>(dataOff[pi] + arg.value) - anchor));
-                            else
-                            {
-                                code.push_back(lw(reg, static_cast<int32_t>(4 * (irx.stepBase[pi] + arg.value)), 17));
-                                code.push_back(NOP);
-                            }
+                            code.push_back(lw(reg, static_cast<int32_t>(dataOff[pi] + arg.value) - anchor, 16));
+                            code.push_back(NOP);
                         }
-                        call(anchor, stubOffset(importsOff, st.lib, st.ord));
-                        code.push_back(sw(2, static_cast<int32_t>(4 * index++), 17));
+                        else
+                        {
+                            code.push_back(lw(reg, static_cast<int32_t>(4 * (irx.stepBase[pi] + arg.value)), 17));
+                            code.push_back(NOP);
+                        }
+                    };
+                    for (const auto &[off, arg] : st.stores)
+                    {
+                        load(arg, 8);
+                        code.push_back(sw(8, static_cast<int32_t>(dataOff[pi] + off) - anchor, 16));
                     }
+                    for (size_t a = 0; a < st.args.size() && a < 4; ++a)
+                        load(st.args[a], 4 + static_cast<uint32_t>(a));
+                    call(anchor, stubOffset(importsOff, st.lib, st.ord));
+                    code.push_back(sw(2, static_cast<int32_t>(4 * index), 17));
+                };
+                for (size_t pi = 0; pi < programs.size(); ++pi)
+                {
+                    const Program &prog = programs[pi];
+                    if (prog.helperParam != Program::kNoHelper)
+                    {
+                        code.push_back(addiu(4, 16, static_cast<int32_t>(dataOff[pi] + prog.helperParam) - anchor));
+                        code.push_back(addiu(8, 16, static_cast<int32_t>(helperEntry[pi]) - anchor));
+                        code.push_back(sw(8, 8, 4));
+                        call(anchor, stubOffset(importsOff, "thbase", 4)); // CreateThread(&param)
+                        code.push_back(move(4, 2));
+                        code.push_back(addiu(5, 0, 0));
+                        call(anchor, stubOffset(importsOff, "thbase", 6)); // StartThread(thid, 0)
+                    }
+                    for (size_t k = 0; k < prog.steps.size(); ++k)
+                        if (!prog.steps[k].helper)
+                            emitStep(pi, prog.steps[k], irx.stepBase[pi] + static_cast<uint32_t>(k));
+                }
                 code.push_back(lui(8, mailbox >> 16));
                 code.push_back(ori(8, 8, mailbox & 0xFFFFu));
                 code.push_back(sw(17, 4, 8));
@@ -423,6 +444,32 @@ namespace gt
                 code.push_back(lw(17, 20, 29));
                 code.push_back(jr(31));
                 code.push_back(addiu(29, 29, 32));
+                // helper thread entries: the same frame and s0/s1 setup, then the helper's steps
+                for (size_t pi = 0; pi < programs.size(); ++pi)
+                {
+                    const Program &prog = programs[pi];
+                    if (prog.helperParam == Program::kNoHelper)
+                        continue;
+                    helperEntry[pi] = static_cast<uint32_t>(here());
+                    code.push_back(addiu(29, 29, -32));
+                    code.push_back(sw(31, 28, 29));
+                    code.push_back(sw(16, 24, 29));
+                    code.push_back(sw(17, 20, 29));
+                    code.push_back(BGEZAL_NEXT);
+                    code.push_back(NOP);
+                    anchor = here();
+                    code.push_back(move(16, 31));
+                    code.push_back(addiu(17, 16, static_cast<int32_t>(resultsOff) - anchor));
+                    for (size_t k = 0; k < prog.steps.size(); ++k)
+                        if (prog.steps[k].helper)
+                            emitStep(pi, prog.steps[k], irx.stepBase[pi] + static_cast<uint32_t>(k));
+                    code.push_back(lw(31, 28, 29));
+                    code.push_back(lw(16, 24, 29));
+                    code.push_back(lw(17, 20, 29));
+                    code.push_back(addiu(2, 0, 0));
+                    code.push_back(jr(31));
+                    code.push_back(addiu(29, 29, 32));
+                }
             };
             std::vector<uint32_t> code;
             std::vector<uint32_t> dataOff(programs.size(), 0);
@@ -910,12 +957,272 @@ namespace gt
             return p;
         }
 
+        // Interrupt manager: handler registration, IRQ enable/disable and the CPU interrupt state.
+        // Handlers are only registered and lines only enabled on IRQs no device raises in either
+        // world (a raised line would call the fake handler), and every program ends with the CPU
+        // interrupts enabled and its handlers released.
+        Program intrProgram(Rng &r, uint32_t focus)
+        {
+            Program p;
+            static const std::vector<uint32_t> quiet = {12u, 13u, 22u, 23u};
+            // DMA completion lines of channels nothing transfers on here (PIO, GPU OTC, DEV9, SIO2);
+            // bits 8/9 of EnableIntr's argument pick the DICR/DICR2 completion modes.
+            static const std::vector<uint32_t> quietDma = {37u, 38u, 41u, 44u, 45u};
+            static const std::vector<uint32_t> bogusIrq = {46u, 63u, 64u, 0xFFu, 0x10Du, 0xFFFFFFFFu, 0x80000000u};
+            std::set<uint32_t> registered;
+            const uint32_t handler = garbageBlock(r, p.data, 2);
+            auto irqArg = [&](bool allowBogus) { return allowBogus && r.chance(20) ? r.pick(bogusIrq) : r.pick(quiet); };
+            const uint32_t ops = r.range(3, 20);
+            for (uint32_t i = 0; i < ops; ++i)
+            {
+                const uint32_t ord = r.chance(40) ? focus : r.pick(std::vector<uint32_t>{4, 5, 6, 7, 8, 17, 23});
+                switch (ord)
+                {
+                case 4:
+                {
+                    const uint32_t irq = irqArg(true), mode = r.range(0, 4);
+                    p.steps.push_back({"intrman", 4, {C(irq), C(mode), D(handler), C(r.u32())}, false,
+                                       "RegisterIntrHandler(" + std::to_string(static_cast<int32_t>(irq)) + ", mode " + std::to_string(mode) + ")"});
+                    registered.insert(irq);
+                    break;
+                }
+                case 5:
+                {
+                    const uint32_t irq = irqArg(true);
+                    p.steps.push_back({"intrman", 5, {C(irq)}, false, "ReleaseIntrHandler(" + std::to_string(static_cast<int32_t>(irq)) + ")"});
+                    registered.erase(irq);
+                    break;
+                }
+                case 6:
+                {
+                    const uint32_t irq = r.chance(30) ? r.pick(quietDma) | (r.range(0, 3) << 8) : r.pick(quiet);
+                    p.steps.push_back({"intrman", 6, {C(irq)}, false, "EnableIntr(" + hex(irq) + ")"});
+                    break;
+                }
+                case 7:
+                {
+                    const uint32_t irq = r.chance(25) ? r.pick(quietDma) : irqArg(true), res = garbageBlock(r, p.data, 1);
+                    p.steps.push_back({"intrman", 7, {C(irq), r.chance(15) ? C(0) : D(res)}, false,
+                                       "DisableIntr(" + std::to_string(static_cast<int32_t>(irq)) + ", &res)"});
+                    break;
+                }
+                case 8: // CpuDisableIntr, possibly twice, then CpuEnableIntr
+                    p.steps.push_back({"intrman", 8, {}, false, "CpuDisableIntr()"});
+                    if (r.chance(50))
+                        p.steps.push_back({"intrman", 8, {}, false, "CpuDisableIntr() again"});
+                    if (r.chance(50))
+                        p.steps.push_back({"intrman", 23, {}, false, "QueryIntrContext()"});
+                    p.steps.push_back({"intrman", 9, {}, false, "CpuEnableIntr()"});
+                    break;
+                case 17: // CpuSuspendIntr (nested or not), then CpuResumeIntr with the stored states
+                {
+                    const uint32_t s1 = garbageBlock(r, p.data, 1);
+                    p.steps.push_back({"intrman", 17, {D(s1)}, false, "CpuSuspendIntr(&s1)"});
+                    if (r.chance(50))
+                    {
+                        const uint32_t s2 = garbageBlock(r, p.data, 1);
+                        p.steps.push_back({"intrman", 17, {D(s2)}, false, "CpuSuspendIntr(&s2) nested"});
+                        p.steps.push_back({"intrman", 18, {W(s2)}, false, "CpuResumeIntr(s2)"});
+                    }
+                    if (r.chance(30))
+                        p.steps.push_back({"intrman", 17, {C(0)}, false, "CpuSuspendIntr(NULL)"});
+                    p.steps.push_back({"intrman", 18, {W(s1)}, false, "CpuResumeIntr(s1)"});
+                    break;
+                }
+                default: // 23
+                    p.steps.push_back({"intrman", 23, {}, false, "QueryIntrContext()"});
+                    break;
+                }
+            }
+            std::vector<uint32_t> lines = quiet;
+            lines.insert(lines.end(), quietDma.begin(), quietDma.end());
+            for (uint32_t irq : lines)
+            {
+                const uint32_t res = garbageBlock(r, p.data, 1);
+                p.steps.push_back({"intrman", 7, {C(irq), D(res)}, false, "DisableIntr(" + std::to_string(irq) + ", &res) cleanup"});
+            }
+            for (uint32_t irq : registered)
+                p.steps.push_back({"intrman", 5, {C(irq)}, false, "ReleaseIntrHandler(" + std::to_string(static_cast<int32_t>(irq)) + ") cleanup"});
+            p.steps.push_back({"intrman", 9, {}, false, "CpuEnableIntr() cleanup"});
+            p.note = std::to_string(p.steps.size()) + " calls";
+            return p;
+        }
+
+        // Blocking calls and what releases them. The step thread blocks (WaitSema, WaitEventFlag,
+        // SleepThread, DelayThread) and a helper thread, at a lower priority, runs only then: it takes
+        // a turn from the "go" semaphore and performs the release (SignalSema, SetEventFlag,
+        // WakeupThread, DeleteSema, ReleaseWaitThread). The step thread, being higher priority,
+        // resumes at once. Alarms are set with short or long clocks and cancelled before or after
+        // they fire (the handler is two instructions in the data area: return 0).
+        Program waitProgram(Rng &r, uint32_t focus)
+        {
+            Program p;
+            auto helper = [&](Step st)
+            {
+                st.helper = true;
+                st.text = "[helper] " + st.text;
+                p.steps.push_back(std::move(st));
+            };
+            auto sema = [&](uint32_t init, uint32_t max, const std::string &name)
+            {
+                const uint32_t param = garbageBlock(r, p.data, 4);
+                putWords(p.data, param, {r.chance(50) ? 1u : 0u, r.u32(), init, max});
+                p.steps.push_back({"thsemap", 4, {D(param)}, true, "CreateSema(" + name + ")"});
+                return static_cast<uint32_t>(p.steps.size() - 1);
+            };
+            p.helperParam = garbageBlock(r, p.data, 5);
+            putWords(p.data, p.helperParam, {0x02000000u /* TH_C */, 0u, 0u, 0x800u, 40u});
+            p.wordKinds[p.helperParam + 8u] = 2; // the entry, stored at run time: an address in the probe
+            p.steps.push_back({"thbase", 20, {}, true, "GetThreadId()"});
+            const uint32_t me = 0;
+            const uint32_t go = sema(0, 100, "go");
+            const uint32_t done = sema(0, 1, "done");
+            const uint32_t wait = sema(0, 1, "wait");
+            const uint32_t efParam = garbageBlock(r, p.data, 3);
+            const uint32_t efAttr = r.chance(50) ? 2u : 0u; // EA_MULTI or EA_SINGLE
+            putWords(p.data, efParam, {efAttr, r.u32(), 0u});
+            p.steps.push_back({"thevent", 4, {D(efParam)}, true, "CreateEventFlag(attr " + hex(efAttr) + ")"});
+            const uint32_t ef = static_cast<uint32_t>(p.steps.size() - 1);
+            const uint32_t handler = garbageBlock(r, p.data, 2);
+            putWords(p.data, handler, {0x03E00008u /* jr ra */, 0x00001021u /* move v0, zero */});
+            // ++*arg; re-arm with 16 cycles (raised to the 100 us floor) until the third call
+            const uint32_t repeat = garbageBlock(r, p.data, 7);
+            putWords(p.data, repeat, {0x8C880000u /* lw t0, 0(a0) */, 0u, 0x25080001u /* addiu t0, t0, 1 */, 0xAC880000u /* sw t0, 0(a0) */,
+                                      0x2D090003u /* sltiu t1, t0, 3 */, 0x03E00008u /* jr ra */, 0x00091100u /* sll v0, t1, 4 */});
+            auto turn = [&]()
+            {
+                p.steps.push_back({"thsemap", 6, {R(go)}, false, "SignalSema(go)"});
+                helper({"thsemap", 8, {R(go)}, false, "WaitSema(go)"});
+            };
+
+            const std::vector<uint32_t> kinds = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+            const uint32_t rounds = r.range(1, 6);
+            for (uint32_t i = 0; i < rounds; ++i)
+            {
+                uint32_t kind = r.pick(kinds);
+                if (r.chance(50))
+                    kind = focus == 24 ? r.pick(std::vector<uint32_t>{2, 3}) : focus == 33 ? 4u : (focus == 35 || focus == 37) ? r.pick(std::vector<uint32_t>{5, 6, 8}) : kind;
+                switch (kind)
+                {
+                case 0: // WaitSema released by SignalSema
+                    turn();
+                    p.steps.push_back({"thsemap", 8, {R(wait)}, false, "WaitSema(wait) blocks"});
+                    helper({"thsemap", 6, {R(wait)}, false, "SignalSema(wait)"});
+                    break;
+                case 1: // WaitSema released by DeleteSema, or by ReleaseWaitThread
+                {
+                    turn();
+                    if (r.chance(50))
+                    {
+                        const uint32_t gone = sema(0, 1, "gone");
+                        p.steps.push_back({"thsemap", 8, {R(gone)}, false, "WaitSema(gone) blocks"});
+                        helper({"thsemap", 5, {R(gone)}, false, "DeleteSema(gone)"});
+                    }
+                    else
+                    {
+                        p.steps.push_back({"thsemap", 8, {R(wait)}, false, "WaitSema(wait) blocks"});
+                        helper({"thbase", 18, {R(me)}, false, "ReleaseWaitThread(main)"});
+                    }
+                    break;
+                }
+                case 2: // SleepThread released by WakeupThread
+                    turn();
+                    p.steps.push_back({"thbase", 24, {}, false, "SleepThread() blocks"});
+                    helper({"thbase", 25, {R(me)}, false, "WakeupThread(main)"});
+                    break;
+                case 3: // a wakeup while waiting on something else is counted; CancelWakeupThread(0) returns it
+                    turn();
+                    p.steps.push_back({"thsemap", 8, {R(wait)}, false, "WaitSema(wait) blocks"});
+                    helper({"thbase", 25, {R(me)}, false, "WakeupThread(main) while it waits on a sema"});
+                    if (r.chance(50))
+                        helper({"thbase", 25, {R(me)}, false, "WakeupThread(main) again"});
+                    helper({"thsemap", 6, {R(wait)}, false, "SignalSema(wait)"});
+                    if (r.chance(50))
+                        p.steps.push_back({"thbase", 24, {}, false, "SleepThread() with a wakeup pending"});
+                    p.steps.push_back({"thbase", 27, {C(0)}, false, "CancelWakeupThread(self)"});
+                    break;
+                case 4: // DelayThread: the helper runs meanwhile
+                {
+                    turn();
+                    const uint32_t usec = r.pick(std::vector<uint32_t>{0u, 1u, 100u, r.range(1, 3000)});
+                    p.steps.push_back({"thbase", 33, {C(usec)}, false, "DelayThread(" + std::to_string(usec) + ")"});
+                    if (r.chance(50))
+                        helper({"thsemap", 9, {R(wait)}, false, "PollSema(wait) while main is delayed"});
+                    break;
+                }
+                case 5: // an alarm that fires during a delay; cancelling it afterwards finds nothing
+                {
+                    const uint32_t clock = garbageBlock(r, p.data, 2);
+                    putWords(p.data, clock, {r.range(1, 0x4000), 0u});
+                    const uint32_t arg = r.u32();
+                    p.steps.push_back({"thbase", 35, {D(clock), D(handler), C(arg)}, false, "SetAlarm(short)"});
+                    if (r.chance(40))
+                        p.steps.push_back({"thbase", 35, {D(clock), D(handler), C(arg)}, false, "SetAlarm(same handler, arg)"});
+                    turn();
+                    p.steps.push_back({"thbase", 33, {C(2000)}, false, "DelayThread(2000) lets it fire"});
+                    p.steps.push_back({"thbase", 37, {D(handler), C(arg)}, false, "CancelAlarm(fired)"});
+                    break;
+                }
+                case 8: // an alarm whose handler re-arms it twice, then lets it end
+                {
+                    const uint32_t clock = garbageBlock(r, p.data, 2), counter = garbageBlock(r, p.data, 1);
+                    putWords(p.data, clock, {r.range(1, 0x2000), 0u});
+                    putWords(p.data, counter, {0u});
+                    p.steps.push_back({"thbase", 35, {D(clock), D(repeat), D(counter)}, false, "SetAlarm(repeating)"});
+                    turn();
+                    p.steps.push_back({"thbase", 33, {C(3000)}, false, "DelayThread(3000): three calls"});
+                    p.steps.push_back({"thbase", 37, {D(repeat), D(counter)}, false, "CancelAlarm(ended)"});
+                    break;
+                }
+                case 6: // an alarm cancelled before it fires
+                {
+                    const uint32_t clock = garbageBlock(r, p.data, 2);
+                    putWords(p.data, clock, {0x10000000u, 0u});
+                    const uint32_t arg = r.u32();
+                    p.steps.push_back({"thbase", 35, {D(clock), D(handler), C(arg)}, false, "SetAlarm(long)"});
+                    p.steps.push_back({"thbase", 37, {D(handler), C(arg ^ 1u)}, false, "CancelAlarm(other arg)"});
+                    p.steps.push_back({"thbase", 37, {D(handler), C(arg)}, false, "CancelAlarm(pending)"});
+                    break;
+                }
+                default: // WaitEventFlag released by SetEventFlag (maybe after a set that does not satisfy it)
+                {
+                    const uint32_t bits = r.chance(50) ? (1u << r.range(0, 31)) : (r.u32() | 1u);
+                    const uint32_t mode = r.pick(std::vector<uint32_t>{0u, 1u, 0x10u, 0x11u});
+                    const uint32_t res = garbageBlock(r, p.data, 1);
+                    turn();
+                    p.steps.push_back({"thevent", 10, {R(ef), C(bits), C(mode), D(res)}, false,
+                                       "WaitEventFlag(ef, " + hex(bits) + ", mode " + hex(mode) + ") blocks"});
+                    const uint32_t low = bits & (~bits + 1u);
+                    if ((mode & 1u) == 0u && bits != low && r.chance(60))
+                        helper({"thevent", 6, {R(ef), C(low)}, false, "SetEventFlag(ef, " + hex(low) + ") not enough"});
+                    helper({"thevent", 6, {R(ef), C(bits | (r.chance(30) ? 0x80000000u : 0u))}, false, "SetEventFlag(ef, bits)"});
+                    p.steps.push_back({"thevent", 8, {R(ef), C(0)}, false, "ClearEventFlag(ef, 0)"});
+                    break;
+                }
+                }
+            }
+            // End: the helper reports its ID and signals done; once it has returned it is deleted.
+            turn();
+            helper({"thbase", 20, {}, true, "GetThreadId()"});
+            const uint32_t helperId = static_cast<uint32_t>(p.steps.size() - 1);
+            helper({"thsemap", 6, {R(done)}, false, "SignalSema(done)"});
+            p.steps.push_back({"thsemap", 8, {R(done)}, false, "WaitSema(done) blocks"});
+            p.steps.push_back({"thbase", 33, {C(100)}, false, "DelayThread(100): the helper returns"});
+            p.steps.push_back({"thbase", 5, {R(helperId)}, false, "DeleteThread(helper)"});
+            for (uint32_t id : {go, done, wait})
+                p.steps.push_back({"thsemap", 5, {R(id)}, false, "DeleteSema"});
+            p.steps.push_back({"thevent", 5, {R(ef)}, false, "DeleteEventFlag(ef)"});
+            p.note = std::to_string(p.steps.size()) + " calls";
+            return p;
+        }
+
         struct KernelTest
         {
             const char *lib;
             uint16_t ord;
             const char *name;
             Program (*gen)(Rng &, uint32_t);
+            bool devices = false; // boot the Sony side with timers and interrupts
         };
         const std::vector<KernelTest> &kernelTests()
         {
@@ -953,6 +1260,19 @@ namespace gt
                 {"thbase", 39, "USec2SysClock", threadProgram},
                 {"thbase", 40, "SysClock2USec", threadProgram},
                 {"thbase", 42, "GetThreadCurrentPriority", threadProgram},
+                {"thbase", 24, "SleepThread", waitProgram, true},
+                {"thbase", 33, "DelayThread", waitProgram, true},
+                {"thbase", 35, "SetAlarm", waitProgram, true},
+                {"thbase", 37, "CancelAlarm", waitProgram, true},
+                {"thsemap", 8, "WaitSema (blocking)", waitProgram, true},
+                {"thevent", 10, "WaitEventFlag (blocking)", waitProgram, true},
+                {"intrman", 4, "RegisterIntrHandler", intrProgram},
+                {"intrman", 5, "ReleaseIntrHandler", intrProgram},
+                {"intrman", 6, "EnableIntr", intrProgram},
+                {"intrman", 7, "DisableIntr", intrProgram},
+                {"intrman", 8, "CpuDisableIntr", intrProgram},
+                {"intrman", 17, "CpuSuspendIntr", intrProgram},
+                {"intrman", 23, "QueryIntrContext", intrProgram},
             };
             return tests;
         }
@@ -961,7 +1281,9 @@ namespace gt
         // (Sony's are pointer-derived, ours are small integers); everything else bit-exact.
         std::string compareProgram(const Program &p, const Observed &lle, const Observed &hle, uint32_t base, size_t pi, bool verbose)
         {
-            std::map<uint32_t, uint32_t> fwd, back;
+            // One bijection per object kind (the HLE numbers threads, semaphores and event flags
+            // separately; Sony's IDs are unique across kinds).
+            std::map<std::string, std::map<uint32_t, uint32_t>> fwdByKind, backByKind;
             std::string diff;
             for (size_t k = 0; k < p.steps.size(); ++k)
             {
@@ -973,6 +1295,8 @@ namespace gt
                 }
                 else if (st.returnsId && static_cast<int32_t>(a) > 0 && static_cast<int32_t>(b) > 0)
                 {
+                    auto &fwd = fwdByKind[st.lib];
+                    auto &back = backByKind[st.lib];
                     auto f = fwd.find(a);
                     auto g = back.find(b);
                     if ((f != fwd.end() && f->second != b) || (g != back.end() && g->second != a))
@@ -1002,7 +1326,8 @@ namespace gt
                     {
                     }
                     else if (kind->second == 1)
-                        same = (wa == 0 && wb == 0) || (fwd.count(wa) && fwd[wa] == wb);
+                        same = (wa == 0 && wb == 0) || std::any_of(fwdByKind.begin(), fwdByKind.end(), [&](const auto &kind)
+                                                                               { const auto it = kind.second.find(wa); return it != kind.second.end() && it->second == wb; });
                     else
                         same = wa - lle.segment == wb - hle.segment;
                     if (!same)
@@ -1089,7 +1414,7 @@ namespace gt
                 {
                     irxOut = buildIrx(batch, KernelBoot::kMailbox);
                     auto kb = std::make_unique<KernelBoot>();
-                    const bool booted = kb->boot(bios, ioprp, order, &irxOut.file, 50'000'000);
+                    const bool booted = kb->boot(bios, ioprp, order, &irxOut.file, 50'000'000, t.devices);
                     lleOut = Observed{};
                     if (!booted)
                         lleOut.error = "kernel boot failed: " + kb->log;
