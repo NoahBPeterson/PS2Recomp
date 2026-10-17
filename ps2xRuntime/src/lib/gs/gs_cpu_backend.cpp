@@ -1,4 +1,5 @@
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_bilerp.h"
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_psmct16.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -320,21 +321,6 @@ namespace
     bool isEightBitIndexedPsm(uint8_t psm)
     {
         return psm == GS_PSM_T8 || psm == GS_PSM_T8H;
-    }
-
-    // One step of the GS bilinear filter on one 8-bit channel: a + ((b - a) * f >> 4), with a
-    // 4-bit weight and an arithmetic (flooring) shift, as PCSX2's GSDrawScanline (lerp16_4).
-    // The texel coordinate keeps 4 fraction bits (12.4), so these weights are all there is.
-    int lerpChannel4(int a, int b, int f)
-    {
-        return a + (((b - a) * f) >> 4);
-    }
-
-    uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, int fx, int fy)
-    {
-        const int top = lerpChannel4(c00, c10, fx);
-        const int bottom = lerpChannel4(c01, c11, fx);
-        return static_cast<uint8_t>(lerpChannel4(top, bottom, fy));
     }
 }
 
@@ -1950,12 +1936,7 @@ namespace
 
     [[gnu::always_inline]] inline uint32_t bilerpTexels(uint32_t c00, uint32_t c10, uint32_t c01, uint32_t c11, int fx, int fy)
     {
-        uint32_t out = 0u;
-        for (unsigned shift = 0; shift < 32u; shift += 8u)
-            out |= static_cast<uint32_t>(lerpChannel(static_cast<uint8_t>(c00 >> shift), static_cast<uint8_t>(c10 >> shift),
-                                                     static_cast<uint8_t>(c01 >> shift), static_cast<uint8_t>(c11 >> shift), fx, fy))
-                   << shift;
-        return out;
+        return GSBilerp::bilerpTexels(c00, c10, c01, c11, fx, fy);
     }
 
     // Texel coordinate (in texels) to the sampler's 16.16 fixed point, after the 12.4 saturation.
@@ -2234,56 +2215,69 @@ namespace
             const int right = std::min(static_cast<int>(std::ceil(std::max(xLong, xShort))), scRight);
             const double ry = static_cast<double>(fy - p[0].y);
 
-            for (int x = left; x < right; ++x)
+            // The texel coordinates are evaluated for a chunk of the span first, in a loop of their
+            // own (the same expressions, so the same values; the compiler vectorizes it), then the
+            // pixels run. Doing the same for Z and the colours is slower.
+            constexpr int kChunk = 64;
+            int texUs[kChunk], texVs[kChunk];
+            for (int chunk = left; chunk < right; chunk += kChunk)
             {
-                const double rx = static_cast<double>(static_cast<float>(x) - p[0].x);
-                const double zv = std::clamp(pz.at(rx, ry), 0.0, 4294967295.0);
-                uint8_t r, g, b, a;
-                if (iip)
-                {
-                    r = clampU8(static_cast<int>(pr.at(rx, ry)));
-                    g = clampU8(static_cast<int>(pg.at(rx, ry)));
-                    b = clampU8(static_cast<int>(pb.at(rx, ry)));
-                    a = clampU8(static_cast<int>(pa.at(rx, ry)));
-                }
-                else
-                {
-                    r = flat.r;
-                    g = flat.g;
-                    b = flat.b;
-                    a = flat.a;
-                }
-
-                if (tme)
-                {
-                    rc.pixelKey = (static_cast<uint64_t>(y) << 34) | (static_cast<uint64_t>(x) << 2);
-                    int texU, texV;
-                    if (fst)
+                const int count = std::min(right - chunk, kChunk);
+                auto rxAt = [&](int i) { return static_cast<double>(static_cast<float>(chunk + i) - p[0].x); };
+                if (tme && fst)
+                    for (int i = 0; i < count; ++i)
                     {
                         // UV is 12.4: shift to the sampler's 16.16.
-                        texU = static_cast<int>(pu.at(rx, ry) * 4096.0);
-                        texV = static_cast<int>(pv.at(rx, ry) * 4096.0);
+                        const double rx = rxAt(i);
+                        texUs[i] = static_cast<int>(pu.at(rx, ry) * 4096.0);
+                        texVs[i] = static_cast<int>(pv.at(rx, ry) * 4096.0);
+                    }
+                else if (tme)
+                    for (int i = 0; i < count; ++i)
+                    {
+                        // The GS interpolates S, T and Q; the texel coordinate is S/Q, T/Q.
+                        const double rx = rxAt(i);
+                        const float q = fabsQ(static_cast<float>(pq.at(rx, ry)));
+                        texUs[i] = texCoordFixed(static_cast<float>(ps_.at(rx, ry)) / q * static_cast<float>(ts.texW));
+                        texVs[i] = texCoordFixed(static_cast<float>(pt.at(rx, ry)) / q * static_cast<float>(ts.texH));
+                    }
+
+                for (int i = 0; i < count; ++i)
+                {
+                    const int x = chunk + i;
+                    const double rx = rxAt(i);
+                    const double zv = std::clamp(pz.at(rx, ry), 0.0, 4294967295.0);
+                    uint8_t r, g, b, a;
+                    if (iip)
+                    {
+                        r = clampU8(static_cast<int>(pr.at(rx, ry)));
+                        g = clampU8(static_cast<int>(pg.at(rx, ry)));
+                        b = clampU8(static_cast<int>(pb.at(rx, ry)));
+                        a = clampU8(static_cast<int>(pa.at(rx, ry)));
                     }
                     else
                     {
-                        // The GS interpolates S, T and Q; the texel coordinate is S/Q, T/Q.
-                        const float q = fabsQ(static_cast<float>(pq.at(rx, ry)));
-                        texU = texCoordFixed(static_cast<float>(ps_.at(rx, ry)) / q * static_cast<float>(ts.texW));
-                        texV = texCoordFixed(static_cast<float>(pt.at(rx, ry)) / q * static_cast<float>(ts.texH));
+                        r = flat.r;
+                        g = flat.g;
+                        b = flat.b;
+                        a = flat.a;
                     }
-                    const uint32_t texel = sampleTexture(rc, ts, texU, texV);
-                    const TextureCombineResult color =
-                        combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel), static_cast<uint8_t>(texel >> 8),
-                                       static_cast<uint8_t>(texel >> 16), static_cast<uint8_t>(texel >> 24));
-                    r = color.r;
-                    g = color.g;
-                    b = color.b;
-                    a = color.a;
+                    if (tme)
+                    {
+                        rc.pixelKey = (static_cast<uint64_t>(y) << 34) | (static_cast<uint64_t>(x) << 2);
+                        const uint32_t texel = sampleTexture(rc, ts, texUs[i], texVs[i]);
+                        const TextureCombineResult color =
+                            combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel), static_cast<uint8_t>(texel >> 8),
+                                           static_cast<uint8_t>(texel >> 16), static_cast<uint8_t>(texel >> 24));
+                        r = color.r;
+                        g = color.g;
+                        b = color.b;
+                        a = color.a;
+                    }
+                    // Fog is only consumed when FGE is set.
+                    const uint8_t fog = fge ? clampU8(static_cast<int>(pf.at(rx, ry))) : uint8_t{0};
+                    W::writeInScissor(rc, ps, x, y, static_cast<u32>(zv), r, g, b, a, fog);
                 }
-
-                // Fog is only consumed when FGE is set.
-                const uint8_t fog = fge ? clampU8(static_cast<int>(pf.at(rx, ry))) : uint8_t{0};
-                W::writeInScissor(rc, ps, x, y, static_cast<u32>(zv), r, g, b, a, fog);
             }
         }
     }

@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_bilerp.h"
 #include "runtime/ee_scheduler.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
@@ -423,6 +424,46 @@ void register_ps2_gs_tests()
 {
     MiniTest::Case("PS2GS", [](TestCase &tc)
     {
+        tc.Run("bilinear filter on packed texels equals the per-channel filter", [](TestCase &t)
+        {
+            // Every pair of the first two corners in every lane position, with all 256 weight pairs and
+            // pseudo-random values for the other corners and lanes.
+            uint32_t random = 0x2545F491u;
+            auto next = [&]()
+            {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                return random;
+            };
+            uint64_t mismatches = 0u, checked = 0u;
+            for (uint32_t a = 0; a < 256u; ++a)
+                for (uint32_t b = 0; b < 256u; ++b)
+                {
+                    const uint32_t lane = (a ^ b) & 3u;
+                    const uint32_t keep = ~(0xFFu << (lane * 8u));
+                    const uint32_t c00 = (next() & keep) | (a << (lane * 8u));
+                    const uint32_t c10 = (next() & keep) | (b << (lane * 8u));
+                    const uint32_t c01 = next(), c11 = next();
+                    for (int fx = 0; fx < 16; ++fx)
+                        for (int fy = 0; fy < 16; ++fy)
+                        {
+                            uint32_t expected = 0u;
+                            for (unsigned shift = 0; shift < 32u; shift += 8u)
+                                expected |= static_cast<uint32_t>(GSBilerp::lerpChannel(
+                                                static_cast<uint8_t>(c00 >> shift), static_cast<uint8_t>(c10 >> shift),
+                                                static_cast<uint8_t>(c01 >> shift), static_cast<uint8_t>(c11 >> shift), fx, fy))
+                                            << shift;
+                            mismatches += GSBilerp::bilerpTexels(c00, c10, c01, c11, fx, fy) != expected;
+                            ++checked;
+                        }
+                }
+            t.Equals(checked, uint64_t{1} << 24, "every corner pair and weight pair checked");
+            t.Equals(mismatches, uint64_t{0}, "packed and per-channel filters agree");
+            t.Equals(GSBilerp::bilerpTexels(0xFFFFFFFFu, 0u, 0u, 0u, 15, 15), 0x00000000u, "weights 15/15 favour the far corner");
+            t.Equals(GSBilerp::bilerpTexels(0xFF00FF00u, 0x00FF00FFu, 0xFF00FF00u, 0x00FF00FFu, 8, 0), 0x7F7F7F7Fu, "half way, floored");
+        });
+
         tc.Run("GS CSR/IMR support coherent 64-bit and 32-bit access", [](TestCase &t)
         {
             PS2Memory mem;
