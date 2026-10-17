@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -496,6 +497,85 @@ void register_ps2_runtime_boot_tests()
             t.IsTrue(host.readHostFile(h2, 9u, buf, 1u, got) && got == 1u && buf[0] == 9u, "the other handle is unaffected");
             host.closeHostFile(h);  // closing twice is harmless
             host.closeHostFile(h2); // the destructor closes anything left otherwise
+        });
+    });
+
+    MiniTest::Case("PS2CdAndLibcStubs", [](TestCase &t0)
+    {
+        auto setA = [](R5900Context &ctx, int reg, uint32_t v) { ctx.r[reg] = _mm_set_epi64x(0, static_cast<int64_t>(v)); };
+        auto v0 = [](const R5900Context &ctx) { return static_cast<int32_t>(_mm_cvtsi128_si32(ctx.r[2])); };
+
+        t0.Run("sceCdIntToPos / sceCdPosToInt: LSN <-> BCD minute:second:sector, 150 sectors of lead-in", [&](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            const struct { uint32_t lsn; uint8_t m, s, f; } cases[] = {
+                {0u, 0x00, 0x02, 0x00}, {74u, 0x00, 0x02, 0x74}, {75u, 0x00, 0x03, 0x00},
+                {4350u, 0x01, 0x00, 0x00}, {123456u, 0x27, 0x28, 0x06}, {359849u, 0x79, 0x59, 0x74}};
+            for (const auto &c : cases)
+            {
+                R5900Context ctx{};
+                setA(ctx, 4, c.lsn);
+                setA(ctx, 5, 0x1000u);
+                ps2_stubs::sceCdIntToPos(rdram.data(), &ctx, &runtime);
+                t.Equals(v0(ctx), 1, "sceCdIntToPos succeeds");
+                const uint8_t *p = rdram.data() + 0x1000u;
+                t.IsTrue(p[0] == c.m && p[1] == c.s && p[2] == c.f && p[3] == 0u,
+                         "LSN " + std::to_string(c.lsn) + " -> BCD position");
+                R5900Context back{};
+                setA(back, 4, 0x1000u);
+                ps2_stubs::sceCdPosToInt(rdram.data(), &back, &runtime);
+                t.Equals(v0(back), static_cast<int32_t>(c.lsn), "sceCdPosToInt inverts it");
+            }
+        });
+
+        t0.Run("sceCdReadClock: sceCdCLOCK in BCD (stat, second, minute, hour, pad, day, month, year) = local time", [&](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0xEEu);
+            R5900Context ctx{};
+            setA(ctx, 4, 0x2000u);
+            const std::time_t before = std::time(nullptr);
+            ps2_stubs::sceCdReadClock(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), 1, "succeeds");
+            const uint8_t *c = rdram.data() + 0x2000u;
+            auto bcd = [](uint8_t b) { return (b >> 4) * 10 + (b & 0xF); };
+            bool validBcd = true;
+            for (int i = 1; i < 8; ++i)
+                validBcd = validBcd && (c[i] & 0xF) < 10 && (c[i] >> 4) < 10;
+            t.IsTrue(validBcd, "every field is BCD");
+            t.Equals(static_cast<uint32_t>(c[0]), 0u, "stat 0");
+            t.Equals(static_cast<uint32_t>(c[4]), 0u, "pad 0");
+            std::tm tm{};
+#ifdef _WIN32
+            localtime_s(&tm, &before);
+#else
+            localtime_r(&before, &tm);
+#endif
+            t.Equals(bcd(c[7]), (tm.tm_year + 1900) % 100, "year");
+            t.Equals(bcd(c[6]), tm.tm_mon + 1, "month");
+            t.IsTrue(bcd(c[3]) < 24 && bcd(c[2]) < 60 && bcd(c[1]) < 60 && bcd(c[5]) >= 1 && bcd(c[5]) <= 31, "time fields in range");
+            t.Equals(static_cast<uint32_t>(c[8]), 0xEEu, "nothing past the 8-byte record");
+        });
+
+        t0.Run("printf returns the rendered length; a null format is an error", [&](TestCase &t)
+        {
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            const char fmt[] = "%s=%d [%04x]";
+            const char str[] = "lives";
+            std::memcpy(rdram.data() + 0x3000u, fmt, sizeof(fmt));
+            std::memcpy(rdram.data() + 0x3100u, str, sizeof(str));
+            R5900Context ctx{};
+            setA(ctx, 4, 0x3000u);
+            setA(ctx, 5, 0x3100u);
+            setA(ctx, 6, static_cast<uint32_t>(-3));
+            setA(ctx, 7, 0xBEEFu);
+            ps2_stubs::printf(rdram.data(), &ctx, &runtime);
+            t.Equals(v0(ctx), static_cast<int32_t>(std::strlen("lives=-3 [beef]")), "length of \"lives=-3 [beef]\"");
+            R5900Context bad{};
+            ps2_stubs::printf(rdram.data(), &bad, &runtime);
+            t.IsTrue(v0(bad) < 0, "printf(NULL) fails");
         });
     });
 }
