@@ -40,6 +40,8 @@
 
 namespace
 {
+    // The run cycle cap the trace was recorded with (ps2_vu1_trace::runCycleCap).
+    uint32_t g_runCycleCap = 65536u;
     using namespace ps2_vu1_trace;
     using vu1ref::ArchState;
 
@@ -68,8 +70,9 @@ namespace
             return false;
         uint32_t version = 0u;
         std::memcpy(&version, bytes.data() + 8, 4);
-        if (version != kVersion)
+        if (!readableVersion(version))
             return false;
+        g_runCycleCap = runCycleCap(version);
         size_t pos = 12u;
         const uint8_t *code = nullptr;
         auto take = [&](void *dst, size_t n)
@@ -519,15 +522,15 @@ int main(int argc, char **argv)
         g_ourPairs = 0;
         vu1.restoreState(r.before);
         if (!resume)
-            vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, 65536);
+            vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, g_runCycleCap);
         else
-            vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, 65536);
+            vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, g_runCycleCap);
         g_ourSteps = nullptr;
         const VU1State ourAfter = vu1.state();
         if (capture)
             ourSteps.push_back(fromRuntime(ourAfter));
         const uint64_t ourPairs = g_ourPairs;
-        const bool ourBudgetStop = ourAfter.cycles - r.before.cycles >= 65536u && !ourAfter.stoppedByD && !ourAfter.stoppedByT;
+        const bool ourBudgetStop = ourAfter.cycles - r.before.cycles >= g_runCycleCap && !ourAfter.stoppedByD && !ourAfter.stoppedByT;
         budgetRuns += ourBudgetStop;
         {
             std::string d;

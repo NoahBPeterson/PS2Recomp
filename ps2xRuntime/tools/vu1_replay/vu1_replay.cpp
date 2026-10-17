@@ -27,6 +27,8 @@
 
 namespace
 {
+    // The run cycle cap the trace was recorded with (ps2_vu1_trace::runCycleCap).
+    uint32_t g_runCycleCap = 65536u;
     using namespace ps2_vu1_trace;
 
     struct Record
@@ -54,8 +56,9 @@ namespace
             return false;
         uint32_t version = 0u;
         std::memcpy(&version, bytes.data() + 8, 4);
-        if (version != kVersion)
+        if (!readableVersion(version))
             return false;
+        g_runCycleCap = runCycleCap(version);
         size_t pos = 12u;
         const uint8_t *code = nullptr;
         auto take = [&](void *dst, size_t n)
@@ -274,7 +277,7 @@ int main(int argc, char **argv)
             {
                 vu1.restoreState(r.before);
                 const auto start = threadCpuNow();
-                vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, 65536);
+                vu1.execute(code, kMemSize, data, kMemSize, gs, &memory, r.header.startPc, r.header.top, r.header.itop, g_runCycleCap);
                 vuTime += threadCpuNow() - start;
             }
             else
@@ -285,7 +288,7 @@ int main(int argc, char **argv)
                 ++resumes;
                 vu1.restoreState(r.before);
                 const auto start = threadCpuNow();
-                vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, 65536);
+                vu1.resume(code, kMemSize, data, kMemSize, gs, &memory, r.header.top, r.header.itop, g_runCycleCap);
                 vuTime += threadCpuNow() - start;
             }
             cycles += r.after.cycles - r.before.cycles;

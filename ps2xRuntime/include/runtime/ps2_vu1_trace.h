@@ -21,7 +21,14 @@
 namespace ps2_vu1_trace
 {
     constexpr char kMagic[8] = {'P', 'S', '2', 'X', 'V', 'U', '1', 'T'};
-    constexpr uint32_t kVersion = 1u;
+    // v2: runs are capped at kRunCycleCap VU1 cycles; v1 traces were recorded with a 65536-cycle cap.
+    constexpr uint32_t kVersion = 2u;
+    // The cycle cap of one VU1 run (MSCAL/MSCNT) in the runtime. A microprogram runs to its end on
+    // the hardware, and the EE side here waits for it, so the cap only stops a runaway program;
+    // 65536 cut TC's longest programs short (pc 0x3800, about 57k instruction pairs).
+    constexpr uint32_t kRunCycleCap = 1u << 22;
+    inline bool readableVersion(uint32_t version) { return version == 1u || version == 2u; }
+    inline uint32_t runCycleCap(uint32_t version) { return version >= 2u ? kRunCycleCap : 65536u; }
     constexpr uint32_t kMemSize = 0x4000u;
 
     enum class RunKind : uint32_t

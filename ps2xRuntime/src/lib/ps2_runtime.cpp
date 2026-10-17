@@ -841,7 +841,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                                  m_memory.getVU1Code(), m_memory.getVU1Data());
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                   m_gs, &m_memory, startPC, top, itop, 65536);
+                                                   m_gs, &m_memory, startPC, top, itop, ps2_vu1_trace::kRunCycleCap);
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
@@ -866,7 +866,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                                  m_memory.getVU1Code(), m_memory.getVU1Data());
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
-                                                  m_gs, &m_memory, top, itop, 65536);
+                                                  m_gs, &m_memory, top, itop, ps2_vu1_trace::kRunCycleCap);
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);

@@ -1166,6 +1166,8 @@ struct Vu1RecGenerator
 
 namespace
 {
+    // The run cycle cap of the trace being replayed (ps2_vu1_trace::runCycleCap).
+    uint32_t g_runCycleCap = 65536u;
     struct Record
     {
         Vu1TraceRecordHeader header{};
@@ -1182,6 +1184,11 @@ namespace
         bytes.assign(std::istreambuf_iterator<char>(f), {});
         if (bytes.size() < 12u || std::memcmp(bytes.data(), kMagic, 8) != 0)
             return false;
+        uint32_t version = 0u;
+        std::memcpy(&version, bytes.data() + 8, 4);
+        if (!readableVersion(version))
+            return false;
+        g_runCycleCap = runCycleCap(version);
         size_t pos = 12u;
         const uint8_t *code = nullptr;
         while (pos + sizeof(Vu1TraceRecordHeader) <= bytes.size())
@@ -1292,10 +1299,10 @@ int main(int argc, char **argv)
             g_runStart = true;
             if (r.header.kind == static_cast<uint32_t>(RunKind::Execute))
                 vu1.execute(memory.getVU1Code(), kMemSize, memory.getVU1Data(), kMemSize, gs, &memory, r.header.startPc,
-                            r.header.top, r.header.itop, 65536);
+                            r.header.top, r.header.itop, g_runCycleCap);
             else
                 vu1.resume(memory.getVU1Code(), kMemSize, memory.getVU1Data(), kMemSize, gs, &memory, r.header.top,
-                           r.header.itop, 65536);
+                           r.header.itop, g_runCycleCap);
         }
     }
     VU1Interpreter::s_pcHook = nullptr;
