@@ -60,10 +60,10 @@ namespace
         uint32_t ft;
         uint32_t result;
         // 0: must match exactly.
-        // 1: the hardware does not round to nearest (ADD.S and MUL.S drop the low bits, the divide unit has its
-        //    own rule); rounding is not emulated, so the row differs in the last mantissa bit.
-        // 2: an ADD.S/SUB.S/MUL.S operand has exponent 0 and a non-zero mantissa. The hardware reads it as
-        //    zero; the fast path does not look for it. Not checked.
+        // 1: one last-bit difference the runtime keeps on purpose, because it follows PCSX2 there: MUL.S chops
+        //    the exact product, where the hardware multiplier can come out one lower; RSQRT.S chops its root
+        //    and its divide, where the hardware divider rounds by its own rule (1/sqrt(25) rounds up, 3/sqrt(3)
+        //    does not).
         int known;
     };
 
@@ -105,8 +105,6 @@ void register_ps2_float_semantics_tests()
         {
             for (const HardwareVector &v : kHardwareVectors)
             {
-                if (v.known == 2)
-                    continue;
                 const uint32_t got = runHardwareOp(v);
                 if (v.known == 1)
                 {
@@ -118,6 +116,47 @@ void register_ps2_float_semantics_tests()
                     t.Equals(got, v.result, describe(v, got));
                 }
             }
+        });
+
+        tc.Run("FPU ADD.S, SUB.S and MUL.S round toward zero", [](TestCase &t)
+        {
+            // TC2's DOF blur takes the fraction of its blur amount as x - ((x + 2^23) - 2^23); chopping keeps
+            // 0.7 + 2^23 at 2^23, so the fraction stays 0.7 (round to nearest makes it -0.3 and no pass runs).
+            const float big = floatOf(0x4B000000u);
+            const float whole = FPU_SUB_S(FPU_ADD_S(0.7f, big), big);
+            t.Equals(bitsOf(whole), 0x00000000u, "(0.7 + 2^23) - 2^23 should be 0");
+            t.Equals(bitsOf(FPU_SUB_S(0.7f, whole)), bitsOf(0.7f), "the fraction of 0.7 should be 0.7");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0xBFFFFFFFu), floatOf(0xBF800000u))), 0xC03FFFFFu,
+                     "-1.9999999 - 1 should chop to -2.9999998, not round to -3");
+            t.Equals(bitsOf(FPU_MUL_S(floatOf(0x3FA265B1u), floatOf(0x3F9027C4u))), 0x3FB6E4DAu,
+                     "the product should chop (nearest gives 3fb6e4db)");
+            t.Equals(bitsOf(FPU_MUL_S(floatOf(0xBFA265B1u), floatOf(0x3F9027C4u))), 0xBFB6E4DAu,
+                     "a negative product should chop toward zero too");
+            t.Equals(bitsOf(FPU_ADD_S(FPU_MUL_S(floatOf(0x3FA265B1u), floatOf(0x3F9027C4u)), 0.0f)), 0x3FB6E4DAu,
+                     "MADD.S is the chopped product, then the chopped add");
+        });
+
+        tc.Run("FPU ADD.S keeps one guard bit of the smaller operand", [](TestCase &t)
+        {
+            // Exponent difference 2: the low bit of 0.25 + 1 ulp is dropped before the subtraction, so
+            // 1 - 0x3E800001 is exactly 0.75 (the exact difference would chop to 0x3F3FFFFF).
+            t.Equals(bitsOf(FPU_SUB_S(1.0f, floatOf(0x3E800001u))), 0x3F400000u, "1 - (0.25 + ulp) should be 0.75");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0xBE800001u), 1.0f)), 0x3F400000u, "the alignment does not depend on operand order");
+            // Exponent difference 1 keeps every bit: 1 - (0.5 + ulp) is exact.
+            t.Equals(bitsOf(FPU_SUB_S(1.0f, floatOf(0x3F000001u))), 0x3EFFFFFEu, "1 - (0.5 + ulp) should be exact");
+            // Exponent difference 25 or more leaves only the sign.
+            t.Equals(bitsOf(FPU_SUB_S(1.0f, floatOf(0x33000001u))), 0x3F800000u, "1 - (2^-25 + ulp) should be 1");
+            t.Equals(bitsOf(FPU_ADD_S(floatOf(0x00400000u), 1.0f)), 0x3F800000u, "an exponent-0 operand reads as zero");
+            t.Equals(bitsOf(FPU_MUL_S(floatOf(0x00400000u), -1.0f)), 0x80000000u, "an exponent-0 factor reads as zero");
+        });
+
+        tc.Run("FPU CVT.S.W chops integers wider than 24 bits", [](TestCase &t)
+        {
+            t.Equals(bitsOf(FPU_CVT_S_W(16777217)), 0x4B800000u, "16777217 should become 16777216");
+            t.Equals(bitsOf(FPU_CVT_S_W(16777219)), 0x4B800001u, "16777219 should become 16777218, not 16777220");
+            t.Equals(bitsOf(FPU_CVT_S_W(-16777219)), 0xCB800001u, "-16777219 should become -16777218");
+            t.Equals(bitsOf(FPU_CVT_S_W(0x7FFFFFFF)), 0x4EFFFFFFu, "INT32_MAX should become 2147483520");
+            t.Equals(bitsOf(FPU_CVT_S_W(INT32_MIN)), 0xCF000000u, "INT32_MIN is exact");
         });
 
         tc.Run("exponent 255 is an ordinary exponent, not Inf or NaN", [](TestCase &t)
@@ -178,6 +217,33 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_SQRT_S(-0.0f)), bitsOf(0.0f), "sqrt(-0) should be +0");
         });
 
+        tc.Run("VU0 ADD/SUB/MUL and the Q unit round toward zero, without the FPU's alignment", [](TestCase &t)
+        {
+            // _mm_set_ps lists lanes 3..0
+            const __m128 a = _mm_set_ps(1.0f, floatOf(0xBFFFFFFFu), floatOf(0x3FFFFFFFu), floatOf(0x3FA265B1u));
+            const __m128 b = _mm_set_ps(floatOf(0xBE800001u), floatOf(0xBF800000u), 1.0f, floatOf(0x3F9027C4u));
+            const __m128 sum = PS2_VADD(a, b);
+            t.Equals(laneBits(sum, 1), 0x403FFFFFu, "lane 1: 1.9999999 + 1 should chop to 2.9999998");
+            t.Equals(laneBits(sum, 2), 0xC03FFFFFu, "lane 2: -1.9999999 - 1 should chop toward zero");
+            // The VU adder keeps every bit of the smaller operand: 0.75 - 2^-25 chops to 0x3F3FFFFF, where the
+            // FPU's ADD.S gives exactly 0.75.
+            t.Equals(laneBits(sum, 3), 0x3F3FFFFFu, "lane 3: 1 - (0.25 + ulp) should chop the exact difference");
+            const __m128 diff = PS2_VSUB(a, _mm_xor_ps(b, _mm_set1_ps(-0.0f)));
+            t.Equals(laneBits(diff, 3), 0x3F3FFFFFu, "SUB of the negated operand should give the same result");
+            const __m128 prod = PS2_VMUL(a, b);
+            t.Equals(laneBits(prod, 0), 0x3FB6E4DAu, "lane 0: the product should chop (nearest gives 3fb6e4db)");
+
+            t.Equals(bitsOf(PS2_VU_DIV_Q(1.0f, 3.0f)), 0x3EAAAAAAu, "DIV 1/3 should chop to 0x3EAAAAAA");
+            t.Equals(bitsOf(PS2_VU_DIV_Q(-1.0f, 3.0f)), 0xBEAAAAAAu, "DIV -1/3 should chop toward zero");
+            t.Equals(bitsOf(PS2_VU_DIV_Q(1.0f, 4.0f)), bitsOf(0.25f), "an exact quotient is unchanged");
+            t.Equals(bitsOf(PS2_VU_SQRT_Q(5.0f)), 0x400F1BBCu, "SQRT 5 should chop to 0x400F1BBC");
+            t.Equals(bitsOf(PS2_VU_SQRT_Q(16.0f)), bitsOf(4.0f), "SQRT 16 should be 4");
+            t.Equals(bitsOf(PS2_VU_RSQRT_Q(1.0f, 4.0f)), bitsOf(0.5f), "RSQRT 1/sqrt(4) should be 0.5");
+            t.Equals(bitsOf(PS2_VU_RSQRT_Q(1.0f, 5.0f)), bitsOf(PS2_VU_DIV_Q(1.0f, floatOf(0x400F1BBCu))),
+                     "RSQRT divides by the chopped root");
+            t.Equals(bitsOf(PS2_VU_DIV_Q(1.0f, 0.0f)), 0x7F7FFFFFu, "DIV by zero still gives +0x7F7FFFFF");
+        });
+
         tc.Run("VU vector ADD/SUB/MUL follow the same rules in every lane", [](TestCase &t)
         {
             // _mm_set_ps lists lanes 3..0
@@ -192,7 +258,8 @@ void register_ps2_float_semantics_tests()
 
             const __m128 diff = PS2_VSUB(a, b);
             t.Equals(laneBits(diff, 0), bitsOf(0.0f), "lane 0: max - max should be 0");
-            t.Equals(laneBits(diff, 2), kTwoPow128, "lane 2: 2^128 - 1 should stay 2^128");
+            // The VU adder has no alignment step, so the exact 2^128 - 1 chops to the value just below 2^128.
+            t.Equals(laneBits(diff, 2), 0x7F7FFFFFu, "lane 2: 2^128 - 1 should chop to 0x7F7FFFFF");
             t.Equals(laneBits(diff, 3), bitsOf(-1.0f), "lane 3: 1 - 2 should be -1");
 
             const __m128 prod = PS2_VMUL(a, b);
