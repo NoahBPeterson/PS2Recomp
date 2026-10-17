@@ -291,8 +291,11 @@ namespace vu1_lower_detail
     }
     case 0x24: // JR
     {
+        // JR/JALR read the VI register as it is now: the backup of a VI written by the previous
+        // instruction applies to the conditional branches only (PCSX2's interpreter and microVU; TC2's
+        // unrolled-remainder jumps `ISUB vi9, vi9, vi8; JR vi9` need the new value).
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        uint32_t target = ((uint32_t)(uint16_t)(is ? m_state.vi[is] : 0) * 8u) & pcMask;
         m_state.branchPending = true;
         m_state.branchTarget = target;
         m_state.branchDelay = 1;
@@ -302,7 +305,7 @@ namespace vu1_lower_detail
     {
         uint8_t it = VIT(instr);
         uint8_t is = VIS(instr);
-        uint32_t target = ((uint32_t)(uint16_t)readBranchVi(is) * 8u) & pcMask;
+        uint32_t target = ((uint32_t)(uint16_t)(is ? m_state.vi[is] : 0) * 8u) & pcMask;
         if (it != 0)
             m_state.vi[it] = (int32_t)((m_state.pc + 16) / 8);
         m_state.branchPending = true;

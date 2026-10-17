@@ -560,6 +560,31 @@ if(NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
     # VU1 microprogram recompiler (T-0121): VU1 traces -> src/vu1_aot/*.cpp.
     add_executable(ps2x_vu1_rec_gen tools/vu1_rec/vu1_rec_gen.cpp)
     target_link_libraries(ps2x_vu1_rec_gen PRIVATE ps2_runtime)
+    # VU1 interpreter vs PCSX2's VU1 interpreter on the recorded traces (tools/vu1_pcsx2_diff), with
+    # PCSX2's VU files compiled from a PCSX2 source tree (GPL-3, read from outside the repo, never
+    # committed). Copied so that their quoted includes find the stand-ins in tools/vu1_pcsx2_diff/shim.
+    set(PS2X_PCSX2_SRC "" CACHE PATH "PCSX2 source tree (tag v2.8.2) for the differential tests")
+    if(PS2X_PCSX2_SRC AND EXISTS "${PS2X_PCSX2_SRC}/pcsx2/VU1microInterp.cpp")
+        set(_vuref ${CMAKE_CURRENT_BINARY_DIR}/pcsx2_ref_vu1)
+        foreach(f VUops.cpp VUflags.cpp VU1microInterp.cpp)
+            configure_file(${PS2X_PCSX2_SRC}/pcsx2/${f} ${_vuref}/${f} COPYONLY)
+        endforeach()
+        foreach(f VU.h VUops.h VUflags.h VUmicro.h)
+            configure_file(${PS2X_PCSX2_SRC}/pcsx2/${f} ${_vuref}/include/${f} COPYONLY)
+        endforeach()
+        add_library(ps2x_vu1_pcsx2_ref STATIC tools/vu1_pcsx2_diff/pcsx2_ref.cpp
+            ${_vuref}/VUops.cpp ${_vuref}/VUflags.cpp ${_vuref}/VU1microInterp.cpp)
+        target_include_directories(ps2x_vu1_pcsx2_ref PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/vu1_pcsx2_diff/shim ${_vuref}/include)
+        # PCSX2 (x86) evaluates a*b+c with two roundings and under the VU1FPCR rounding mode.
+        if(MSVC)
+            target_compile_options(ps2x_vu1_pcsx2_ref PRIVATE /fp:strict /w)
+        else()
+            target_compile_options(ps2x_vu1_pcsx2_ref PRIVATE -ffp-contract=off -frounding-math -w)
+        endif()
+        add_executable(ps2x_vu1_pcsx2_diff tools/vu1_pcsx2_diff/vu1_pcsx2_diff.cpp)
+        target_link_libraries(ps2x_vu1_pcsx2_diff PRIVATE ps2_runtime ps2x_vu1_pcsx2_ref)
+    endif()
 endif()
 
 set(PS2X_SANITIZE "" CACHE STRING "Comma-separated -fsanitize= list for ps2_runtime/ps2_iop (e.g. address,undefined or thread)")
