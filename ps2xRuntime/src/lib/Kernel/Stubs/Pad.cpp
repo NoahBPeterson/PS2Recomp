@@ -101,6 +101,16 @@ namespace ps2_stubs
             return padScriptButtonsAt(padScript(), frame);
         }
 
+        // PS2X_PAD_SCRIPT_CLOCK=reads times the script in port-0 pad reads (TC reads once per game
+        // loop iteration) instead of host frames, so it presses at the same game point however fast
+        // the game runs.
+        const bool g_padScriptByReads = []
+        {
+            const char *env = std::getenv("PS2X_PAD_SCRIPT_CLOCK");
+            return env && std::string(env) == "reads";
+        }();
+        std::atomic<uint32_t> g_port0Reads{0u};
+
         uint8_t axisToByte(float axis)
         {
             axis = std::clamp(axis, -1.0f, 1.0f);
@@ -357,7 +367,8 @@ namespace ps2_stubs
 
             if (port == 0)
             {
-                state.buttons = static_cast<uint16_t>(state.buttons & ~scriptedButtonsAt(g_ps2xHostFrame.load(std::memory_order_relaxed)));
+                const uint32_t clock = g_padScriptByReads ? g_port0Reads.fetch_add(1u, std::memory_order_relaxed) : g_ps2xHostFrame.load(std::memory_order_relaxed);
+                state.buttons = static_cast<uint16_t>(state.buttons & ~scriptedButtonsAt(clock));
             }
 
             fillPadStatus(outData, state, portState);

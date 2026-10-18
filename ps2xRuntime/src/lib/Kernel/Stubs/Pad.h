@@ -11,7 +11,8 @@ namespace ps2_stubs
 {
     // PS2X_PAD_SCRIPT="name@frame+dur[*period],..." holds a port-0 button from host frame `frame`
     // for `dur` frames, repeating every `period` frames if given. Names: start select cross circle
-    // square triangle up down left right l1 r1 l2 r2 l3 r3.
+    // square triangle up down left right l1 r1 l2 r2 l3 r3. PS2X_PAD_SCRIPT_CLOCK=reads counts port-0
+    // pad reads instead of host frames.
     struct PadScriptPress
     {
         uint16_t mask = 0u;
