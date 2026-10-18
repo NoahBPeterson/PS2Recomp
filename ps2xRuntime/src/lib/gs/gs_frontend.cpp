@@ -699,6 +699,74 @@ namespace
     };
 }
 
+void GS::applyPrivilegedEvent(GSRegisters &regs, uint8_t reg, uint64_t value)
+{
+    const uint32_t id = static_cast<uint32_t>(value);
+    const uint32_t mask = static_cast<uint32_t>(value >> 32);
+    if (reg == GS_REG_SIGNAL)
+    {
+        const uint32_t lo = (static_cast<uint32_t>(regs.siglblid) & ~mask) | (id & mask);
+        regs.siglblid = (regs.siglblid & 0xFFFFFFFF00000000ULL) | lo;
+        regs.csr.fetch_or(0x1);
+    }
+    else if (reg == GS_REG_FINISH)
+        regs.csr.fetch_or(0x2);
+    else if (reg == GS_REG_LABEL)
+    {
+        const uint32_t hi = (static_cast<uint32_t>(regs.siglblid >> 32) & ~mask) | (id & mask);
+        regs.siglblid = (static_cast<uint64_t>(hi) << 32) | (regs.siglblid & 0xFFFFFFFFULL);
+    }
+}
+
+void GS::privilegedEvent(uint8_t reg, uint64_t value)
+{
+    if (reg == GS_REG_FINISH)
+        g_ps2xGsFinishes.fetch_add(1u, std::memory_order_relaxed);
+    if (m_privilegedEventSink)
+        m_privilegedEventSink(reg, value);
+    else if (m_privRegs)
+        applyPrivilegedEvent(*m_privRegs, reg, value);
+}
+
+void GS::scanPrivilegedEvents(const uint8_t *data, uint32_t sizeBytes)
+{
+    // SIGNAL/FINISH/LABEL can only be written by A+D (PACKED descriptor 0xE); the raw backend
+    // consumes the rest. Walks the GIF tags like the backend does: PACKED nloop x nreg qwords,
+    // REGLIST nloop x nreg dwords (padded to a qword), IMAGE nloop qwords.
+    uint32_t offset = 0u;
+    while (offset + 16u <= sizeBytes)
+    {
+        const uint64_t tagLo = loadLE64(data + offset);
+        const uint64_t tagHi = loadLE64(data + offset + 8u);
+        offset += 16u;
+        const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+        const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 0x3u);
+        uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xFu);
+        if (nreg == 0u)
+            nreg = 16u;
+        if (flg == 0u)
+        {
+            for (uint32_t loop = 0; loop < nloop; ++loop)
+                for (uint32_t r = 0; r < nreg; ++r)
+                {
+                    if (offset + 16u > sizeBytes)
+                        return;
+                    if (((tagHi >> (r * 4u)) & 0xFu) == 0xEu)
+                    {
+                        const uint8_t addr = data[offset + 8u];
+                        if (addr == GS_REG_SIGNAL || addr == GS_REG_FINISH || addr == GS_REG_LABEL)
+                            privilegedEvent(addr, loadLE64(data + offset));
+                    }
+                    offset += 16u;
+                }
+        }
+        else if (flg == 1u)
+            offset += ((nloop * nreg + 1u) & ~1u) * 8u;
+        else
+            offset += nloop * 16u;
+    }
+}
+
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -708,7 +776,10 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes, uint32_t path
     if (m_backend && m_backend->UsesRawCommands())
     {
         if (data && sizeBytes && (sizeBytes & 15u) == 0u)
+        {
+            scanPrivilegedEvents(data, sizeBytes);
             m_backend->ProcessGIF(path, data, sizeBytes);
+        }
         return;
     }
     if (!data || sizeBytes < 16 || !m_backend)
@@ -1155,6 +1226,8 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
 {
     if (m_backend && m_backend->UsesRawCommands())
     {
+        if (regAddr == GS_REG_SIGNAL || regAddr == GS_REG_FINISH || regAddr == GS_REG_LABEL)
+            privilegedEvent(regAddr, value);
         m_backend->WriteRegisterRaw(regAddr, value);
         return;
     }
@@ -1553,40 +1626,17 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
         break;
     }
     case GS_REG_SIGNAL:
-    {
-        if (m_privRegs)
-        {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
-            uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
-            lo = (lo & ~mask) | (id & mask);
-            m_privRegs->siglblid = (m_privRegs->siglblid & 0xFFFFFFFF00000000ULL) | lo;
-            m_privRegs->csr.fetch_or(0x1);
-        }
+    case GS_REG_LABEL:
+        privilegedEvent(regAddr, value);
         break;
-    }
     case GS_REG_FINISH:
     {
-        g_ps2xGsFinishes.fetch_add(1u, std::memory_order_relaxed);
         if (m_backend)
         {
             m_backend->Flush();
             m_backend->Sync(GSSyncReason::Finish);
         }
-        if (m_privRegs)
-            m_privRegs->csr.fetch_or(0x2);
-        break;
-    }
-    case GS_REG_LABEL:
-    {
-        if (m_privRegs)
-        {
-            uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
-            uint32_t mask = static_cast<uint32_t>(value >> 32);
-            uint32_t hi = static_cast<uint32_t>(m_privRegs->siglblid >> 32);
-            hi = (hi & ~mask) | (id & mask);
-            m_privRegs->siglblid = (static_cast<uint64_t>(hi) << 32) | (m_privRegs->siglblid & 0xFFFFFFFF);
-        }
+        privilegedEvent(regAddr, value);
         break;
     }
     case 0x59:

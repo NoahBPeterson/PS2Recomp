@@ -30,6 +30,10 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <pthread.h>
+#endif
 
 // Presented host frames; read by debug switches (e.g. PS2X_PAD_SCRIPT in Pad.cpp).
 std::atomic<uint32_t> g_ps2xHostFrame{0u};
@@ -44,6 +48,50 @@ extern std::atomic<uint32_t> g_ps2xGsFinishes;
 static std::atomic<uint32_t> g_ps2xVu1Runs{0u};
 static std::atomic<uint64_t> g_ps2xVu1Cycles{0u};
 static std::atomic<uint64_t> g_ps2xVu1InterpretedPairs{0u};
+
+namespace
+{
+    // PS2X_CPU_REPORT=1: CPU time of each named runtime thread over the [fps] window, per second
+    // and per game frame (port-0 pad poll). Unlike fps it holds up on a loaded machine: the game
+    // thread's ms per frame is the critical path whenever a core is free. macOS only.
+    void printThreadCpuReport(double span, double frames)
+    {
+#if defined(__APPLE__)
+        static std::unordered_map<std::string, uint64_t> previous;
+        std::unordered_map<std::string, uint64_t> current;
+        thread_act_array_t threads = nullptr;
+        mach_msg_type_number_t count = 0;
+        if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+            return;
+        for (mach_msg_type_number_t i = 0; i < count; ++i)
+        {
+            char name[64] = {};
+            if (pthread_t thread = pthread_from_mach_thread_np(threads[i]))
+                pthread_getname_np(thread, name, sizeof(name));
+            thread_basic_info_data_t info{};
+            mach_msg_type_number_t infoCount = THREAD_BASIC_INFO_COUNT;
+            if (name[0] && thread_info(threads[i], THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &infoCount) == KERN_SUCCESS)
+                current[name] += uint64_t(info.user_time.seconds + info.system_time.seconds) * 1000000u +
+                                 uint64_t(info.user_time.microseconds + info.system_time.microseconds);
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        }
+        vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads), count * sizeof(thread_act_t));
+        std::printf("[cpu]");
+        for (const auto &[name, micros] : current)
+        {
+            const auto it = previous.find(name);
+            const double ms = double(micros - (it != previous.end() ? it->second : 0u)) / 1000.0;
+            if (ms / span >= 5.0)
+                std::printf(" %s=%.0fms/s(%.2fms/frame)", name.c_str(), ms / span, frames > 0.0 ? ms / frames : 0.0);
+        }
+        std::printf("\n");
+        previous = std::move(current);
+#else
+        (void)span;
+        (void)frames;
+#endif
+    }
+}
 extern std::atomic<uint64_t> g_ps2xEeBusyCycles; // EeScheduler.cpp
 extern std::atomic<uint64_t> g_ps2xEeIdleCycles;
 
@@ -727,6 +775,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.stopVif1Worker(); // before the VU1 and GS it uses go
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -851,6 +900,9 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 
 bool PS2Runtime::syncCoreSubsystems()
 {
+    // Kernel stubs call this before they drive the GS (or VU1) directly; the VIF1 worker owns them
+    // while it runs.
+    m_memory.syncVif1Worker();
     uint8_t *const rdram = m_memory.getRDRAM();
     uint8_t *const gsVram = m_memory.getGSVRAM();
     if (!rdram || !gsVram)
@@ -872,15 +924,15 @@ bool PS2Runtime::syncCoreSubsystems()
     m_memory.setGifArbiter(&m_gifArbiter);
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     R5900Context *cpuContext = (m_eeScheduler && !m_memory.onVif1Worker()) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     // On the VIF1 worker: FBRST as the EE had it when the work was queued.
+                                     const uint32_t fbrst = m_memory.onVif1Worker() ? m_memory.vu1RunFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      const uint64_t cycles0 = m_vu1.state().cycles;
                                      Vu1TraceWriter::get().begin(ps2_vu1_trace::RunKind::Execute, startPC, top, itop, m_vu1.state(),
                                                                  m_memory.getVU1Code(), m_memory.getVU1Data());
@@ -892,21 +944,23 @@ bool PS2Runtime::syncCoreSubsystems()
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
                                      m_memory.noteVu1RunCycles(m_vu1.state().cycles - cycles0);
                                      g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
+                                     // (not from the VIF1 worker: the EE thread owns the context)
+                                     if (!m_memory.onVif1Worker())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                     R5900Context *cpuContext = (m_eeScheduler && !m_memory.onVif1Worker()) ? m_eeScheduler->currentContext() : nullptr;
                                      if (!cpuContext)
                                      {
                                          cpuContext = &m_cpuContext;
                                      }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     // On the VIF1 worker: FBRST as the EE had it when the work was queued.
+                                     const uint32_t fbrst = m_memory.onVif1Worker() ? m_memory.vu1RunFbrst() : cpuContext->vu0_fbrst;
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      const uint64_t cycles0 = m_vu1.state().cycles;
                                      Vu1TraceWriter::get().begin(ps2_vu1_trace::RunKind::Resume, 0u, top, itop, m_vu1.state(),
                                                                  m_memory.getVU1Code(), m_memory.getVU1Data());
@@ -918,6 +972,8 @@ bool PS2Runtime::syncCoreSubsystems()
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
                                      m_memory.noteVu1RunCycles(m_vu1.state().cycles - cycles0);
                                      g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
+                                     // (not from the VIF1 worker: the EE thread owns the context)
+                                     if (!m_memory.onVif1Worker())
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
@@ -929,8 +985,16 @@ bool PS2Runtime::syncCoreSubsystems()
         return !(value && value[0] == '0');
     }();
     if (vif1Timing)
+    {
         m_memory.setDeviceTiming([this]() { return m_eeScheduler->eeCycle(); },
                                  [this](uint64_t eeCycle) { m_eeScheduler->scheduleDeviceDeadline(eeCycle); });
+        m_memory.setVu0FbrstSource([this]()
+                                   {
+                                       const R5900Context *context = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+                                       return (context ? context : &m_cpuContext)->vu0_fbrst; });
+        m_gs.setPrivilegedEventSink([this](uint8_t reg, uint64_t value) { m_memory.gsPrivilegedEvent(reg, value); });
+        m_memory.startVif1Worker();
+    }
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -3017,6 +3081,9 @@ void PS2Runtime::run()
                                 vu1Cycles > windowVu1Cycles ? 100.0 * double(vu1Interpreted - windowVu1Interpreted) / double(vu1Cycles - windowVu1Cycles) : 0.0,
                                 static_cast<unsigned long long>(m_memory.gs().vsyncTick.load(std::memory_order_acquire)));
                     windowVu1Interpreted = vu1Interpreted;
+                    static const bool cpuReport = std::getenv("PS2X_CPU_REPORT") != nullptr;
+                    if (cpuReport)
+                        printThreadCpuReport(span, double(pads - windowPads));
                     // PS2X_THREAD_REPORT=1: every EE thread (state, what it waits on, last known
                     // pc/ra) and the semaphores with waiters, for diagnosing stalls in unattended runs.
                     static const bool threadReport = std::getenv("PS2X_THREAD_REPORT") != nullptr;

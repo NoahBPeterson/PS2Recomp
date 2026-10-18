@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <iostream>
+#include <memory>
 #include <mutex>
 
 #include "gs/ps2_gif_arbiter.h"
@@ -97,6 +98,8 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+struct Vif1Worker; // ps2_vif1_worker.cpp
+
 class PS2Memory
 {
 public:
@@ -171,10 +174,27 @@ public:
     using DeviceDeadlineFn = std::function<void(uint64_t eeCycle)>;
     void setDeviceTiming(EeClockFn clock, DeviceDeadlineFn scheduleDeadline);
     void noteVu1RunCycles(uint64_t cycles) { m_lastVu1RunCycles = cycles; }
-    // Applies the timed device events due at eeCycle; the scheduler's deadline calls it.
-    void applyDueDeviceEvents(uint64_t eeCycle);
+    // Applies the timed device events up to `upTo` (the deadline's cycle); the scheduler calls it.
+    void applyDueDeviceEvents(uint64_t upTo);
     // EE cycle of the last queued device event, 0 if none is queued.
-    uint64_t lastDeviceEventCycle() const { return m_deviceEvents.empty() ? 0u : m_deviceEvents.back().cycle; }
+    uint64_t lastDeviceEventCycle() const;
+
+    // VIF1 worker thread (T-0122, with device timing; PS2X_VIF1_THREAD=0 keeps VIF1 on the EE
+    // thread). VIF1 DMA data, the VU1 microprograms it starts and the GIF packets they send run on
+    // it; the EE waits for it (syncVif1Worker) before it touches anything the worker owns, and its
+    // device deadlines wait until the worker's clock is past the EE's.
+    void startVif1Worker();
+    void stopVif1Worker();
+    void syncVif1Worker();
+    // Scheduler, before it collects due deadlines: waits until every device event up to eeCycle
+    // is queued (the worker's clock is past it).
+    void gateVif1Worker(uint64_t eeCycle);
+    // VU0 FBRST as the EE had it when the work was queued (DE1/TE1 for the VU1 callbacks).
+    void setVu0FbrstSource(std::function<uint32_t()> source) { m_vu0FbrstSource = std::move(source); }
+    uint32_t vu1RunFbrst() const { return m_vu1RunFbrst; }
+    bool onVif1Worker() const;
+    // GS::PrivilegedEventSink: applied now, or at the worker's VIF1 clock from the worker.
+    void gsPrivilegedEvent(uint8_t reg, uint64_t value);
 
     void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
@@ -264,13 +284,26 @@ public:
     // EE cycle the last microprogram ends; m_vif1ClockBytes: transferred bytes not yet a whole cycle.
     struct TimedDeviceEvent
     {
+        enum class Kind : uint8_t
+        {
+            Vif1DmaComplete,
+            Vif1Intc,  // a VIFcode i-bit
+            GsEvent,   // SIGNAL/FINISH/LABEL from a GIF packet the worker sent (reg, value)
+        };
         uint64_t cycle = 0u;
-        bool vif1DmaComplete = false; // else INTC_VIF1 (a VIFcode i-bit)
+        Kind kind = Kind::Vif1DmaComplete;
+        uint8_t reg = 0u;
+        uint64_t value = 0u;
     };
     static constexpr uint32_t kVif1BytesPerEeCycle = 8u; // one qword per bus cycle (EE clock / 2)
     EeClockFn m_eeClock;
     DeviceDeadlineFn m_scheduleDeviceDeadline;
+    mutable std::mutex m_deviceEventMutex; // m_deviceEvents: queued by the worker, applied by the EE
     std::vector<TimedDeviceEvent> m_deviceEvents; // in cycle order
+    friend struct Vif1Worker;
+    std::unique_ptr<Vif1Worker> m_vif1Worker;
+    std::function<uint32_t()> m_vu0FbrstSource;
+    uint32_t m_vu1RunFbrst = 0u;
     uint64_t m_vif1Clock = 0u;
     uint64_t m_vu1BusyUntil = 0u;
     uint64_t m_lastVu1RunCycles = 0u;
@@ -279,11 +312,11 @@ public:
     bool deviceTimingEnabled() const { return m_eeClock && m_scheduleDeviceDeadline; }
     void beginVif1Work();
     void advanceVif1Clock(uint32_t bytes);
-    void waitVif1ForVu1() { m_vif1Clock = std::max(m_vif1Clock, m_vu1BusyUntil); }
+    void waitVif1ForVu1();
     void runVu1Program(bool resume, uint32_t startPC, uint32_t top, uint32_t itop);
     void finishVif1Dma();
     void raiseVif1Intc();
-    void queueDeviceEvent(bool vif1DmaComplete);
+    void queueDeviceEvent(TimedDeviceEvent::Kind kind, uint8_t reg = 0u, uint64_t value = 0u);
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

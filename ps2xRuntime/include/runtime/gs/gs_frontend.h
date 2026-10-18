@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -117,6 +118,14 @@ public:
                            uint32_t sizeBytes);
     void writeRegister(uint8_t regAddr, uint64_t value);
 
+    // SIGNAL / FINISH / LABEL (the GS events the EE sees in CSR and SIGLBLID) are latched here, in
+    // GIF order on the thread processing the data, for every backend. With a sink set, each goes to
+    // it (PS2Memory: applied now on the EE thread, a timed device event from the VIF1 worker);
+    // without one it is applied to the privileged registers at once.
+    using PrivilegedEventSink = std::function<void(uint8_t reg, uint64_t value)>;
+    void setPrivilegedEventSink(PrivilegedEventSink sink) { m_privilegedEventSink = std::move(sink); }
+    static void applyPrivilegedEvent(struct GSRegisters &regs, uint8_t reg, uint64_t value);
+
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
     void unlockDisplaySnapshot();
     uint32_t getLastDisplayBaseBytes() const;
@@ -185,6 +194,9 @@ private:
     uint8_t *m_localMemoryStorage = nullptr;
     uint32_t m_localMemorySize = 0u;
     struct GSRegisters *m_privRegs = nullptr;
+    PrivilegedEventSink m_privilegedEventSink;
+    void privilegedEvent(uint8_t reg, uint64_t value);
+    void scanPrivilegedEvents(const uint8_t *data, uint32_t sizeBytes);
     mutable std::recursive_mutex m_stateMutex;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;

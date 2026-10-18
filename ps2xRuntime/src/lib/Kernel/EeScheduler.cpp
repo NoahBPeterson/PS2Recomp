@@ -1897,6 +1897,9 @@ void EeScheduler::processDueDeadlines()
 {
     for (;;)
     {
+        // The VIF1 worker (T-0122) queues device events with their own deadlines: wait until
+        // every one up to the EE's cycle is queued before collecting what is due.
+        m_runtime.memory().gateVif1Worker(m_eeCycle);
         std::vector<ScheduledEvent> due;
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
@@ -2040,7 +2043,9 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::Dmac:
         break;
     case EeEventType::Device:
-        m_runtime.memory().applyDueDeviceEvents(m_eeCycle);
+        // Only events up to this deadline's own cycle, so each applies in its slot of the sorted
+        // due list (a later one has its own deadline).
+        m_runtime.memory().applyDueDeviceEvents(event.value);
         m_runtime.drainCompletedDmacHandlers(m_rdram);
         break;
     case EeEventType::Alarm:
@@ -2191,7 +2196,7 @@ void EeScheduler::waitForEvent()
 
 void EeScheduler::scheduleDeviceDeadline(uint64_t eeCycle)
 {
-    scheduleEvent(eeCycle, std::chrono::steady_clock::now(), EeEvent{EeEventType::Device, 0, 0});
+    scheduleEvent(eeCycle, std::chrono::steady_clock::now(), EeEvent{EeEventType::Device, 0, eeCycle});
 }
 
 void EeScheduler::scheduleEvent(uint64_t deadlineCycle,

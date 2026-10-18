@@ -510,28 +510,23 @@ namespace
             }
         }
 
-        bool on_signal(uint64_t value) override
+        // SIGNAL/FINISH/LABEL reach CSR and SIGLBLID through the GS frontend (GS::privilegedEvent),
+        // in GIF order on the thread that processes the data; doing it here as well, on this
+        // backend's command thread, would land at a host-dependent time (and could set a bit the
+        // EE has already cleared again).
+        bool on_signal(uint64_t) override
         {
-            auto mask = uint32_t(value >> 32);
-            auto id = (uint32_t(priv.siglblid) & ~mask) | (uint32_t(value) & mask);
-            priv.siglblid = (priv.siglblid & 0xffffffff00000000ull) | id;
-            priv.csr.fetch_or(1);
             return false;
         }
 
         bool on_finish(uint64_t) override
         {
             gs.flush();
-            interop.device().wait_idle();
-            priv.csr.fetch_or(2);
             return false;
         }
 
-        bool on_label(uint64_t value) override
+        bool on_label(uint64_t) override
         {
-            auto mask = uint32_t(value >> 32);
-            auto id = (uint32_t(priv.siglblid >> 32) & ~mask) | (uint32_t(value) & mask);
-            priv.siglblid = (uint64_t(id) << 32) | uint32_t(priv.siglblid);
             return false;
         }
 

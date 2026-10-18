@@ -393,6 +393,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_runtime.cpp
     src/lib/ps2_recomp_abi.cpp
     src/lib/ps2_vif1_interpreter.cpp
+    src/lib/ps2_vif1_worker.cpp
     src/lib/vu/ps2_vu1_core.cpp
     src/lib/vu/ps2_vu1_upper.cpp
     src/lib/vu/ps2_vu1_lower.cpp

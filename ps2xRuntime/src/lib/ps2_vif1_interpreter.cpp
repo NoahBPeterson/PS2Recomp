@@ -1,5 +1,7 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include "ps2_vif1_worker.h"
+#include "runtime/gs/gs_frontend.h"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -954,7 +956,6 @@ void PS2Memory::resumeVIF1AfterStall()
     if (!m_vif1Stalled)
         return;
     m_vif1Stalled = false;
-    beginVif1Work();
     std::vector<uint8_t> rest;
     rest.swap(m_vif1StalledData);
     // The DMAC reads the held-back part of the list only now: re-read the rest of the current
@@ -1008,26 +1009,27 @@ void PS2Memory::resumeVIF1AfterStall()
         if (trace && changed)
             std::fprintf(stderr, "[vif1-stall] resume: the held-back list changed in guest memory (~%zu byte(s))\n", changed);
     }
-    const uint8_t *savedBuffer = m_vif1Sources.buffer;
-    Vif1ChainSources saved = std::move(m_vif1Sources.current);
-    m_vif1Sources.buffer = held.valid ? rest.data() : nullptr;
-    m_vif1Sources.current = std::move(restSources);
-    processVIF1Data(rest.data(), static_cast<uint32_t>(rest.size()));
-    m_vif1Sources.buffer = savedBuffer;
-    m_vif1Sources.current = std::move(saved);
-    if (m_gifArbiter)
-        m_gifArbiter->drain();
-    if (!m_vif1Stalled && m_vif1DmaHeld)
-    {
-        m_vif1DmaHeld = false;
-        finishVif1Dma();
-    }
+    // The worker (or this thread, without one) runs the rest and completes a held DMA.
+    Vif1Job job;
+    job.kind = Vif1Job::Kind::Resume;
+    Vif1JobSegment segment;
+    segment.data = std::move(rest);
+    segment.sources = std::move(restSources);
+    segment.tracked = held.valid;
+    job.segments.push_back(std::move(segment));
+    Vif1Worker::submit(*this, std::move(job));
 }
 
 void PS2Memory::setDeviceTiming(EeClockFn clock, DeviceDeadlineFn scheduleDeadline)
 {
     m_eeClock = std::move(clock);
     m_scheduleDeviceDeadline = std::move(scheduleDeadline);
+}
+
+void PS2Memory::waitVif1ForVu1()
+{
+    m_vif1Clock = std::max(m_vif1Clock, m_vu1BusyUntil);
+    Vif1Worker::publish(*this);
 }
 
 void PS2Memory::beginVif1Work()
@@ -1040,8 +1042,13 @@ void PS2Memory::beginVif1Work()
 void PS2Memory::advanceVif1Clock(uint32_t bytes)
 {
     m_vif1ClockBytes += bytes;
-    m_vif1Clock += m_vif1ClockBytes / kVif1BytesPerEeCycle;
+    const uint32_t cycles = m_vif1ClockBytes / kVif1BytesPerEeCycle;
     m_vif1ClockBytes %= kVif1BytesPerEeCycle;
+    if (cycles)
+    {
+        m_vif1Clock += cycles;
+        Vif1Worker::publish(*this);
+    }
 }
 
 void PS2Memory::runVu1Program(bool resume, uint32_t startPC, uint32_t top, uint32_t itop)
@@ -1060,10 +1067,24 @@ void PS2Memory::runVu1Program(bool resume, uint32_t startPC, uint32_t top, uint3
     m_vu1BusyUntil = m_vif1Clock + m_lastVu1RunCycles;
 }
 
-void PS2Memory::queueDeviceEvent(bool vif1DmaComplete)
+void PS2Memory::queueDeviceEvent(TimedDeviceEvent::Kind kind, uint8_t reg, uint64_t value)
 {
-    m_deviceEvents.push_back(TimedDeviceEvent{m_vif1Clock, vif1DmaComplete});
+    // Queued before the worker's clock moves past m_vif1Clock (Vif1Worker::gate relies on it).
+    {
+        std::lock_guard lock(m_deviceEventMutex);
+        m_deviceEvents.push_back(TimedDeviceEvent{m_vif1Clock, kind, reg, value});
+    }
     m_scheduleDeviceDeadline(m_vif1Clock);
+}
+
+void PS2Memory::gsPrivilegedEvent(uint8_t reg, uint64_t value)
+{
+    // From the VIF1 worker (PATH1/PATH2 packets) the EE sees it at the VIF1 clock, like the
+    // interrupts; from the EE thread at once.
+    if (onVif1Worker())
+        queueDeviceEvent(TimedDeviceEvent::Kind::GsEvent, reg, value);
+    else
+        GS::applyPrivilegedEvent(gs_regs, reg, value);
 }
 
 void PS2Memory::finishVif1Dma()
@@ -1073,8 +1094,7 @@ void PS2Memory::finishVif1Dma()
         completeVif1Dma();
         return;
     }
-    ++m_vif1CompletionsPending;
-    queueDeviceEvent(true);
+    queueDeviceEvent(TimedDeviceEvent::Kind::Vif1DmaComplete); // (counted in m_vif1CompletionsPending at the kick)
 }
 
 void PS2Memory::raiseVif1Intc()
@@ -1084,22 +1104,30 @@ void PS2Memory::raiseVif1Intc()
         queueIntcCause(5u);
         return;
     }
-    queueDeviceEvent(false);
+    queueDeviceEvent(TimedDeviceEvent::Kind::Vif1Intc);
 }
 
-void PS2Memory::applyDueDeviceEvents(uint64_t eeCycle)
+void PS2Memory::applyDueDeviceEvents(uint64_t upTo)
 {
+    std::lock_guard lock(m_deviceEventMutex);
     size_t due = 0u;
-    while (due < m_deviceEvents.size() && m_deviceEvents[due].cycle <= eeCycle)
+    while (due < m_deviceEvents.size() && m_deviceEvents[due].cycle <= upTo)
     {
-        if (m_deviceEvents[due].vif1DmaComplete)
+        const TimedDeviceEvent &event = m_deviceEvents[due];
+        switch (event.kind)
         {
+        case TimedDeviceEvent::Kind::Vif1DmaComplete:
             if (m_vif1CompletionsPending)
                 --m_vif1CompletionsPending;
             completeVif1Dma();
-        }
-        else
+            break;
+        case TimedDeviceEvent::Kind::Vif1Intc:
             queueIntcCause(5u);
+            break;
+        case TimedDeviceEvent::Kind::GsEvent:
+            GS::applyPrivilegedEvent(gs_regs, event.reg, event.value);
+            break;
+        }
         ++due;
     }
     m_deviceEvents.erase(m_deviceEvents.begin(), m_deviceEvents.begin() + static_cast<std::ptrdiff_t>(due));
