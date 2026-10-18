@@ -1,6 +1,7 @@
 #ifndef PS2_MEMORY_H
 #define PS2_MEMORY_H
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -160,6 +161,21 @@ public:
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
 
+    // VIF1 timing (T-0122). With an EE clock and a deadline scheduler set (the runtime sets both),
+    // a VIF1 DMA's completion (D_STAT, CHCR.STR, the DMAC cause) and its VIFcode i-bit interrupts
+    // become visible at the EE cycle the VIF1/VU1 timing model reaches: transfer time per qword,
+    // MSCAL/MSCNT/MPG/FLUSH* waiting for the running microprogram, which takes the VU1 cycles the
+    // callbacks report through noteVu1RunCycles(). Without them (tests, tools) both are immediate.
+    // VU memory, VIF1 registers and GS packets still change when the data is processed.
+    using EeClockFn = std::function<uint64_t()>;
+    using DeviceDeadlineFn = std::function<void(uint64_t eeCycle)>;
+    void setDeviceTiming(EeClockFn clock, DeviceDeadlineFn scheduleDeadline);
+    void noteVu1RunCycles(uint64_t cycles) { m_lastVu1RunCycles = cycles; }
+    // Applies the timed device events due at eeCycle; the scheduler's deadline calls it.
+    void applyDueDeviceEvents(uint64_t eeCycle);
+    // EE cycle of the last queued device event, 0 if none is queued.
+    uint64_t lastDeviceEventCycle() const { return m_deviceEvents.empty() ? 0u : m_deviceEvents.back().cycle; }
+
     void markVU0CodeModified() { m_vu0CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     void markVU1CodeModified() { m_vu1CodeGeneration.fetch_add(1, std::memory_order_relaxed); }
     uint8_t *getVU1Code() { return m_vu1Code; }
@@ -243,6 +259,31 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+
+    // VIF1 timing (setDeviceTiming). m_vif1Clock: EE cycle the VIF1 model has reached; m_vu1BusyUntil:
+    // EE cycle the last microprogram ends; m_vif1ClockBytes: transferred bytes not yet a whole cycle.
+    struct TimedDeviceEvent
+    {
+        uint64_t cycle = 0u;
+        bool vif1DmaComplete = false; // else INTC_VIF1 (a VIFcode i-bit)
+    };
+    static constexpr uint32_t kVif1BytesPerEeCycle = 8u; // one qword per bus cycle (EE clock / 2)
+    EeClockFn m_eeClock;
+    DeviceDeadlineFn m_scheduleDeviceDeadline;
+    std::vector<TimedDeviceEvent> m_deviceEvents; // in cycle order
+    uint64_t m_vif1Clock = 0u;
+    uint64_t m_vu1BusyUntil = 0u;
+    uint64_t m_lastVu1RunCycles = 0u;
+    uint32_t m_vif1ClockBytes = 0u;
+    uint32_t m_vif1CompletionsPending = 0u;
+    bool deviceTimingEnabled() const { return m_eeClock && m_scheduleDeviceDeadline; }
+    void beginVif1Work();
+    void advanceVif1Clock(uint32_t bytes);
+    void waitVif1ForVu1() { m_vif1Clock = std::max(m_vif1Clock, m_vu1BusyUntil); }
+    void runVu1Program(bool resume, uint32_t startPC, uint32_t top, uint32_t itop);
+    void finishVif1Dma();
+    void raiseVif1Intc();
+    void queueDeviceEvent(bool vif1DmaComplete);
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

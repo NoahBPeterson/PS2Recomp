@@ -1053,6 +1053,113 @@ void register_ps2_memory_tests()
             t.Equals(mem.vif1_regs.tops, 0x30u, "DBF=0 should restore TOPS to BASE");
         });
 
+        // T-0122: with device timing set, a VIF1 DMA completes at the EE cycle the VIF1/VU1 model
+        // reaches (one qword per two EE cycles; MSCAL waits for the running microprogram), not at
+        // CHCR.STR.
+        tc.Run("timed VIF1 DMA completes at the modeled cycle, after the transfer, not the microprogram", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint64_t now = 1000u;
+            std::vector<uint64_t> deadlines;
+            mem.setDeviceTiming([&]() { return now; }, [&](uint64_t cycle) { deadlines.push_back(cycle); });
+            uint32_t runs = 0u;
+            mem.setVu1MscalCallback([&](uint32_t, uint32_t, uint32_t)
+            {
+                ++runs;
+                mem.noteVu1RunCycles(5000u);
+            });
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kChain = 0x00150000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+            writeDmaTag(rdram, kChain, makeDmaTag(1u, 7u, 0u, false)); // END, one qword
+            putU32(kChain + 16u, makeVifCmd(0x14u, 0u, 0u));          // MSCAL 0
+            putU32(kChain + 20u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 24u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 28u, makeVifCmd(0x00u, 0u, 0u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.Equals(runs, 1u, "the microprogram should run when VIF1 reaches MSCAL");
+            t.Equals(deadlines.size(), static_cast<size_t>(1u), "the completion should be scheduled once");
+            t.Equals(deadlines.empty() ? 0ull : static_cast<unsigned long long>(deadlines[0]), 1002ull,
+                     "completion = kick + 16 bytes at 8 a cycle (the DMA does not wait for VU1)");
+            t.IsTrue((mem.readIORegister(kVif1Ch) & 0x100u) != 0u, "CHCR.STR should stay set until the completion");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) == 0u, "D_STAT.CIS1 should be clear before the completion");
+            t.IsTrue(mem.consumeCompletedDmacCauses().empty(), "no DMAC cause before the completion");
+
+            mem.applyDueDeviceEvents(1001u);
+            t.IsTrue((mem.readIORegister(kVif1Ch) & 0x100u) != 0u, "nothing is due one cycle early");
+            mem.applyDueDeviceEvents(1002u);
+            t.IsTrue((mem.readIORegister(kVif1Ch) & 0x100u) == 0u, "CHCR.STR should clear at the completion");
+            t.IsTrue((mem.readIORegister(0x1000E010u) & 0x2u) != 0u, "D_STAT.CIS1 should be set at the completion");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.IsTrue(std::find(causes.begin(), causes.end(), 1u) != causes.end(), "the VIF1 DMAC cause should be raised");
+            t.Equals(mem.lastDeviceEventCycle(), 0ull, "no device event should be left");
+        });
+
+        tc.Run("timed VIF1: MSCAL waits for the running microprogram", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            uint64_t now = 1000u;
+            std::vector<uint64_t> deadlines;
+            mem.setDeviceTiming([&]() { return now; }, [&](uint64_t cycle) { deadlines.push_back(cycle); });
+            mem.setVu1MscalCallback([&](uint32_t, uint32_t, uint32_t) { mem.noteVu1RunCycles(5000u); });
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kChain = 0x00151000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+            writeDmaTag(rdram, kChain, makeDmaTag(1u, 7u, 0u, false)); // END, one qword
+            putU32(kChain + 16u, makeVifCmd(0x14u, 0u, 0u));          // MSCAL 0: runs 1000..6000
+            putU32(kChain + 20u, makeVifCmd(0x14u, 0u, 0u));          // MSCAL 0: waits until 6000
+            putU32(kChain + 24u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 28u, makeVifCmd(0x00u, 0u, 0u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.Equals(deadlines.empty() ? 0ull : static_cast<unsigned long long>(deadlines[0]), 6001ull,
+                     "the second MSCAL waits for the first program (6000); the last 8 bytes take a cycle");
+
+            // The next transfer starts no earlier than VIF1 got to, even if the EE clock is behind it.
+            now = 2000u;
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.Equals(deadlines.size() < 2u ? 0ull : static_cast<unsigned long long>(deadlines[1]), 16001ull,
+                     "MSCALs wait for 11000 and 16000; the transfer ends at 16001");
+        });
+
+        tc.Run("timed VIF1 i-bit raises INTC VIF1 at its modeled cycle", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<uint64_t> deadlines;
+            mem.setDeviceTiming([]() { return uint64_t{500u}; }, [&](uint64_t cycle) { deadlines.push_back(cycle); });
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kChain = 0x00152000u;
+            uint8_t *rdram = mem.getRDRAM();
+            auto putU32 = [&](uint32_t addr, uint32_t v) { std::memcpy(rdram + addr, &v, 4u); };
+            writeDmaTag(rdram, kChain, makeDmaTag(1u, 7u, 0u, false));             // END, one qword
+            putU32(kChain + 16u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 20u, makeVifCmd(0x00u, 0u, 0u));
+            putU32(kChain + 24u, 0x80000000u | makeVifCmd(0x07u, 0u, 0x1234u)); // MARK with the i-bit
+            putU32(kChain + 28u, makeVifCmd(0x00u, 0u, 0u));
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x30u, kChain), "write VIF1 TADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x105u), "write VIF1 CHCR STR|CHAIN|DIR should succeed");
+            t.IsTrue(mem.consumeCompletedIntcCauses().empty(), "INTC VIF1 should wait for its cycle");
+            t.Equals(deadlines.size(), static_cast<size_t>(1u), "only the interrupt is scheduled (the DMA is held by the stall)");
+            t.Equals(deadlines.empty() ? 0ull : static_cast<unsigned long long>(deadlines[0]), 501ull,
+                     "the i-bit code ends 12 bytes in: 500 + 12/8");
+            mem.applyDueDeviceEvents(501u);
+            const std::vector<uint32_t> causes = mem.consumeCompletedIntcCauses();
+            t.IsTrue(std::find(causes.begin(), causes.end(), 5u) != causes.end(), "INTC VIF1 should be raised at its cycle");
+        });
+
         tc.Run("VIF MSKPATH3 uses immediate bit15", [](TestCase &t)
         {
             PS2Memory mem;

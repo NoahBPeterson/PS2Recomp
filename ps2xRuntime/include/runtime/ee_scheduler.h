@@ -239,6 +239,7 @@ enum class EeEventType : uint8_t
     Dmac,
     ExternalWake,
     Alarm,
+    Device, // a timed device effect is due (PS2Memory::applyDueDeviceEvents)
 };
 
 struct EeEvent
@@ -288,6 +289,11 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    // Emulated EE clock; executor thread.
+    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
+    // Device timing (T-0122): applies PS2Memory's due device events once the EE clock reaches
+    // eeCycle. Gated on emulated time only, not paced to the host clock.
+    void scheduleDeviceDeadline(uint64_t eeCycle);
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Guest code gives control back to the scheduler by returning up the host stack (a due checkpoint, or a

@@ -9,6 +9,11 @@
 #include <limits>
 #include <stdexcept>
 
+// EE cycles accounted while guest code ran (checkpoints) and while the executor idled to a deadline;
+// [fps] readout. Written only by the executor thread.
+std::atomic<uint64_t> g_ps2xEeBusyCycles{0u};
+std::atomic<uint64_t> g_ps2xEeIdleCycles{0u};
+
 namespace
 {
     constexpr int KE_OK = 0;
@@ -374,6 +379,8 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+    g_ps2xEeBusyCycles.store(g_ps2xEeBusyCycles.load(std::memory_order_relaxed) + std::max<uint32_t>(1u, cycles),
+                             std::memory_order_relaxed);
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -2032,6 +2039,10 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::Dmac:
         break;
+    case EeEventType::Device:
+        m_runtime.memory().applyDueDeviceEvents(m_eeCycle);
+        m_runtime.drainCompletedDmacHandlers(m_rdram);
+        break;
     case EeEventType::Alarm:
     {
         auto it = m_alarms.find(static_cast<int>(event.id));
@@ -2166,6 +2177,7 @@ void EeScheduler::waitForEvent()
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
         lock.unlock();
+        g_ps2xEeIdleCycles.store(g_ps2xEeIdleCycles.load(std::memory_order_relaxed) + elapsed, std::memory_order_relaxed);
         uint64_t remaining = elapsed;
         while (remaining > 0u)
         {
@@ -2175,6 +2187,11 @@ void EeScheduler::waitForEvent()
         }
         m_checkpointPending.store(true, std::memory_order_release);
     }
+}
+
+void EeScheduler::scheduleDeviceDeadline(uint64_t eeCycle)
+{
+    scheduleEvent(eeCycle, std::chrono::steady_clock::now(), EeEvent{EeEventType::Device, 0, 0});
 }
 
 void EeScheduler::scheduleEvent(uint64_t deadlineCycle,

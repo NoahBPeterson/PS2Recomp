@@ -386,6 +386,18 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     }
 
     uint32_t pos = 0;
+    // VIF1 timing (setDeviceTiming): the clock runs over the bytes processed so far whenever the
+    // time matters (an i-bit, a microprogram start, a wait for VU1) and at the end.
+    uint32_t clocked = 0;
+    const auto clockTo = [&](uint32_t to)
+    {
+        to = std::min(to, sizeBytes);
+        if (to > clocked)
+        {
+            advanceVif1Clock(to - clocked);
+            clocked = to;
+        }
+    };
 
     while (pos + 4 <= sizeBytes)
     {
@@ -393,6 +405,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             m_vif1IrqStallPending = false;
             m_vif1Stalled = true;
+            clockTo(pos);
             m_vif1Sources.noteStall(data, pos, sizeBytes, static_cast<uint32_t>(m_vif1StalledData.size()));
             m_vif1StalledData.insert(m_vif1StalledData.end(), data + pos, data + sizeBytes);
             return;
@@ -430,7 +443,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             vif1_regs.stat |= (1u << 11) | (1u << 10); // INT, VIS
             m_vif1IrqStallPending = true;
-            queueIntcCause(5u); // INTC_VIF1
+            clockTo(pos);
+            raiseVif1Intc(); // INTC_VIF1
         }
 
         if (opcode == VIF_NOP)
@@ -487,6 +501,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            clockTo(pos);
+            waitVif1ForVu1();
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
@@ -505,8 +521,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vu1MscalCallback)
-                m_vu1MscalCallback(startPC, runTop, runItop);
+            clockTo(pos);
+            runVu1Program(false, startPC, runTop, runItop);
             continue;
         }
         else if (opcode == VIF_MSCNT)
@@ -523,8 +539,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vif1_regs.tops = (vif1_regs.base + vif1_regs.ofst) & 0x3FFu;
             vif1_regs.stat ^= (1u << 7); // toggle DBF
 
-            if (m_vu1MscntCallback)
-                m_vu1MscntCallback(runTop, runItop);
+            clockTo(pos);
+            runVu1Program(true, 0u, runTop, runItop);
             continue;
         }
         else if (opcode == VIF_STMASK)
@@ -559,6 +575,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             uint32_t destAddr = ((uint32_t)imm * 8u) & (PS2_VU1_CODE_SIZE - 1u);
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
+            clockTo(pos);
+            waitVif1ForVu1(); // MPG waits for the running microprogram
             bool copied = false;
             if (m_vu1Code && mpgBytes > 0 && pos + mpgBytes <= sizeBytes)
             {
@@ -923,6 +941,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
     }
 
+    clockTo(pos);
     if (m_vif1IrqStallPending)
     {
         m_vif1IrqStallPending = false;
@@ -935,6 +954,7 @@ void PS2Memory::resumeVIF1AfterStall()
     if (!m_vif1Stalled)
         return;
     m_vif1Stalled = false;
+    beginVif1Work();
     std::vector<uint8_t> rest;
     rest.swap(m_vif1StalledData);
     // The DMAC reads the held-back part of the list only now: re-read the rest of the current
@@ -1000,6 +1020,87 @@ void PS2Memory::resumeVIF1AfterStall()
     if (!m_vif1Stalled && m_vif1DmaHeld)
     {
         m_vif1DmaHeld = false;
-        completeVif1Dma();
+        finishVif1Dma();
     }
+}
+
+void PS2Memory::setDeviceTiming(EeClockFn clock, DeviceDeadlineFn scheduleDeadline)
+{
+    m_eeClock = std::move(clock);
+    m_scheduleDeviceDeadline = std::move(scheduleDeadline);
+}
+
+void PS2Memory::beginVif1Work()
+{
+    // VIF1 picks up new work (a DMA kick, FIFO data, a stall release) no earlier than now.
+    if (deviceTimingEnabled())
+        m_vif1Clock = std::max(m_vif1Clock, m_eeClock());
+}
+
+void PS2Memory::advanceVif1Clock(uint32_t bytes)
+{
+    m_vif1ClockBytes += bytes;
+    m_vif1Clock += m_vif1ClockBytes / kVif1BytesPerEeCycle;
+    m_vif1ClockBytes %= kVif1BytesPerEeCycle;
+}
+
+void PS2Memory::runVu1Program(bool resume, uint32_t startPC, uint32_t top, uint32_t itop)
+{
+    // MSCAL/MSCNT wait for the running microprogram; the new one ends after the VU1 cycles it
+    // takes (VU1 runs at the EE clock).
+    waitVif1ForVu1();
+    m_lastVu1RunCycles = 0u;
+    if (resume)
+    {
+        if (m_vu1MscntCallback)
+            m_vu1MscntCallback(top, itop);
+    }
+    else if (m_vu1MscalCallback)
+        m_vu1MscalCallback(startPC, top, itop);
+    m_vu1BusyUntil = m_vif1Clock + m_lastVu1RunCycles;
+}
+
+void PS2Memory::queueDeviceEvent(bool vif1DmaComplete)
+{
+    m_deviceEvents.push_back(TimedDeviceEvent{m_vif1Clock, vif1DmaComplete});
+    m_scheduleDeviceDeadline(m_vif1Clock);
+}
+
+void PS2Memory::finishVif1Dma()
+{
+    if (!deviceTimingEnabled())
+    {
+        completeVif1Dma();
+        return;
+    }
+    ++m_vif1CompletionsPending;
+    queueDeviceEvent(true);
+}
+
+void PS2Memory::raiseVif1Intc()
+{
+    if (!deviceTimingEnabled())
+    {
+        queueIntcCause(5u);
+        return;
+    }
+    queueDeviceEvent(false);
+}
+
+void PS2Memory::applyDueDeviceEvents(uint64_t eeCycle)
+{
+    size_t due = 0u;
+    while (due < m_deviceEvents.size() && m_deviceEvents[due].cycle <= eeCycle)
+    {
+        if (m_deviceEvents[due].vif1DmaComplete)
+        {
+            if (m_vif1CompletionsPending)
+                --m_vif1CompletionsPending;
+            completeVif1Dma();
+        }
+        else
+            queueIntcCause(5u);
+        ++due;
+    }
+    m_deviceEvents.erase(m_deviceEvents.begin(), m_deviceEvents.begin() + static_cast<std::ptrdiff_t>(due));
 }

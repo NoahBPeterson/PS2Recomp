@@ -1156,6 +1156,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        beginVif1Work();
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
@@ -1966,6 +1967,8 @@ void PS2Memory::processPendingTransfers()
     m_pendingVif0Transfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    if (hadVif1)
+        beginVif1Work();
     for (auto &p : m_pendingVif1Transfers)
     {
         if (!p.chainData.empty())
@@ -2084,7 +2087,7 @@ void PS2Memory::processPendingTransfers()
         if (m_vif1Stalled)
             m_vif1DmaHeld = true;
         else
-            completeVif1Dma();
+            finishVif1Dma();
     }
 }
 
@@ -2651,7 +2654,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     {
         if (address >= 0x10008000 && address < 0x1000F000)
         {
-            if ((address & 0xFF) == 0x00)
+            // (VIF1 keeps STR until its timed completion, T-0122)
+            if ((address & 0xFF) == 0x00 && !(address == 0x10009000u && m_vif1CompletionsPending != 0u))
             {
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;

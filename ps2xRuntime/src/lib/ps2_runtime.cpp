@@ -44,6 +44,8 @@ extern std::atomic<uint32_t> g_ps2xGsFinishes;
 static std::atomic<uint32_t> g_ps2xVu1Runs{0u};
 static std::atomic<uint64_t> g_ps2xVu1Cycles{0u};
 static std::atomic<uint64_t> g_ps2xVu1InterpretedPairs{0u};
+extern std::atomic<uint64_t> g_ps2xEeBusyCycles; // EeScheduler.cpp
+extern std::atomic<uint64_t> g_ps2xEeIdleCycles;
 
 namespace
 {
@@ -888,6 +890,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
+                                     m_memory.noteVu1RunCycles(m_vu1.state().cycles - cycles0);
                                      g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
@@ -913,11 +916,21 @@ bool PS2Runtime::syncCoreSubsystems()
                                      Vu1TraceWriter::get().end(m_vu1.state(), m_memory.getVU1Data());
                                      g_ps2xVu1Runs.fetch_add(1u, std::memory_order_relaxed);
                                      g_ps2xVu1Cycles.fetch_add(m_vu1.state().cycles - cycles0, std::memory_order_relaxed);
+                                     m_memory.noteVu1RunCycles(m_vu1.state().cycles - cycles0);
                                      g_ps2xVu1InterpretedPairs.store(m_vu1.interpretedPairs(), std::memory_order_relaxed);
                                      cpuContext->vu0_vpu_stat =
                                          (cpuContext->vu0_vpu_stat & ~0x0600u) |
                                          (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                          (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+    // VIF1 transfers take modeled time (T-0122); PS2X_VIF1_TIMING=0 completes them at once, as before.
+    static const bool vif1Timing = []
+    {
+        const char *value = std::getenv("PS2X_VIF1_TIMING");
+        return !(value && value[0] == '0');
+    }();
+    if (vif1Timing)
+        m_memory.setDeviceTiming([this]() { return m_eeScheduler->eeCycle(); },
+                                 [this](uint64_t eeCycle) { m_eeScheduler->scheduleDeviceDeadline(eeCycle); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -2990,6 +3003,14 @@ void PS2Runtime::run()
                     const double span = std::max(now - windowStart, 1e-3);
                     // vu1_interp: pairs the interpreter issued (not a translated block) per VU1 cycle, in %.
                     const uint64_t vu1Interpreted = g_ps2xVu1InterpretedPairs.load(std::memory_order_relaxed);
+                    // ee_busy/ee_idle: EE Mcycles/s accounted by guest code and skipped while idle.
+                    static uint64_t windowEeBusy = 0u, windowEeIdle = 0u;
+                    const uint64_t eeBusy = g_ps2xEeBusyCycles.load(std::memory_order_relaxed);
+                    const uint64_t eeIdle = g_ps2xEeIdleCycles.load(std::memory_order_relaxed);
+                    std::printf("[fps] ee_busy_Mcyc/s=%.1f ee_idle_Mcyc/s=%.1f\n", double(eeBusy - windowEeBusy) / span / 1e6,
+                                double(eeIdle - windowEeIdle) / span / 1e6);
+                    windowEeBusy = eeBusy;
+                    windowEeIdle = eeIdle;
                     std::printf("[fps] t=%.0fs host_frame=%u game=%.1f host=%d pad/s=%.2f finish/s=%.2f vu1_runs/s=%.0f vu1_Mcyc/s=%.2f vu1_interp=%.1f%% vsync=%llu\n",
                                 now, presentedFrames, gameFps, hostFps, (pads - windowPads) / span, (finishes - windowFinishes) / span,
                                 (vu1Runs - windowVu1Runs) / span, double(vu1Cycles - windowVu1Cycles) / span / 1e6,
