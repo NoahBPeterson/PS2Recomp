@@ -7,13 +7,20 @@
 #include "device.hpp"
 #include "gs_interface.hpp"
 #include "thread_id.hpp"
+#include "thread_name.hpp"
+#include "pgs_precompile.h"
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
 #include <mutex>
 #include <stdexcept>
 #include <sys/stat.h>
@@ -21,6 +28,110 @@
 namespace
 {
     constexpr size_t VramSize = 4 * 1024 * 1024;
+
+    // Where the Vulkan pipeline cache persists between runs (MoltenVK keeps its SPIR-V to Metal
+    // translations in it): PS2X_PGS_PIPELINE_CACHE, else the user's cache directory.
+    std::filesystem::path pipelineCachePath()
+    {
+        if (const char *path = std::getenv("PS2X_PGS_PIPELINE_CACHE"))
+            return path;
+        std::filesystem::path base;
+#if defined(_WIN32)
+        if (const char *local = std::getenv("LOCALAPPDATA"))
+            base = local;
+#elif defined(__APPLE__)
+        if (const char *home = std::getenv("HOME"))
+            base = std::filesystem::path(home) / "Library" / "Caches";
+#else
+        if (const char *xdg = std::getenv("XDG_CACHE_HOME"))
+            base = xdg;
+        else if (const char *home = std::getenv("HOME"))
+            base = std::filesystem::path(home) / ".cache";
+#endif
+        if (base.empty())
+            return {};
+        return base / "ps2recomp" / "pgs_pipeline_cache.bin";
+    }
+
+    // Compute pipelines that compiled mid-game, one per line, next to the pipeline cache; the next
+    // start precompiles them (pgs_precompile.h). Format: "v1 <program> <pipeline> <mask>
+    // <robustness> <subgroup control> <full> <min log2> <max log2> <8 spec constants>", hex.
+    class PipelineVariantRecord
+    {
+    public:
+        static PipelineVariantRecord &instance()
+        {
+            static PipelineVariantRecord record;
+            return record;
+        }
+
+        // Loads the file into ParallelGS::ps2x_recorded_variants and starts recording misses.
+        void load()
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_path = pipelineCachePath();
+            if (!m_path.empty())
+                m_path.replace_filename("pgs_pipeline_variants.txt");
+            ParallelGS::ps2x_recorded_variants.clear();
+            if (std::ifstream in{m_path})
+            {
+                std::string line;
+                while (std::getline(in, line))
+                {
+                    ParallelGS::Ps2xPipelineVariant v;
+                    unsigned long long program = 0, pipeline = 0;
+                    unsigned mask = 0, robustness = 0, control = 0, full = 0, minLog2 = 0, maxLog2 = 0;
+                    unsigned c[8] = {};
+                    if (std::sscanf(line.c_str(), "v1 %llx %llx %x %x %x %x %x %x %x %x %x %x %x %x %x %x", &program, &pipeline,
+                                    &mask, &robustness, &control, &full, &minLog2, &maxLog2, &c[0], &c[1], &c[2], &c[3],
+                                    &c[4], &c[5], &c[6], &c[7]) != 16 ||
+                        !m_seen.insert(pipeline).second)
+                        continue;
+                    v.program = program;
+                    v.pipeline = pipeline;
+                    v.mask = uint8_t(mask);
+                    v.robustness = uint8_t(robustness);
+                    v.subgroupControl = uint8_t(control);
+                    v.subgroupFull = uint8_t(full);
+                    v.subgroupMinLog2 = uint8_t(minLog2);
+                    v.subgroupMaxLog2 = uint8_t(maxLog2);
+                    std::copy(std::begin(c), std::end(c), v.constants);
+                    ParallelGS::ps2x_recorded_variants.push_back(v);
+                }
+            }
+            Vulkan::ps2x_compute_compile_hook = [](const Vulkan::DeferredPipelineCompile &compile) { instance().record(compile); };
+        }
+
+    private:
+        void record(const Vulkan::DeferredPipelineCompile &compile)
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_path.empty() || !compile.program || !m_seen.insert(compile.hash).second)
+                return;
+            const auto &state = compile.static_state.state;
+            const auto &potential = compile.potential_static_state;
+            uint32_t c[8] = {};
+            for (unsigned i = 0; i < 8; i++)
+                if (potential.spec_constant_mask & (1u << i))
+                    c[i] = potential.spec_constants[i];
+            std::error_code error;
+            std::filesystem::create_directories(m_path.parent_path(), error);
+            if (std::FILE *f = std::fopen(m_path.string().c_str(), "a"))
+            {
+                std::fprintf(f, "v1 %llx %llx %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+                             (unsigned long long)compile.program->get_hash(), (unsigned long long)compile.hash,
+                             unsigned(potential.spec_constant_mask), unsigned(state.robustness),
+                             unsigned(state.subgroup_control_size), unsigned(state.subgroup_full_group),
+                             unsigned(state.subgroup_minimum_size_log2), unsigned(state.subgroup_maximum_size_log2),
+                             c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+                std::fclose(f);
+            }
+        }
+
+        std::mutex m_mutex;
+        std::filesystem::path m_path;
+        std::set<uint64_t> m_seen; // pipeline hashes already listed
+    };
     uint64_t word(const void *data)
     {
         uint64_t value;
@@ -140,10 +251,45 @@ namespace
                                                         Vulkan::CONTEXT_CREATION_ENABLE_DESCRIPTOR_BUFFER_BIT))
                 throw std::runtime_error("parallel-gs: Vulkan instance/device creation failed");
             m_device.set_context(m_context);
+            loadPipelineCache();
             m_device.init_frame_contexts(4);
         }
 
         Vulkan::Device &device() { return m_device; }
+
+        // Before any pipeline is created. Granite checks the cache's GPU UUID and hash and starts
+        // a fresh one if they do not match.
+        void loadPipelineCache()
+        {
+            const auto path = pipelineCachePath();
+            std::vector<uint8_t> data;
+            if (std::ifstream in{path, std::ios::binary})
+                data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            if (!m_device.init_pipeline_cache(data.empty() ? nullptr : data.data(), data.size()))
+                std::fprintf(stderr, "[gs] paraLLEl-GS: could not create a pipeline cache\n");
+        }
+
+        void savePipelineCache()
+        {
+            const auto path = pipelineCachePath();
+            const size_t size = m_device.get_pipeline_cache_size();
+            if (path.empty() || !size)
+                return;
+            std::vector<uint8_t> data(size);
+            if (!m_device.get_pipeline_cache_data(data.data(), size))
+                return;
+            std::error_code error;
+            std::filesystem::create_directories(path.parent_path(), error);
+            auto temp = path;
+            temp += ".tmp";
+            {
+                std::ofstream out{temp, std::ios::binary | std::ios::trunc};
+                out.write(reinterpret_cast<const char *>(data.data()), std::streamsize(size));
+                if (!out)
+                    return;
+            }
+            std::filesystem::rename(temp, path, error); // whole file or none
+        }
 
         PresentationFrame present(const ParallelGS::ScanoutResult &scanout)
         {
@@ -222,6 +368,7 @@ namespace
             std::lock_guard<std::recursive_mutex> guard;
             explicit Lock(std::recursive_mutex &m) : guard(m) { Util::register_thread_index(0); }
         };
+        bool precompileSaved = false;
         uint64_t bitblt = 0, trxreg = 0;
         GSTransferSnapshot transfer;
         size_t transferBytes = 0, uploadedBytes = 0;
@@ -391,6 +538,7 @@ namespace
     public:
         explicit ParallelBackend(GSRegisters &registers) : priv(registers)
         {
+            PipelineVariantRecord::instance().load(); // before gs.init queues the precompile
             if (!gs.init(&interop.device(), ParallelGS::GSOptions{}))
                 throw std::runtime_error("parallel-gs: GS initialization failed; check Vulkan feature diagnostics above");
             gs.set_signal_interface(this);
@@ -401,6 +549,22 @@ namespace
             Lock lock(mutex);
             gs.flush();
             interop.device().wait_idle();
+            interop.savePipelineCache(); // pipelines compiled on demand since the precompile
+        }
+
+        void PrecompileProgress(uint32_t &done, uint32_t &total) override
+        {
+            total = ParallelGS::ps2x_precompile_total.load(std::memory_order_relaxed);
+            done = std::min(total, ParallelGS::ps2x_precompile_done.load(std::memory_order_relaxed));
+            if (total && done == total && !precompileSaved)
+            {
+                Lock lock(mutex);
+                interop.savePipelineCache();
+                precompileSaved = true;
+                std::printf("[gs] paraLLEl-GS precompiled %u pipelines, %u of them recorded as compiled mid-game "
+                            "in earlier runs (of %zu listed)\n",
+                            total, ParallelGS::ps2x_precompile_recorded.load(), ParallelGS::ps2x_recorded_variants.size());
+            }
         }
 
         bool UsesRawCommands() const override
@@ -773,7 +937,194 @@ namespace
     };
 }
 
+namespace
+{
+    // Runs a raw-command backend's command stream on a thread of its own, so the EE thread only
+    // queues it: GIF packets, register writes, image data and flushes are queued and a worker
+    // runs them in order; every other call (it returns data, or reads or replaces VRAM) first
+    // waits for the commands queued before it, then runs on the caller's thread.
+    // PS2X_PGS_ASYNC=0 runs everything on the caller's thread.
+    class QueuedRawBackend final : public GSRasterBackend
+    {
+        struct Command
+        {
+            enum Kind : uint8_t
+            {
+                Gif,
+                Register,
+                Image,
+                Flush,
+                TextureFlush,
+            } kind;
+            uint8_t addr = 0;     // Register
+            uint32_t path = 0;    // Gif
+            uint64_t value = 0;   // Register
+            size_t offset = 0;    // Gif, Image: in the batch's bytes
+            uint32_t size = 0;
+        };
+        // Back-pressure: the EE waits once this much is queued.
+        static constexpr size_t kMaxQueuedBytes = size_t(64) << 20;
+        static constexpr size_t kMaxQueuedCommands = 1u << 16;
+
+        std::unique_ptr<GSRasterBackend> inner;
+        mutable std::mutex mutex;
+        mutable std::condition_variable wake, progress;
+        std::vector<Command> pending;
+        std::vector<uint8_t> pendingBytes;
+        uint64_t pushed = 0;
+        mutable uint64_t done = 0;
+        bool stop = false;
+        std::thread worker;
+
+        bool onWorker() const { return std::this_thread::get_id() == worker.get_id(); }
+
+        void push(Command command, const uint8_t *data = nullptr)
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            progress.wait(lock, [&] { return pending.size() < kMaxQueuedCommands && pendingBytes.size() < kMaxQueuedBytes; });
+            if (data)
+            {
+                command.offset = pendingBytes.size();
+                pendingBytes.insert(pendingBytes.end(), data, data + command.size);
+            }
+            pending.push_back(command);
+            ++pushed;
+            wake.notify_one();
+        }
+
+        // Waits for every command queued before this call (not for an empty queue: the EE may
+        // keep queuing meanwhile).
+        void drain() const
+        {
+            if (onWorker())
+                return;
+            std::unique_lock<std::mutex> lock(mutex);
+            const uint64_t target = pushed;
+            progress.wait(lock, [&] { return done >= target; });
+        }
+
+        void run()
+        {
+            std::vector<Command> batch;
+            std::vector<uint8_t> bytes;
+            for (;;)
+            {
+                {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    done += batch.size();
+                    batch.clear();
+                    bytes.clear();
+                    progress.notify_all();
+                    wake.wait(lock, [&] { return !pending.empty() || stop; });
+                    if (pending.empty())
+                        return;
+                    batch.swap(pending);
+                    bytes.swap(pendingBytes);
+                    progress.notify_all(); // room again
+                }
+                for (const Command &c : batch)
+                {
+                    switch (c.kind)
+                    {
+                    case Command::Gif:
+                        inner->ProcessGIF(c.path, bytes.data() + c.offset, c.size);
+                        break;
+                    case Command::Register:
+                        inner->WriteRegisterRaw(c.addr, c.value);
+                        break;
+                    case Command::Image:
+                        inner->UploadImage(bytes.data() + c.offset, c.size);
+                        break;
+                    case Command::Flush:
+                        inner->Flush();
+                        break;
+                    case Command::TextureFlush:
+                        inner->TextureFlush();
+                        break;
+                    }
+                }
+            }
+        }
+
+    public:
+        explicit QueuedRawBackend(std::unique_ptr<GSRasterBackend> backend) : inner(std::move(backend))
+        {
+            worker = std::thread([this] {
+                Util::set_current_thread_name("PGS-Commands");
+                run();
+            });
+        }
+
+        ~QueuedRawBackend() override
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                stop = true;
+                wake.notify_one();
+            }
+            worker.join(); // runs what is still queued first
+        }
+
+        void PrecompileProgress(uint32_t &d, uint32_t &total) override { inner->PrecompileProgress(d, total); }
+        bool UsesRawCommands() const override { return inner->UsesRawCommands(); }
+
+        void ProcessGIF(uint32_t path, const uint8_t *data, uint32_t size) override
+        {
+            if (!data || !size)
+                return;
+            Command c{Command::Gif};
+            c.path = path;
+            c.size = size;
+            push(c, data);
+        }
+        void WriteRegisterRaw(uint8_t addr, uint64_t value) override
+        {
+            Command c{Command::Register};
+            c.addr = addr;
+            c.value = value;
+            push(c);
+        }
+        void UploadImage(const uint8_t *data, uint32_t size) override
+        {
+            if (!data || !size)
+                return;
+            Command c{Command::Image};
+            c.size = size;
+            push(c, data);
+        }
+        void Flush() override { push(Command{Command::Flush}); }
+        void TextureFlush() override { push(Command{Command::TextureFlush}); }
+
+        void Initialize(uint8_t *vram, uint32_t size) override { drain(); inner->Initialize(vram, size); }
+        void Reset() override { drain(); inner->Reset(); }
+        void ReadRegisterState(GSDebugSnapshot &s) const override { drain(); inner->ReadRegisterState(s); }
+        void Submit(const GSPrimitiveBatch &batch) override { drain(); inner->Submit(batch); }
+        void LoadClut(const GSTex0Reg &t, const GSTexClutReg &c) override { drain(); inner->LoadClut(t, c); }
+        void BeginTransfer(const GSTransferCommand &c) override { drain(); inner->BeginTransfer(c); }
+        void Sync(GSSyncReason reason) override { drain(); inner->Sync(reason); }
+        PresentationFrame Present(const GSPresentationRequest &r) override { drain(); return inner->Present(r); }
+        bool ClearFramebuffer(const GSContext &ctx, uint32_t rgba) override { drain(); return inner->ClearFramebuffer(ctx, rgba); }
+        uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override { drain(); return inner->ConsumeLocalToHostBytes(dst, maxBytes); }
+        uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
+        {
+            drain();
+            return inner->ReadVram(psm, base, bw, x, y);
+        }
+        void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+        {
+            drain();
+            inner->WriteVram(psm, base, bw, x, y, value);
+        }
+        void SnapshotVram(std::vector<uint8_t> &out) const override { drain(); inner->SnapshotVram(out); }
+        GSTransferSnapshot GetTransferSnapshot() const override { drain(); return inner->GetTransferSnapshot(); }
+    };
+}
+
 std::unique_ptr<GSRasterBackend> CreateParallelGSBackend(GSRegisters &registers)
 {
-    return std::make_unique<ParallelBackend>(registers);
+    std::unique_ptr<GSRasterBackend> backend = std::make_unique<ParallelBackend>(registers);
+    const char *async = std::getenv("PS2X_PGS_ASYNC");
+    if (async && async[0] == '0')
+        return backend;
+    return std::make_unique<QueuedRawBackend>(std::move(backend));
 }

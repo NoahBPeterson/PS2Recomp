@@ -515,6 +515,49 @@ static bool noWindow()
 }
 static std::vector<uint8_t> g_presentBuffer(DEFAULT_FB_SIZE, 0u); // FB_WIDTH x FB_HEIGHT RGBA
 
+// Waits for the GS backend's ahead-of-time shader compilation before the game starts, so no
+// pipeline compiles mid-game: a progress bar in the window, or a line per 10% when headless.
+static void waitForGsPrecompile(GSRasterBackend &backend)
+{
+    uint32_t done = 0u, total = 0u;
+    backend.PrecompileProgress(done, total);
+    if (total == 0u || done >= total)
+        return;
+    const auto start = std::chrono::steady_clock::now();
+    int lastTenth = -1;
+    while (done < total)
+    {
+        const int percent = static_cast<int>(uint64_t(done) * 100u / total);
+        if (noWindow())
+        {
+            if (percent / 10 != lastTenth)
+            {
+                lastTenth = percent / 10;
+                std::cout << "[gs] compiling shaders " << percent << "% (" << done << "/" << total << ")" << std::endl;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        else
+        {
+            if (WindowShouldClose())
+                break;
+            const int w = GetScreenWidth(), h = GetScreenHeight();
+            const int barW = w * 2 / 3, barH = 24, barX = (w - barW) / 2, barY = h / 2;
+            BeginDrawing();
+            ClearBackground(BLACK);
+            DrawText("Compiling shaders (first launch, or after a driver update)", barX, barY - 40, 20, RAYWHITE);
+            DrawRectangleLines(barX, barY, barW, barH, RAYWHITE);
+            DrawRectangle(barX + 2, barY + 2, (barW - 4) * percent / 100, barH - 4, RAYWHITE);
+            DrawText(TextFormat("%d%%  (%u / %u)", percent, done, total), barX, barY + barH + 12, 20, GRAY);
+            EndDrawing();
+        }
+        backend.PrecompileProgress(done, total);
+    }
+    backend.PrecompileProgress(done, total); // the backend saves its pipeline cache on completion
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cout << "[gs] shaders compiled: " << done << "/" << total << " in " << seconds << " s" << std::endl;
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -912,6 +955,7 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+        GSRasterBackend *parallelBackend = nullptr;
 #ifdef PS2X_GS_PARALLEL
         // PS2X_GS=parallel opts into paraLLEl-GS (Vulkan compute; MoltenVK on macOS). Opt-in for now:
         // the game runs several times faster with it and then corrupts textures and calls through a
@@ -920,7 +964,9 @@ bool PS2Runtime::initialize(const char *title)
         {
             try
             {
-                m_gs.setRasterBackend(CreateParallelGSBackend(m_memory.gs()));
+                auto backend = CreateParallelGSBackend(m_memory.gs());
+                parallelBackend = backend.get();
+                m_gs.setRasterBackend(std::move(backend));
                 std::cout << "[gs] using paraLLEl-GS backend" << std::endl;
             }
             catch (const std::exception &error)
@@ -930,6 +976,8 @@ bool PS2Runtime::initialize(const char *title)
         }
 #endif
         SetTargetFPS(60);
+        if (parallelBackend)
+            waitForGsPrecompile(*parallelBackend);
         SetExitKey(KEY_NULL); // raylib quits on Esc by default; games use Esc-mapped input, so only the window close quits
         if (m_debugUiInitCallback && !noWindow())
         {

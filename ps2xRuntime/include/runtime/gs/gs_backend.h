@@ -22,6 +22,9 @@ public:
     virtual void WriteRegisterRaw(uint8_t /*addr*/, uint64_t /*value*/) {}
     virtual void ReadRegisterState(GSDebugSnapshot & /*snapshot*/) const {}
 
+    // Shader pipelines compiled ahead of the game so far, of `total` (0: nothing to wait for).
+    virtual void PrecompileProgress(uint32_t &done, uint32_t &total) { done = total = 0; }
+
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 

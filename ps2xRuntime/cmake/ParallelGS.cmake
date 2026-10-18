@@ -19,6 +19,7 @@ endif()
 FetchContent_MakeAvailable(parallel_gs)
 
 include("${CMAKE_CURRENT_LIST_DIR}/ParallelGSTransferTails.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ParallelGSPrecompile.cmake")
 target_sources(ps2_runtime PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/lib/gs/gs_parallel_backend.cpp")
 target_link_libraries(ps2_runtime PRIVATE parallel-gs)
 target_compile_definitions(ps2_runtime PUBLIC PS2X_GS_PARALLEL=1)
