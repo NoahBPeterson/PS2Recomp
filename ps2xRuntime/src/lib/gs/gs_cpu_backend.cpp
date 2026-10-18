@@ -184,6 +184,28 @@ namespace
         }
     }
 
+    // Draw state fixed at compile time for the states the game draws most pixels with
+    // (kTriangleSpecs); -1 reads the field at run time. A primitive takes a spec only when its
+    // state equals every fixed field, so a spec runs the generic code with those fields folded.
+    struct PixelSpec
+    {
+        int8_t fge = -1, ate = -1, atst = -1, failRgb = -1, failAlpha = -1, failDepth = -1, dateRead = -1;
+        int8_t ztest = -1, zwrite = -1, abe = -1, pabe = -1, asel = -1, bsel = -1, csel = -1, dsel = -1;
+        int8_t fbmskZero = -1, dither = -1, colclamp = -1, fbaOr = -1;
+        int8_t tme = -1, linear = -1, iip = -1, fst = -1, tfx = -1, tcc = -1;
+
+        constexpr bool operator==(const PixelSpec &) const = default;
+    };
+
+    template <int V, class T>
+    [[gnu::always_inline]] constexpr T specOr(T runtime)
+    {
+        if constexpr (V < 0)
+            return runtime;
+        else
+            return static_cast<T>(V);
+    }
+
     struct PixelWriteMask
     {
         bool writeRgb = true;
@@ -256,6 +278,7 @@ namespace
         uint8_t a;
     };
 
+    template <int Tfx = -1, int Tcc = -1>
     [[gnu::always_inline]] inline TextureCombineResult combineTexture(const GSTex0Reg &tex,
                                         uint8_t vr,
                                         uint8_t vg,
@@ -266,10 +289,10 @@ namespace
                                         uint8_t tb,
                                         uint8_t ta)
     {
-        const bool textureHasAlpha = tex.tcc != 0u;
+        const bool textureHasAlpha = specOr<Tcc>(tex.tcc) != 0u;
         TextureCombineResult out{tr, tg, tb, textureHasAlpha ? ta : va};
 
-        switch (tex.tfx)
+        switch (specOr<Tfx>(tex.tfx))
         {
         case 0: // MODULATE
             out.r = clampU8((tr * vr) >> 7);
@@ -1561,34 +1584,73 @@ namespace
         }
     };
 
-    inline bool alphaTestPasses(const PixelSetup &ps, uint8_t alpha)
+    [[gnu::always_inline]] inline bool alphaTestPasses(uint8_t atst, uint8_t aref, uint8_t alpha)
     {
-        switch (ps.atst)
+        switch (atst)
         {
         case 0:
             return false;
         case 1:
             return true;
         case 2:
-            return alpha < ps.aref;
+            return alpha < aref;
         case 3:
-            return alpha <= ps.aref;
+            return alpha <= aref;
         case 4:
-            return alpha == ps.aref;
+            return alpha == aref;
         case 5:
-            return alpha >= ps.aref;
+            return alpha >= aref;
         case 6:
-            return alpha > ps.aref;
+            return alpha > aref;
         default:
-            return alpha != ps.aref;
+            return alpha != aref;
         }
     }
 
     // One pixel through scissor, fog, alpha test, DATE, depth test, blending, FBA, FBMSK and
-    // the framebuffer/depth writes. FP/ZP: frame/depth psm, or kGenericPsm.
-    template <int FP, int ZP>
+    // the framebuffer/depth writes. FP/ZP: frame/depth psm, or kGenericPsm. S: see PixelSpec.
+    template <int FP, int ZP, PixelSpec S = PixelSpec{}>
     struct PixelWriter
     {
+        static constexpr int framePsm = FP, depthPsm = ZP;
+        static constexpr PixelSpec spec = S;
+        template <PixelSpec S2>
+        using WithSpec = PixelWriter<FP, ZP, S2>;
+
+        // The frame format is fixed when FP is (rasterDispatch picks FP from ps.fpsm).
+        [[gnu::always_inline]] static bool fb16(const PixelSetup &ps)
+        {
+            if constexpr (FP == kGenericPsm)
+                return ps.fb16;
+            else
+                return bitsPerPixel(FP) == 16;
+        }
+        [[gnu::always_inline]] static bool fb24(const PixelSetup &ps)
+        {
+            if constexpr (FP == kGenericPsm)
+                return ps.fb24;
+            else
+                return FP == GS_PSM_CT24;
+        }
+        [[gnu::always_inline]] static bool fb32(const PixelSetup &ps)
+        {
+            if constexpr (FP == kGenericPsm)
+                return ps.fb32;
+            else
+                return FP == GS_PSM_CT32;
+        }
+        [[gnu::always_inline]] static bool alphaPasses(const PixelSetup &ps, uint8_t alpha)
+        {
+            return alphaTestPasses(specOr<S.atst>(ps.atst), ps.aref, alpha);
+        }
+        [[gnu::always_inline]] static PixelWriteMask failMask(const PixelSetup &ps)
+        {
+            if constexpr (S.failRgb < 0 || S.failAlpha < 0 || S.failDepth < 0)
+                return ps.failMask;
+            else
+                return {S.failRgb != 0, S.failAlpha != 0, S.failDepth != 0};
+        }
+
         [[gnu::always_inline]] static inline void write(RasterCtx &rc, const PixelSetup &ps, int x, int y, uint32_t z,
                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
         {
@@ -1602,7 +1664,7 @@ namespace
         [[gnu::always_inline]] static inline void writeInScissor(RasterCtx &rc, const PixelSetup &ps, int x, int y, uint32_t z,
                                                                  uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog)
         {
-            if (ps.fge)
+            if (specOr<S.fge>(ps.fge))
             {
                 const uint32_t inverseFog = 255u - fog;
                 auto applyFog = [&](uint8_t input, uint8_t fogColor) -> uint8_t
@@ -1615,15 +1677,18 @@ namespace
             }
 
             PixelWriteMask writeMask{};
-            if (ps.ate && !alphaTestPasses(ps, a))
+            if (specOr<S.ate>(ps.ate) && !alphaPasses(ps, a))
             {
-                writeMask = ps.failMask;
+                writeMask = failMask(ps);
                 if (!writeMask.writesAnything())
                     return;
             }
 
-            const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && ps.fb32;
-            const bool frmw = ps.dateRead || (writeMask.writesFramebuffer() && ((ps.fbmsk != 0) || ps.abe || preserveDestinationAlpha));
+            const bool dateRead = specOr<S.dateRead>(ps.dateRead);
+            const bool abe = specOr<S.abe>(ps.abe);
+            const uint32_t fbmsk = S.fbmskZero == 1 ? 0u : ps.fbmsk;
+            const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fb32(ps);
+            const bool frmw = dateRead || (writeMask.writesFramebuffer() && ((fbmsk != 0) || abe || preserveDestinationAlpha));
 
             uint8_t *const vram = rc.vram;
             PixelRef<FP> fbPixel{vram, ps.fbp, ps.fbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), ps.fbRead, ps.fbWrite};
@@ -1634,20 +1699,20 @@ namespace
             {
                 rawFramebufferPixel = fbPixel.read();
                 fbrgba = rawFramebufferPixel;
-                if (ps.fb16)
+                if (fb16(ps))
                     fbrgba = Rgba5551ToRgba8888(fbrgba);
-                else if (ps.fb24)
+                else if (fb24(ps))
                     fbrgba |= 0x80000000u;
             }
 
-            if (ps.dateRead)
+            if (dateRead)
             {
-                const uint32_t bit = ps.fb32 ? (rawFramebufferPixel >> 31) : (rawFramebufferPixel >> 15);
+                const uint32_t bit = fb32(ps) ? (rawFramebufferPixel >> 31) : (rawFramebufferPixel >> 15);
                 if (((bit & 0x1u) != 0u) != ps.datm)
                     return;
             }
 
-            switch (ps.ztestMethod)
+            switch (specOr<S.ztest>(ps.ztestMethod))
             {
             case 0:
                 return;
@@ -1667,7 +1732,7 @@ namespace
             {
                 // Blend, dither and COLCLAMP in 9+ bits, in that order (PCSX2 GSDrawScanline).
                 int cr = r, cg = g, cb = b;
-                if (ps.abe)
+                if (abe)
                 {
                     const uint8_t dr = fbrgba & 0xFF;
                     const uint8_t dg = (fbrgba >> 8) & 0xFF;
@@ -1675,7 +1740,7 @@ namespace
                     const uint8_t da = (fbrgba >> 24) & 0xFF;
 
                     // PABE disables alpha blending when the source alpha MSB is clear.
-                    if (!(ps.pabe && (a & 0x80u) == 0u))
+                    if (!(specOr<S.pabe>(ps.pabe) && (a & 0x80u) == 0u))
                     {
                         auto pickRGB = [](uint8_t sel, int cs, int cd) -> int
                         {
@@ -1685,21 +1750,23 @@ namespace
                                 return cd;
                             return 0;
                         };
-                        const int cAlpha = (ps.csel == 0) ? a : (ps.csel == 1) ? da
+                        const uint8_t csel = specOr<S.csel>(ps.csel);
+                        const uint8_t asel = specOr<S.asel>(ps.asel), bsel = specOr<S.bsel>(ps.bsel), dsel = specOr<S.dsel>(ps.dsel);
+                        const int cAlpha = (csel == 0) ? a : (csel == 1) ? da
                                                                                 : ps.fix;
-                        cr = ((pickRGB(ps.asel, r, dr) - pickRGB(ps.bsel, r, dr)) * cAlpha >> 7) + pickRGB(ps.dsel, r, dr);
-                        cg = ((pickRGB(ps.asel, g, dg) - pickRGB(ps.bsel, g, dg)) * cAlpha >> 7) + pickRGB(ps.dsel, g, dg);
-                        cb = ((pickRGB(ps.asel, b, db) - pickRGB(ps.bsel, b, db)) * cAlpha >> 7) + pickRGB(ps.dsel, b, db);
+                        cr = ((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr);
+                        cg = ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg);
+                        cb = ((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db);
                     }
                 }
-                if (ps.dither)
+                if (specOr<S.dither>(ps.dither))
                 {
                     const int dm = ps.dimx[y & 3][x & 3];
                     cr += dm;
                     cg += dm;
                     cb += dm;
                 }
-                if (ps.colclamp)
+                if (specOr<S.colclamp>(ps.colclamp))
                 {
                     r = clampU8(cr);
                     g = clampU8(cg);
@@ -1712,22 +1779,22 @@ namespace
                     b = static_cast<uint8_t>(cb);
                 }
 
-                if (writeMask.writeAlpha && ps.fbaOr)
+                if (writeMask.writeAlpha && specOr<S.fbaOr>(ps.fbaOr))
                     a = static_cast<uint8_t>(a | 0x80u);
 
                 u32 pixel = pack32(r, g, b, a);
-                if (ps.fbmsk != 0)
-                    pixel = (pixel & ~ps.fbmsk) | (fbrgba & ps.fbmsk);
+                if (fbmsk != 0)
+                    pixel = (pixel & ~fbmsk) | (fbrgba & fbmsk);
                 if (preserveDestinationAlpha)
                     pixel = (pixel & 0x00FFFFFFu) | (fbrgba & 0xFF000000u);
-                if (ps.fb16)
+                if (fb16(ps))
                     pixel = Rgba8888ToRgba5551(pixel);
 
                 fbPixel.write(pixel);
                 rc.mark(ps.fbMark, x, y);
             }
 
-            if (ps.zwrite && writeMask.writeDepth)
+            if (specOr<S.zwrite>(ps.zwrite) && writeMask.writeDepth)
             {
                 zPixel.write(z);
                 rc.mark(ps.zMark, x, y);
@@ -1949,9 +2016,10 @@ namespace
     // Samples at a 16.16 fixed-point texel coordinate (the integer part selects the texel). The
     // bilinear filter centres on texels: it steps back half a texel, then weighs the 2x2 block by
     // the 4 fraction bits below the texel.
+    template <int Linear = -1>
     [[gnu::always_inline]] inline uint32_t sampleTexture(RasterCtx &rc, const TexSetup &ts, int u, int v)
     {
-        if (!ts.linear)
+        if (!specOr<Linear>(ts.linear))
             return fetchTexel(rc, ts, u >> 16, v >> 16);
 
         u -= 0x8000;
@@ -2180,10 +2248,11 @@ namespace
         };
         auto attr = [&](auto get) -> Plane { return plane(get(*p[0].v), get(*p[1].v), get(*p[2].v)); };
 
-        const bool iip = state.prim.iip;
-        const bool tme = state.prim.tme;
-        const bool fst = state.prim.fst;
-        const bool fge = state.prim.fge;
+        constexpr PixelSpec S = W::spec;
+        const bool iip = specOr<S.iip>(state.prim.iip);
+        const bool tme = specOr<S.tme>(state.prim.tme);
+        const bool fst = specOr<S.fst>(state.prim.fst);
+        const bool fge = specOr<S.fge>(state.prim.fge);
         const auto &tex = ctx.tex0;
         const GSVertex &flat = batch.vertices[2]; // IIP=0: the last vertex's colour
 
@@ -2283,9 +2352,9 @@ namespace
                     if (tme)
                     {
                         rc.pixelKey = (static_cast<uint64_t>(y) << 34) | (static_cast<uint64_t>(x) << 2);
-                        const uint32_t texel = sampleTexture(rc, ts, texUs[i], texVs[i]);
+                        const uint32_t texel = sampleTexture<S.linear>(rc, ts, texUs[i], texVs[i]);
                         const TextureCombineResult color =
-                            combineTexture(tex, r, g, b, a, static_cast<uint8_t>(texel), static_cast<uint8_t>(texel >> 8),
+                            combineTexture<S.tfx, S.tcc>(tex, r, g, b, a, static_cast<uint8_t>(texel), static_cast<uint8_t>(texel >> 8),
                                            static_cast<uint8_t>(texel >> 16), static_cast<uint8_t>(texel >> 24));
                         r = color.r;
                         g = color.g;
@@ -2369,6 +2438,57 @@ namespace
         }
     }
 
+    // The states the game draws most triangle pixels with, all on a CT32 frame and Z24 depth
+    // (pixel counts of the title-menu GS replay, config/conformance/gs/cases/menu.gs).
+    constexpr PixelSpec kTriangleSpecs[] = {
+        // Bilinear MODULATE texture, blend (Cs - Cd) * As + Cd, Z GEQUAL tested but not written
+        // (alpha test NEVER with AFAIL FB_ONLY): 40% of the menu's pixels.
+        {.fge = 0, .ate = 1, .atst = 0, .failRgb = 1, .failAlpha = 1, .failDepth = 0, .dateRead = 0,
+         .ztest = 2, .zwrite = 1, .abe = 1, .pabe = 0, .asel = 0, .bsel = 1, .csel = 0, .dsel = 1,
+         .fbmskZero = 1, .dither = 0, .colclamp = 1, .fbaOr = 0,
+         .tme = 1, .linear = 1, .iip = 1, .fst = 0, .tfx = 0, .tcc = 1},
+        // The same with blend Cs * As + Cd (additive): 19%.
+        {.fge = 0, .ate = 1, .atst = 0, .failRgb = 1, .failAlpha = 1, .failDepth = 0, .dateRead = 0,
+         .ztest = 2, .zwrite = 1, .abe = 1, .pabe = 0, .asel = 0, .bsel = 2, .csel = 0, .dsel = 1,
+         .fbmskZero = 1, .dither = 0, .colclamp = 1, .fbaOr = 0,
+         .tme = 1, .linear = 1, .iip = 1, .fst = 0, .tfx = 0, .tcc = 1},
+        // Untextured, depth only (alpha test NEVER with AFAIL ZB_ONLY): 8%.
+        {.fge = 0, .ate = 1, .atst = 0, .failRgb = 0, .failAlpha = 0, .failDepth = 1, .dateRead = 0,
+         .ztest = 2, .zwrite = 1, .abe = 0, .pabe = 0,
+         .fbmskZero = 1, .dither = 0, .colclamp = 1, .fbaOr = 0,
+         .tme = 0, .iip = 1},
+    };
+
+    bool specMatches(const PixelSpec &s, const PixelSetup &ps, const TexSetup &ts, const GSDrawState &state)
+    {
+        auto ok = [](int8_t fixed, int value) { return fixed < 0 || fixed == value; };
+        return ok(s.fge, ps.fge) && ok(s.ate, ps.ate) && ok(s.atst, ps.atst) && ok(s.failRgb, ps.failMask.writeRgb) &&
+               ok(s.failAlpha, ps.failMask.writeAlpha) && ok(s.failDepth, ps.failMask.writeDepth) &&
+               ok(s.dateRead, ps.dateRead) && ok(s.ztest, static_cast<int>(ps.ztestMethod)) && ok(s.zwrite, ps.zwrite) &&
+               ok(s.abe, ps.abe) && ok(s.pabe, ps.pabe) && ok(s.asel, ps.asel) && ok(s.bsel, ps.bsel) &&
+               ok(s.csel, ps.csel) && ok(s.dsel, ps.dsel) && ok(s.fbmskZero, ps.fbmsk == 0u) && ok(s.dither, ps.dither) &&
+               ok(s.colclamp, ps.colclamp) && ok(s.fbaOr, ps.fbaOr) && ok(s.tme, state.prim.tme) &&
+               ok(s.linear, ts.linear) && ok(s.iip, state.prim.iip) && ok(s.fst, state.prim.fst) &&
+               ok(s.tfx, state.context.tex0.tfx) && ok(s.tcc, state.context.tex0.tcc);
+    }
+
+    // drawTriangle with the first matching kTriangleSpecs entry; false when none matches.
+    template <class W, size_t I = 0>
+    bool drawTriangleSpecialized(RasterCtx &rc, const GSPrimitiveBatch &batch, const PixelSetup &ps, const TexSetup &ts)
+    {
+        if constexpr (I == std::size(kTriangleSpecs))
+            return false;
+        else
+        {
+            if (specMatches(kTriangleSpecs[I], ps, ts, batch.state))
+            {
+                drawTriangle<typename W::template WithSpec<kTriangleSpecs[I]>>(rc, batch, ps, ts);
+                return true;
+            }
+            return drawTriangleSpecialized<W, I + 1>(rc, batch, ps, ts);
+        }
+    }
+
     template <class W>
     void rasterPrimitive(RasterCtx &rc, const GSPrimitiveBatch &batch, const PixelSetup &ps, const TexSetup &ts)
     {
@@ -2381,6 +2501,9 @@ namespace
         case GS_PRIM_TRIANGLE:
         case GS_PRIM_TRISTRIP:
         case GS_PRIM_TRIFAN:
+            if constexpr (W::framePsm == GS_PSM_CT32 && W::depthPsm == GS_PSM_Z24 && W::spec == PixelSpec{})
+                if (drawTriangleSpecialized<W>(rc, batch, ps, ts))
+                    break;
             drawTriangle<W>(rc, batch, ps, ts);
             break;
         case GS_PRIM_LINE:
