@@ -957,10 +957,10 @@ bool PS2Runtime::initialize(const char *title)
 #endif
         GSRasterBackend *parallelBackend = nullptr;
 #ifdef PS2X_GS_PARALLEL
-        // PS2X_GS=parallel opts into paraLLEl-GS (Vulkan compute; MoltenVK on macOS). Opt-in for now:
-        // the game runs several times faster with it and then corrupts textures and calls through a
-        // bad function pointer soon after New Game (T-0120).
-        if (const char *gsChoice = std::getenv("PS2X_GS"); gsChoice && std::string(gsChoice) == "parallel")
+        // paraLLEl-GS (Vulkan compute; MoltenVK on macOS) is the default GS backend when built in;
+        // PS2X_GS=cpu selects the CPU backend (the conformance reference), as does a missing or
+        // unusable Vulkan device.
+        if (const char *gsChoice = std::getenv("PS2X_GS"); !gsChoice || std::string(gsChoice) != "cpu")
         {
             try
             {
