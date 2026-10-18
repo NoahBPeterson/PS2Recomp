@@ -536,6 +536,7 @@ static int replayOnce(int argc, char **argv)
     }
     size_t hashLines = 0u, hashMismatches = 0u;
     double hashMs = 0.0;
+    double pngMs = 0.0; // PNG encoding and reference comparison, left out of the replay time
     // Records one state line. VRAM is read through the backend's Sync + SnapshotVram, so an
     // asynchronous backend is hashed only after it has finished.
     std::vector<uint8_t> snap;
@@ -629,7 +630,10 @@ static int replayOnce(int argc, char **argv)
             const std::string png = outDir + "/" + name;
             if (gs.copyLatchedHostPresentationFrame(pixels, width, height) && width && height)
             {
-                if (!writePng(png, pixels, width, height))
+                auto p0 = std::chrono::steady_clock::now();
+                const bool written = writePng(png, pixels, width, height);
+                pngMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
+                if (!written)
                     std::fprintf(stderr, "failed to write %s\n", png.c_str());
                 else if (!quiet)
                     std::printf("%s %ux%u\n", png.c_str(), width, height);
@@ -637,7 +641,9 @@ static int replayOnce(int argc, char **argv)
                     recordHash("frame", frames, &pixels);
                 if (!refDir.empty())
                 {
+                    p0 = std::chrono::steady_clock::now();
                     const int64_t bad = compareWithReference(refDir + "/" + name, pixels, width, height, tol);
+                    pngMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p0).count();
                     if (bad < 0 || bad > maxBad)
                         ++mismatches;
                     if (bad < 0)
@@ -681,7 +687,7 @@ static int replayOnce(int argc, char **argv)
     }
     const auto t2 = std::chrono::steady_clock::now();
     const double loadMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    const double replayMs = std::chrono::duration<double, std::milli>(t2 - t1).count() - hashMs;
+    const double replayMs = std::chrono::duration<double, std::milli>(t2 - t1).count() - hashMs - pngMs;
     std::printf("replayed %u frame(s), %u transfers (%.1f MiB GIF), %u FIFO reads, serial '%s', state v%u: "
                 "load %.0f ms, replay %.0f ms (%.1f ms/frame) [%s]\n",
                 frames, transfers, double(gifBytes) / (1024.0 * 1024.0), fifoReads, dump.serial.c_str(), dump.stateVersion,

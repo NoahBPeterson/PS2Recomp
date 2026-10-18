@@ -441,7 +441,8 @@ namespace
             statBytes[path] += size;
             observeGIF(path, data, size);
             gs.gif_transfer(path, data, size);
-            noteState(path);
+            if (pgsDebug())
+                noteState(path); // per-packet state statistics, printed by Present under PS2X_PGS_DEBUG
         }
 
         void WriteRegisterRaw(uint8_t addr, uint64_t value) override
