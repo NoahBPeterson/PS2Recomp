@@ -4,6 +4,7 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "ps2_runtime.h"
 
 #include <cmath>
 #include <cstdint>
@@ -217,6 +218,39 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("runtime: an MSCAL'd microprogram longer than 65536 cycles runs to its end", [](TestCase &t)
+        {
+            constexpr uint32_t kEBit = 1u << 30, kNop = 0x8000033Cu;
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize() && runtime.syncCoreSubsystems(), "runtime core binds");
+            PS2Memory &mem = runtime.memory();
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+            // vi3 = 2047, vi4 = 64; 64 x (count vi1 up to 2047): about half a million cycles; then
+            // data[5] = vf0 (0, 0, 0, 1) and end.
+            const uint32_t program[][2] = {
+                {makeVuIaddiu(3u, 0u, 2047), kVuUpperNop},
+                {makeVuIaddiu(4u, 0u, 64), kVuUpperNop},
+                {makeVuIaddiu(1u, 0u, 0), kVuUpperNop},  // 2: outer
+                {makeVuIaddiu(1u, 1u, 1), kVuUpperNop},  // 3: inner
+                {makeVuIbne(1u, 3u, -2), kVuUpperNop},   // 4: -> 3
+                {kNop, kVuUpperNop},
+                {makeVuIaddiu(2u, 2u, 1), kVuUpperNop},
+                {makeVuIbne(2u, 4u, -6), kVuUpperNop},   // 7: -> 2
+                {kNop, kVuUpperNop},
+                {makeVuSq(0xFu, 0u, 0u, 5), kVuUpperNop | kEBit},
+                {kNop, kVuUpperNop},
+            };
+            for (uint32_t i = 0; i < std::size(program); ++i)
+                uploadVu1Mpg(mem, static_cast<uint16_t>(i), program[i][0], program[i][1]);
+            const uint64_t cycles0 = runtime.vu1().state().cycles;
+            const uint32_t mscal = makeVifCmd(0x14u, 0u, 0u);
+            mem.processVIF1Data(reinterpret_cast<const uint8_t *>(&mscal), sizeof(mscal));
+            float out[4] = {};
+            readVuQword(mem.getVU1Data(), 5u, out);
+            t.IsTrue(runtime.vu1().state().cycles - cycles0 > 65536u, "the program ran longer than 65536 cycles");
+            t.IsTrue(out[3] == 1.0f && out[0] == 0.0f, "and reached its end (the store after the loops landed)");
+        });
+
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;
