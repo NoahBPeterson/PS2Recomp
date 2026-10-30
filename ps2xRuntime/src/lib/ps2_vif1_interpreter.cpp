@@ -340,9 +340,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         uint8_t num = (cmd >> 16) & 0xFF;
         const bool irq = (cmd & 0x80000000u) != 0u;
 
-        // Track most-recent command for VIFn_CODE emulation.
+        // Track most-recent command for VIFn_CODE emulation. NUM is the amount an UNPACK still has to
+        // write (it ends at 0 below); other VIFcodes leave it alone (PCSX2 vifUnpackSetup).
         vif1_regs.code = cmd;
-        vif1_regs.num = num;
         if (irq)
             vif1_regs.stat |= (1u << 11); // INT
 
@@ -466,19 +466,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MPG)
         {
-            uint32_t destAddr = (uint32_t)imm * 8u;
+            // LOADDR wraps in micro memory, and so does an upload running past its end (PCSX2 _vifCode_MPG).
+            uint32_t destAddr = ((uint32_t)imm * 8u) & (PS2_VU1_CODE_SIZE - 1u);
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
-            if (m_vu1Code && destAddr < PS2_VU1_CODE_SIZE && mpgBytes > 0)
+            if (m_vu1Code && mpgBytes > 0 && pos + mpgBytes <= sizeBytes)
             {
-                uint32_t copyBytes = mpgBytes;
-                if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
-                    copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
-                {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
-                    markVU1CodeModified();
-                }
+                const uint32_t head = std::min(mpgBytes, PS2_VU1_CODE_SIZE - destAddr);
+                std::memcpy(m_vu1Code + destAddr, data + pos, head);
+                if (head < mpgBytes)
+                    std::memcpy(m_vu1Code, data + pos + head, mpgBytes - head);
+                markVU1CodeModified();
             }
             pos += mpgBytes;
             if (pos > sizeBytes)
@@ -551,7 +549,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (cl == 0u)
                 cl = 1u;
             if (wl == 0u)
-                wl = 1u;
+            {
+                wl = 256u; // WL=0 is a 256-cycle write length (PCSX2; Kingdom Hearts 2 relies on it)
+                static bool reported = false;
+                if (!reported)
+                {
+                    reported = true;
+                    std::fprintf(stderr, "[vif1] UNPACK with WL=0 (CYCLE=0x%x): treated as WL=256\n", vif1_regs.cycle);
+                }
+            }
 
             uint32_t sourceVectorCount = writeVectorCount;
             if (cl < wl)
@@ -710,6 +716,27 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         handledFormat = false;
                     }
 
+                    // V3 unpacks run as V4 on the hardware: W takes the stream's next element (and goes
+                    // through MASK/MODE like the others); the next vector usually overwrites it (PCSX2
+                    // Vif_Unpack.cpp, "confirmed real hardware behavior", Ape Escape 3).
+                    if (decoded && handledFormat && components == 3 && vl != 3u)
+                    {
+                        const uint32_t elemBytes = static_cast<uint32_t>(bitsPerComponent) / 8u;
+                        const uint8_t *w = srcVec + 3u * elemBytes;
+                        if (w + elemBytes > data + sizeBytes)
+                            decompressed[3] = 0u;
+                        else if (vl == 0u)
+                            std::memcpy(&decompressed[3], w, 4u);
+                        else if (vl == 1u)
+                        {
+                            uint16_t raw = 0;
+                            std::memcpy(&raw, w, sizeof(raw));
+                            decompressed[3] = extend16(raw);
+                        }
+                        else
+                            decompressed[3] = extend8(*w);
+                    }
+
                     // Unknown compressed format fallback: preserve legacy raw-copy behavior.
                     if (!handledFormat && decoded && !maskEnable && (vif1_regs.mode == 0u || vif1_regs.mode == 3u))
                     {
@@ -768,6 +795,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
                 }
+                vif1_regs.num = 0u;
             }
             pos += totalBytes;
 

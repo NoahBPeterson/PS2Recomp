@@ -417,7 +417,8 @@ void register_ps2_memory_tests()
 
             // UNPACK V4_32: opcode 0x6C (vn=3, vl=0), num=0 => 256 vectors, 16 bytes each.
             std::vector<uint8_t> packet;
-            packet.reserve(4u + 4096u);
+            packet.reserve(8u + 4096u);
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1 (CYCLE=0 means WL=256)
             appendU32(packet, makeVifCmd(0x6Cu, 0u, 0u));
             for (uint32_t i = 0; i < 4096u; ++i)
             {
@@ -438,6 +439,78 @@ void register_ps2_memory_tests()
                 }
             }
             t.IsTrue(matches, "UNPACK num=0 should copy 256 V4_32 vectors (4096 bytes)");
+        });
+
+        tc.Run("VIF1 NUM counts an UNPACK down to 0; other VIFcodes leave it alone", [](TestCase &t)
+        {
+            // PCSX2 vifUnpackSetup: only UNPACK loads NUM, and the transfer counts it to 0.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x07u, 7u, 0x1234u)); // MARK with a non-zero NUM field
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            t.Equals(mem.vif1_regs.num, 0u, "MARK should not load its NUM field into VIF1_NUM");
+
+            packet.clear();
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
+            appendU32(packet, makeVifCmd(0x6Cu, 2u, 0u));      // UNPACK V4_32, 2 vectors
+            for (uint32_t i = 0; i < 8u; ++i)
+                appendU32(packet, i);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            t.Equals(mem.vif1_regs.num, 0u, "a completed UNPACK should leave VIF1_NUM at 0");
+        });
+
+        tc.Run("VIF1 MPG wraps around the end of VU1 micro memory", [](TestCase &t)
+        {
+            // PCSX2 _vifCode_MPG: the upload address wraps, so does an upload running past the end.
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Code(), 0, PS2_VU1_CODE_SIZE);
+            const uint16_t lastInstruction = static_cast<uint16_t>(PS2_VU1_CODE_SIZE / 8u - 1u);
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x4Au, 2u, lastInstruction)); // MPG, 2 instructions
+            appendU32(packet, 0x11111111u);
+            appendU32(packet, 0x22222222u);
+            appendU32(packet, 0x33333333u);
+            appendU32(packet, 0x44444444u);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            uint32_t words[4] = {};
+            std::memcpy(&words[0], mem.getVU1Code() + PS2_VU1_CODE_SIZE - 8u, 8u);
+            std::memcpy(&words[2], mem.getVU1Code(), 8u);
+            t.Equals(words[0], 0x11111111u, "the first instruction lands in the last slot");
+            t.Equals(words[1], 0x22222222u, "the first instruction lands in the last slot (upper)");
+            t.Equals(words[2], 0x33333333u, "the second instruction wraps to address 0");
+            t.Equals(words[3], 0x44444444u, "the second instruction wraps to address 0 (upper)");
+
+            packet.clear();
+            std::memset(mem.getVU1Code(), 0, PS2_VU1_CODE_SIZE);
+            appendU32(packet, makeVifCmd(0x4Au, 1u, static_cast<uint16_t>(PS2_VU1_CODE_SIZE / 8u + 1u)));
+            appendU32(packet, 0x55555555u);
+            appendU32(packet, 0x66666666u);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            std::memcpy(&words[0], mem.getVU1Code() + 8u, 8u);
+            t.Equals(words[0], 0x55555555u, "an address past the end wraps (instruction 1)");
+            t.Equals(words[1], 0x66666666u, "an address past the end wraps (instruction 1, upper)");
+        });
+
+        tc.Run("VIF1 UNPACK V3 writes W from the stream's next element", [](TestCase &t)
+        {
+            // PCSX2 Vif_Unpack.cpp: V3 runs as V4 on the hardware, so W takes the next element of the
+            // stream (confirmed hardware behaviour).
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
+            appendU32(packet, makeVifCmd(0x68u, 2u, 0u));      // UNPACK V3_32, 2 vectors
+            for (uint32_t v : {1u, 2u, 3u, 5u, 6u, 7u})
+                appendU32(packet, v);
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+            uint32_t q0[4] = {};
+            std::memcpy(q0, mem.getVU1Data(), sizeof(q0));
+            t.Equals(q0[0], 1u, "vector 0 x");
+            t.Equals(q0[2], 3u, "vector 0 z");
+            t.Equals(q0[3], 5u, "vector 0 w is the next element of the stream (vector 1's x)");
         });
 
         tc.Run("VIF control commands update MARK MASK ROW and COL registers", [](TestCase &t)
@@ -657,6 +730,7 @@ void register_ps2_memory_tests()
             std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
 
             std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x01u, 0u, 0x0101u)); // STCYCL CL=1 WL=1
             appendU32(packet, makeVifCmd(0x30u, 0u, 0u)); // STROW
             appendU32(packet, 10u);
             appendU32(packet, 20u);
